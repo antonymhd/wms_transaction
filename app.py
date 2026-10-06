@@ -37,12 +37,12 @@ df = load_data()
 product_col = 'Nama Produk' if 'Nama Produk' in df.columns else 'Nama Barang'
 part_col = 'Part Number' if 'Part Number' in df.columns else 'Part Number'
 
-# Membuat mapping unik antara Part Number dan Nama Produk
-product_mapping = df[[part_col, product_col]].dropna().drop_duplicates()
-list_part_number = sorted(product_mapping[part_col].astype(str).tolist())
+# Mapping unik antara Nama Produk dan Part Number
+product_mapping = df[[product_col, part_col]].dropna().drop_duplicates()
+list_nama_produk = sorted(product_mapping[product_col].astype(str).tolist())
 
 kolom_list = ['G', 'F', 'E', 'D', 'C', 'B', 'A']
-baris_list = list(range(1, 29))
+baris_list = list(range(1, 29)) # Baris 1 sampai 28
 
 def is_rack_exist(kolom, baris):
     if kolom == 'F' and baris < 5: return False
@@ -55,69 +55,86 @@ daftar_rak = [f"{k}{b}" for k in kolom_list for b in baris_list if is_rack_exist
 # TAMPILAN FORM TRANSAKSI
 # =========================================================================
 st.title("📝 Form Transaksi Inbound / Outbound")
-st.caption("Gunakan halaman ini khusus untuk pencatatan pergerakan pallet di lapangan.")
+st.caption("Pencatatan pergerakan pallet, quantity, dan rentang slot rak gudang.")
 st.divider()
 
 with st.form("form_wms_transaksi"):
     tipe_trx = st.selectbox("Jenis Pergerakan:", ["INBOUND (Barang Masuk) ⬇️", "OUTBOUND (Barang Keluar) ⬆️"])
+    is_inbound = "INBOUND" in tipe_trx
     
-    # Dropdown Part Number & Auto-fill Nama Produk
-    selected_part = st.selectbox("Pilih Part Number:", options=list_part_number)
-    matched_row = product_mapping[product_mapping[part_col].astype(str) == selected_part]
-    nama_produk = matched_row[product_col].values[0] if not matched_row.empty else ""
+    # Dropdown Nama Produk & Auto-fill Part Number
+    selected_product = st.selectbox("Pilih Nama Produk:", options=list_nama_produk)
+    matched_row = product_mapping[product_mapping[product_col].astype(str) == selected_product]
+    part_number = matched_row[part_col].values[0] if not matched_row.empty else ""
     
-    st.text_input("Nama Produk (Auto-filled):", value=nama_produk, disabled=True)
+    st.text_input("Part Number (Auto-filled):", value=part_number, disabled=True)
     
-    lot_number = st.text_input("Lot Number / No Lot:", placeholder="Masukkan nomor lot jika ada")
+    lot_number = st.text_input("No. Lot / Lot Number:", placeholder="Masukkan nomor lot...")
     
     c1, c2 = st.columns(2)
     with c1:
         pilih_kolom = st.selectbox("Kolom Rak:", options=kolom_list)
     with c2:
-        pilih_baris = st.selectbox("Baris Rak:", options=baris_list)
+        pilih_baris = st.selectbox("Baris Rak (1 - 28):", options=baris_list)
         
     lokasi_rak = f"{pilih_kolom}{pilih_baris}"
     
+    # Batas maksimal pallet berdasarkan nomor baris
+    max_pallet = 31 if pilih_baris <= 16 else 44
+    st.caption(f"ℹ️ Kapasitas maksimal Baris {pilih_baris} adalah **{max_pallet} Pallet**.")
+    
     c3, c4 = st.columns(2)
     with c3:
-        pallet_dari = st.number_input("Dari Pallet ke-:", min_value=1, step=1, value=1)
+        pallet_dari = st.number_input("Dari Pallet ke-:", min_value=1, max_value=max_pallet, step=1, value=1)
     with c4:
-        pallet_sampai = st.number_input("Sampai Pallet ke-:", min_value=1, step=1, value=1)
+        pallet_sampai = st.number_input("Sampai Pallet ke-:", min_value=1, max_value=max_pallet, step=1, value=1)
         
-    # Hitung Qty otomatis dari rentang pallet
-    qty_total = (pallet_sampai - pallet_dari) + 1
-    if qty_total < 1: qty_total = 1
+    if pallet_sampai < pallet_dari:
+        st.warning("⚠ Peringatan: 'Sampai Pallet ke' tidak boleh lebih kecil dari 'Dari Pallet ke'.")
+
+    st.divider()
     
-    st.info(f"📦 **Total Qty Pallet yang diproses:** {qty_total} Pallet (Di Rak **{lokasi_rak}**)")
+    # Input Quantity In / Out
+    if is_inbound:
+        qty_in = st.number_input("Quantity In (Qty Masuk):", min_value=0, step=1, value=0, help="Contoh: 21000")
+        qty_out = 0
+    else:
+        qty_in = st.number_input("Quantity In (Acuan Awal):", min_value=0, step=1, value=0)
+        qty_out = st.number_input("Quantity Out (Qty Keluar):", min_value=0, step=1, value=0, help="Contoh barang yang dikeluarkan")
+        
+        if qty_out > qty_in:
+            st.error("🚨 Validasi Gagal: Qty Out tidak boleh lebih besar dari Qty In!")
+
+    keterangan = st.text_area("Keterangan Tambahan:", placeholder="Catatan operasional...")
     
-    keterangan = st.text_area("Keterangan Tambahan (Opsional):", placeholder="Catatan kondisi barang atau keterangan lainnya...")
-    
-    submitted = st.form_submit_button("💾 Simpan Transaksi ke Sistem", type="primary", use_container_width=True)
+    submitted = st.form_submit_button("💾 Simpan Transaksi", type="primary", use_container_width=True)
     
     if submitted:
-        tipe_clean = "IN" if "INBOUND" in tipe_trx else "OUT"
-        payload = {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "tipe": tipe_clean,
-            "barang": f"{selected_part} - {nama_produk} (Lot: {lot_number})",
-            "rak": lokasi_rak,
-            "qty": qty_total
-        }
-        
-        try:
-            response = requests.post(WEB_APP_URL, json=payload)
-            if response.status_code == 200:
-                st.success(f"✅ Transaksi {tipe_clean} Berhasil Disimpan! ({qty_total} Pallet di Rak {lokasi_rak})")
-                st.cache_data.clear()
-            else:
-                st.error("❌ Gagal mengirim data ke Google Sheets.")
-        except Exception as e:
-            st.error(f"Terjadi kesalahan koneksi: {e}")
+        if not is_inbound and qty_out > qty_in:
+            st.error("❌ Transaksi dibatalkan karena Qty Out melebihi Qty In.")
+        elif pallet_sampai < pallet_dari:
+            st.error("❌ Rentang pallet tidak valid.")
+        else:
+            tipe_clean = "IN" if is_inbound else "OUT"
+            sisa_stok = qty_in - qty_out if not is_inbound else qty_in
+            
+            payload = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "tipe": tipe_clean,
+                "barang": f"{part_number} - {selected_product} (Lot: {lot_number})",
+                "rak": lokasi_rak,
+                "qty": f"In:{qty_in} | Out:{qty_out} | Sisa:{sisa_stok} (Pallet {pallet_dari}-{pallet_sampai})"
+            }
+            
+            try:
+                response = requests.post(WEB_APP_URL, json=payload)
+                if response.status_code == 200:
+                    st.success(f"✅ Transaksi {tipe_clean} Berhasil Disimpan! (Sisa Stok Tercatat: {sisa_stok})")
+                    st.cache_data.clear()
+                else:
+                    st.error("❌ Gagal mengirim data ke Google Sheets.")
+            except Exception as e:
+                st.error(f"Terjadi kesalahan koneksi: {e}")
 
 st.divider()
-st.subheader("📜 Riwayat Transaksi Lapangan Terbaru")
-log_df = load_log()
-if not log_df.empty:
-    st.dataframe(log_df.tail(5).iloc[::-1], use_container_width=True, hide_index=True)
-else:
-    st.info("Belum ada riwayat transaksi.")
+st
