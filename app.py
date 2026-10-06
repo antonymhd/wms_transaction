@@ -41,15 +41,7 @@ part_col = 'Part Number' if 'Part Number' in df.columns else 'Part Number'
 product_mapping = df[[product_col, part_col]].dropna().drop_duplicates()
 list_nama_produk = sorted(product_mapping[product_col].astype(str).tolist())
 
-kolom_list = ['G', 'F', 'E', 'D', 'C', 'B', 'A']
 baris_list = list(range(1, 29)) # Baris 1 sampai 28
-
-def is_rack_exist(kolom, baris):
-    if kolom == 'F' and baris < 5: return False
-    if kolom == 'G' and baris < 17: return False
-    return True
-
-daftar_rak = [f"{k}{b}" for k in kolom_list for b in baris_list if is_rack_exist(k, b)]
 
 # =========================================================================
 # TAMPILAN FORM TRANSAKSI
@@ -71,15 +63,25 @@ with st.form("form_wms_transaksi"):
     
     lot_number = st.text_input("No. Lot / Lot Number:", placeholder="Masukkan nomor lot...")
     
-    c1, c2 = st.columns(2)
-    with c1:
-        pilih_kolom = st.selectbox("Kolom Rak:", options=kolom_list)
-    with c2:
-        pilih_baris = st.selectbox("Baris Rak (1 - 28):", options=baris_list)
+    # Pilih Baris Terlebih Dahulu agar Kolom & Kapasitas menyesuaikan
+    pilih_baris = st.selectbox("Pilih Baris Rak (1 - 28):", options=baris_list)
+    
+    # Tentukan Kolom yang aktif berdasarkan Baris
+    if pilih_baris <= 4:
+        kolom_tersedia = ['A', 'B', 'C', 'D', 'E']
+        info_kolom = "Baris 1–4 (Kolom A - E)"
+    elif pilih_baris <= 16:
+        kolom_tersedia = ['A', 'B', 'C', 'D', 'E', 'F']
+        info_kolom = "Baris 5–16 (Kolom A - F)"
+    else:
+        kolom_tersedia = ['A', 'B', 'C', 'D', 'E', 'F', 'G']
+        info_kolom = "Baris 17–28 (Kolom A - G)"
         
+    pilih_kolom = st.selectbox(f"Pilih Kolom Rak ({info_kolom}):", options=kolom_tersedia)
     lokasi_rak = f"{pilih_kolom}{pilih_baris}"
     
-    # Batas maksimal pallet berdasarkan nomor baris
+    # Tentukan Kapasitas Maksimal Pallet berdasarkan Baris
+    # Baris 1-16 = 31 Pallet, Baris 17-28 = 44 Pallet
     max_pallet = 31 if pilih_baris <= 16 else 44
     st.caption(f"ℹ️ Kapasitas maksimal Baris {pilih_baris} adalah **{max_pallet} Pallet**.")
     
@@ -137,4 +139,9 @@ with st.form("form_wms_transaksi"):
                 st.error(f"Terjadi kesalahan koneksi: {e}")
 
 st.divider()
-st
+st.subheader("📜 Riwayat Transaksi Terbaru")
+log_df = load_log()
+if not log_df.empty:
+    st.dataframe(log_df.tail(5).iloc[::-1], use_container_width=True, hide_index=True)
+else:
+    st.info("Belum ada riwayat transaksi tercatat.")
