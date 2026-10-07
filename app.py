@@ -6,10 +6,10 @@ import requests
 # Konfigurasi Halaman
 st.set_page_config(page_title="WMS - Form Transaksi", page_icon="📝", layout="centered")
 
-# PASTIKAN URL INI BENAR (Link Web App /exec)
+# PASTIKAN URL INI BENAR
 WEB_APP_URL = "https://script.google.com/macros/s/AKfycbyUDkB585uFQqq9yVYPRFTUSmHK0bocAn0Ky7wz5a1HRuoDuAO125iq6etbG-Jc5SqsNg/exec"
 
-@st.cache_data(ttl=2) # TTL 2 detik agar selalu membaca stok paling terbaru
+@st.cache_data(ttl=2)
 def load_data():
     try:
         sheet_url = "https://docs.google.com/spreadsheets/d/1rPODgznxi5QxPWk6paIK0-SsTPwIByJPcGYZ8YAUEwc/export?format=csv&gid=0"
@@ -73,14 +73,16 @@ df_lokasi = df[(df['Kolom'].astype(str) == pilih_kolom) &
                (df['Pallet Ke'] >= pallet_dari) & 
                (df['Pallet Ke'] <= pallet_sampai)]
 
-# Hitung berapa pallet yang masih "Terisi" di rentang yang dipilih
 status_terisi = (df_lokasi['Status'] == 'Terisi').sum()
 
-# Ambil data acuan stok jika ada
+# PERBAIKAN LOGIKA: Jika Sisa kosong, otomatis hitung In - Out
 if not df_lokasi.empty:
     acuan_in = pd.to_numeric(df_lokasi['In'], errors='coerce').fillna(0).max()
     acuan_out = pd.to_numeric(df_lokasi['Out'], errors='coerce').fillna(0).max()
-    acuan_sisa = pd.to_numeric(df_lokasi['Sisa'], errors='coerce').fillna(0).max()
+    
+    # Ambil nilai Sisa. Jika 0 (karena kosong di Sheet), paksa hitung secara matematika
+    sisa_di_sheet = pd.to_numeric(df_lokasi['Sisa'], errors='coerce').fillna(0).max()
+    acuan_sisa = sisa_di_sheet if sisa_di_sheet > 0 else (acuan_in - acuan_out)
 else:
     acuan_in = acuan_out = acuan_sisa = 0
 
@@ -115,15 +117,13 @@ if is_inbound:
         sisa_stok_final = qty_in_final
 
 else: # OUTBOUND
-    # VALIDASI OUTBOUND: Rak harus ada isinya
-    if status_terisi == 0 or acuan_sisa <= 0:
+    # VALIDASI OUTBOUND: Hanya ditolak jika benar-benar tidak ada barang (Sisa murni <= 0 dan Status bukan Terisi)
+    if status_terisi == 0 and acuan_sisa <= 0:
         st.error("🚨 **TIDAK BISA DIPROSES:** Lokasi ini **KOSONG** (Sisa: 0). Tidak ada barang yang bisa dikeluarkan dari pallet ini.")
         valid_to_submit = False
     else:
-        # Menampilkan data riil (Tidak perlu input saldo manual lagi)
         st.info(f"📊 **Data Stok Ditemukan:** In Awal = {int(acuan_in)} | Out Terdahulu = {int(acuan_out)} | **SISA STOK = {int(acuan_sisa)}**")
         
-        # Ambil produk bawaan dari sheet agar operator tidak salah pilih barang yang mau di-outbound
         produk_lama = df_lokasi['Nama Produk'].iloc[0] if not pd.isna(df_lokasi['Nama Produk'].iloc[0]) else list_nama_produk[0]
         selected_product = st.selectbox("Pilih Nama Produk (Wajib):", options=list_nama_produk, index=list_nama_produk.index(produk_lama) if produk_lama in list_nama_produk else 0)
         
@@ -134,10 +134,9 @@ else: # OUTBOUND
         lot_lama = df_lokasi['Lot Number'].iloc[0] if not pd.isna(df_lokasi['Lot Number'].iloc[0]) else ""
         lot_number = st.text_input("Lot Number / No. Lot (Wajib):", value=lot_lama)
         
-        # Streamlit membatasi otomatis max_value sesuai acuan sisa
+        # Batasi Qty Out sesuai stok riil yang ada (acuan_sisa)
         qty_out_input = st.number_input(f"Input Qty OUT (Maksimal ditarik: {int(acuan_sisa)}):", min_value=1, max_value=int(acuan_sisa) if int(acuan_sisa) > 0 else 1, step=1, value=1)
         
-        # Rumus Akumulasi: Out Total = Out Lama + Out Baru, Sisa = In - Out Total
         qty_in_final = acuan_in
         qty_out_final = acuan_out + qty_out_input
         sisa_stok_final = qty_in_final - qty_out_final
@@ -178,7 +177,7 @@ if submitted and valid_to_submit:
                 result = response.json()
                 if result.get("status") == "success":
                     st.success(f"✅ Transaksi Berhasil! Sisa Stok sekarang: **{sisa_stok_final}**.")
-                    st.cache_data.clear() # Paksa reload data terbaru
+                    st.cache_data.clear() # Paksa reload
                 else:
                     st.error(f"❌ Error dari server: {result.get('message')}")
             else:
