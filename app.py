@@ -2,17 +2,23 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 import requests
+import time # Tambahkan modul time
 
 # Konfigurasi Halaman
 st.set_page_config(page_title="WMS - Form Transaksi", page_icon="📝", layout="centered")
 
-# PASTIKAN URL INI BENAR
 WEB_APP_URL = "https://script.google.com/macros/s/AKfycbyUDkB585uFQqq9yVYPRFTUSmHK0bocAn0Ky7wz5a1HRuoDuAO125iq6etbG-Jc5SqsNg/exec"
 
-@st.cache_data(ttl=2)
+# ==========================================================
+# SOLUSI ANTI-LEMOT (CACHE BUSTING)
+# ==========================================================
+# Ubah TTL menjadi sangat singkat (1 detik)
+@st.cache_data(ttl=1)
 def load_data():
     try:
-        sheet_url = "https://docs.google.com/spreadsheets/d/1rPODgznxi5QxPWk6paIK0-SsTPwIByJPcGYZ8YAUEwc/export?format=csv&gid=0"
+        # Tambahkan "&t=waktu_saat_ini" di ujung URL agar Google mengira ini link baru
+        cache_buster = int(time.time())
+        sheet_url = f"https://docs.google.com/spreadsheets/d/1rPODgznxi5QxPWk6paIK0-SsTPwIByJPcGYZ8YAUEwc/export?format=csv&gid=0&t={cache_buster}"
         df = pd.read_csv(sheet_url)
         df.columns = df.columns.astype(str).str.strip()
         return df
@@ -20,14 +26,16 @@ def load_data():
         st.error(f"⚠ Gagal memuat data master! Error: {e}")
         st.stop()
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=1)
 def load_log():
     try:
-        log_url = "https://docs.google.com/spreadsheets/d/1rPODgznxi5QxPWk6paIK0-SsTPwIByJPcGYZ8YAUEwc/export?format=csv&sheet=Log%20Transaksi"
+        cache_buster = int(time.time())
+        log_url = f"https://docs.google.com/spreadsheets/d/1rPODgznxi5QxPWk6paIK0-SsTPwIByJPcGYZ8YAUEwc/export?format=csv&sheet=Log%20Transaksi&t={cache_buster}"
         return pd.read_csv(log_url)
     except Exception:
         return pd.DataFrame(columns=["Timestamp", "Tipe Transaksi", "Part Number", "Nama Produk", "Lot Number", "Lokasi Rak", "Rentang Pallet", "Qty In", "Qty Out", "Sisa Stok", "Keterangan"])
 
+# (Sisa kode di bawahnya tetap persis sama seperti sebelumnya)
 df = load_data()
 product_col = 'Nama Produk' if 'Nama Produk' in df.columns else 'Nama Barang'
 part_col = 'Part Number' if 'Part Number' in df.columns else 'Part Number'
