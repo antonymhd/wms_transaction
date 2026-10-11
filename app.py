@@ -4,6 +4,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 import time
 import io
+import copy
 
 # ==========================================================
 # 1. KONFIGURASI WEB & DATABASE
@@ -14,7 +15,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# 💡 NAMA DATABASE SAMA DENGAN APP.PY
+# 💡 NAMA DATABASE
 NAMA_DATABASE = 'uji_coba_rak'
 
 if not firebase_admin._apps:
@@ -26,7 +27,42 @@ st.title("📝 WMS Entry Form (Inbound & Outbound)")
 st.caption(f"Alat khusus PPIC. Terhubung ke database: {NAMA_DATABASE}")
 
 # ==========================================================
-# 2. TABS MENU UTAMA
+# 2. FITUR UNDO & REDO (MEMORI JANGKA PENDEK)
+# ==========================================================
+if 'undo_data' not in st.session_state:
+    st.session_state['undo_data'] = None
+    st.session_state['redo_data'] = None
+    st.session_state['action_msg'] = ""
+    st.session_state['action_kolom'] = ""
+    st.session_state['action_status'] = None # Status: 'DONE' (bisa Undo) atau 'UNDONE' (bisa Redo)
+
+if st.session_state['action_status'] == 'DONE':
+    st.info(f"🔄 **Aksi Terakhir:** {st.session_state['action_msg']}")
+    if st.button("🔙 BATALKAN AKSI TERAKHIR (UNDO)", type="primary"):
+        with st.spinner("Mengembalikan data seperti semula..."):
+            doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{st.session_state['action_kolom']}")
+            doc_ref.set({'data': st.session_state['undo_data']})
+            st.session_state['action_status'] = 'UNDONE' # Ubah status agar bisa di-Redo
+            st.success("✅ Aksi dibatalkan (Undo)! Data kembali seperti semula.")
+            time.sleep(1.5)
+            st.rerun()
+            
+elif st.session_state['action_status'] == 'UNDONE':
+    st.warning(f"↩️ **Anda membatalkan aksi:** {st.session_state['action_msg']}")
+    if st.button("↪️ KEMBALIKAN LAGI (REDO)", type="primary"):
+        with st.spinner("Memulihkan aksi..."):
+            doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{st.session_state['action_kolom']}")
+            doc_ref.set({'data': st.session_state['redo_data']})
+            st.session_state['action_status'] = 'DONE' # Ubah status agar bisa di-Undo lagi
+            st.success("✅ Aksi dipulihkan (Redo)!")
+            time.sleep(1.5)
+            st.rerun()
+
+if st.session_state['action_status'] is not None:
+    st.divider()
+
+# ==========================================================
+# 3. TABS MENU UTAMA
 # ==========================================================
 tab1, tab2, tab3 = st.tabs(["📥 1. Inbound Borongan", "📤 2. Penyesuaian Outbound", "⚙️ 3. Pengaturan & Backup Data"])
 
@@ -35,12 +71,12 @@ tab1, tab2, tab3 = st.tabs(["📥 1. Inbound Borongan", "📤 2. Penyesuaian Out
 # ----------------------------------------------------------
 with tab1:
     st.header("Input Data Kertas (Borongan)")
-    st.info("Pilih rak dan produk. Sistem otomatis melacak sisa slot kosong dan mengisi barisnya.")
+    st.caption("Pilih rak dan produk. Sistem otomatis melacak sisa slot kosong dan mengisi barisnya.")
     
     col_in1, col_in2 = st.columns(2)
     with col_in1:
         in_kolom = st.selectbox("Lokasi Kolom", ["A", "B", "C", "D", "E", "F", "G"])
-        in_baris = st.number_input("Nomor Baris", min_value=1, max_value=28, value=1)
+        in_baris = st.number_input("Nomor Baris (Inbound)", min_value=1, max_value=28, value=1)
         in_qty = st.number_input("Jumlah Pallet Masuk", min_value=1, step=1)
     
     with col_in2:
@@ -76,6 +112,9 @@ with tab1:
                 doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{in_kolom}")
                 doc = doc_ref.get()
                 all_data = doc.to_dict().get('data', []) if doc.exists else []
+                
+                # 📸 Simpan versi SEBELUM untuk Undo
+                data_sebelum = copy.deepcopy(all_data)
                 
                 baris_data = [d for d in all_data if float(d.get('Baris', 0) or 0) == float(in_baris)]
                 
@@ -119,6 +158,14 @@ with tab1:
                         curr_p += 1
                         
                     all_data.extend(new_records)
+                    
+                    # 📸 FOTOKOPI STATE UNTUK UNDO & REDO
+                    st.session_state['undo_data'] = data_sebelum
+                    st.session_state['redo_data'] = copy.deepcopy(all_data)
+                    st.session_state['action_kolom'] = in_kolom
+                    st.session_state['action_msg'] = f"Inbound {in_qty} Pallet '{in_produk}' ke Rak {in_kolom}-{in_baris}"
+                    st.session_state['action_status'] = 'DONE'
+                    
                     doc_ref.set({'data': all_data})
                     st.success(f"✅ Berhasil menyuntikkan {in_qty} pallet ke rak {in_kolom}-{in_baris}!")
                     time.sleep(1)
@@ -129,12 +176,12 @@ with tab1:
 # ----------------------------------------------------------
 with tab2:
     st.header("Penyesuaian Sisa Stok (Berdasarkan No. Lot)")
-    st.warning("Pilih No. Lot yang dibongkar, lalu masukkan SISA AKHIR pallet sesuai coretan di kertas.")
+    st.caption("Pilih No. Lot yang dibongkar, lalu masukkan SISA AKHIR pallet sesuai coretan di kertas.")
     
     col_out1, col_out2 = st.columns([1, 2])
     with col_out1:
         out_kolom = st.selectbox("Lokasi Kolom", ["A", "B", "C", "D", "E", "F", "G"], key="outk")
-        out_baris = st.number_input("Nomor Baris", min_value=1, max_value=28, value=1, key="outb")
+        out_baris = st.number_input("Nomor Baris (Outbound)", min_value=1, max_value=28, value=1, key="outb")
         
     doc_ref_out = db.collection(NAMA_DATABASE).document(f"Kolom_{out_kolom}")
     doc_out = doc_ref_out.get()
@@ -159,7 +206,6 @@ with tab2:
             
             st.markdown(f"**📦 Total Lot `{pilih_lot}` di Rak ini: `{current_qty_lot}` Slot Fisik**")
             
-            # Memunculkan Part Number dan Keterangan
             kolom_tampil = ['Pallet Ke', 'Part Number', 'Nama Produk', 'Lot Number', 'Keterangan']
             kolom_tersedia = [c for c in kolom_tampil if c in df_lot.columns]
             st.dataframe(df_lot[kolom_tersedia].head(5), hide_index=True)
@@ -171,15 +217,17 @@ with tab2:
                 out_sisa_dus = st.number_input("Sisa Pecahan (Dus/Box/Sak)", min_value=0, step=1, value=0)
             
             if st.button("🚜 Sesuaikan Stok Lot Ini", type="primary", use_container_width=True):
-                # LOGIKA FISIK: Jika ada pecahan, rak butuh 1 slot fisik ekstra
                 slot_tambahan = 1 if out_sisa_dus > 0 else 0
                 total_slot_dibutuhkan = out_sisa_akhir + slot_tambahan
                 
                 if total_slot_dibutuhkan > current_qty_lot:
-                    st.error(f"❌ Tidak logis! Anda mengklaim sisa fisik {total_slot_dibutuhkan} Slot (Pallet Utuh + Pecahan), padahal di sistem hanya ada {current_qty_lot} Pallet.")
+                    st.error(f"❌ Tidak logis! Anda mengklaim sisa fisik {total_slot_dibutuhkan} Slot, padahal di sistem hanya ada {current_qty_lot} Pallet.")
                 elif total_slot_dibutuhkan == current_qty_lot and out_sisa_dus == 0:
                     st.info("Sisa pallet sama dengan sistem. Tidak ada yang diubah.")
                 else:
+                    # 📸 Simpan versi SEBELUM untuk Undo
+                    data_sebelum_out = copy.deepcopy(all_out_data)
+                    
                     out_qty = current_qty_lot - total_slot_dibutuhkan
                     pallets_to_remove = df_lot['Pallet Ke'].head(out_qty).tolist() if out_qty > 0 else []
                     
@@ -189,25 +237,29 @@ with tab2:
                         p_val = pd.to_numeric(d.get('Pallet Ke', 0))
                         l_str = str(d.get('Lot Number', ''))
                         
-                        # 1. Buang data jika masuk list hapus
                         if b_val == float(out_baris) and p_val in pallets_to_remove:
                             continue 
                         
-                        # 2. Sisipkan pecahan di pallet paling luar yang tersisa
                         if out_sisa_dus > 0 and b_val == float(out_baris) and l_str == pilih_lot:
                             sisa_pallets = df_lot[~df_lot['Pallet Ke'].isin(pallets_to_remove)]
                             if not sisa_pallets.empty and p_val == sisa_pallets['Pallet Ke'].max():
                                 d['Keterangan'] = f"Pecahan: {out_sisa_dus} qty"
                         
-                        # 3. Hapus keterangan pecahan jika diset jadi 0 lagi
                         elif out_sisa_dus == 0 and b_val == float(out_baris) and l_str == pilih_lot:
                             if 'Pecahan' in str(d.get('Keterangan', '')):
                                 d['Keterangan'] = ""
                                 
                         new_all_out_data.append(d)
                     
+                    # 📸 FOTOKOPI STATE UNTUK UNDO & REDO
+                    st.session_state['undo_data'] = data_sebelum_out
+                    st.session_state['redo_data'] = copy.deepcopy(new_all_out_data)
+                    st.session_state['action_kolom'] = out_kolom
+                    st.session_state['action_msg'] = f"Penyesuaian Outbound Lot '{pilih_lot}' di Rak {out_kolom}-{out_baris}"
+                    st.session_state['action_status'] = 'DONE'
+                    
                     doc_ref_out.set({'data': new_all_out_data})
-                    st.success(f"✅ Selesai! Menggunakan {total_slot_dibutuhkan} Slot Fisik ({out_sisa_akhir} Utuh + 1 Pecahan).")
+                    st.success(f"✅ Selesai! Menggunakan {total_slot_dibutuhkan} Slot Fisik.")
                     time.sleep(1.5)
                     st.rerun()
         else:
@@ -271,6 +323,10 @@ with tab3:
                     for doc in docs:
                         batch.delete(doc.reference)
                     batch.commit()
+                    
+                    # Kosongkan memori jika data di-reset
+                    st.session_state['action_status'] = None
+                    
                     st.success("✅ Seluruh data berhasil dihapus dan dikosongkan!")
                     time.sleep(1.5)
                     st.rerun()
