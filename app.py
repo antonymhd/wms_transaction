@@ -3,9 +3,10 @@ import pandas as pd
 import firebase_admin
 from firebase_admin import credentials, firestore
 import time
+import io
 
 # ==========================================================
-# 1. KONFIGURASI WEB
+# 1. KONFIGURASI WEB & DATABASE
 # ==========================================================
 st.set_page_config(
     page_title="WMS Data Entry - Hokkan Deltapack",
@@ -13,21 +14,21 @@ st.set_page_config(
     layout="wide"
 )
 
-# ==========================================================
-# 2. INISIALISASI FIREBASE
-# ==========================================================
+# 💡 UBAH NAMA INI MENJADI 'visualisasi_rak' AGAR TERHUBUNG KE GUDANG ASLI
+NAMA_DATABASE = 'uji_coba_rak'
+
 if not firebase_admin._apps:
     cred = credentials.Certificate(dict(st.secrets["firebase"]))
     firebase_admin.initialize_app(cred)
 db = firestore.client()
 
 st.title("📝 WMS Entry Form (Inbound & Outbound)")
-st.caption("Alat khusus PPIC untuk konversi laporan kertas lapangan ke sistem visualisasi WMS.")
+st.caption(f"Alat khusus PPIC. Terhubung ke database: {NAMA_DATABASE}")
 
 # ==========================================================
-# 3. TABS MENU (INBOUND & OUTBOUND)
+# 2. TABS MENU UTAMA
 # ==========================================================
-tab1, tab2 = st.tabs(["📥 1. Inbound Borongan (Masuk)", "📤 2. Penyesuaian Outbound (Keluar)"])
+tab1, tab2, tab3 = st.tabs(["📥 1. Inbound Borongan", "📤 2. Penyesuaian Outbound", "⚙️ 3. Pengaturan & Backup Data"])
 
 # ----------------------------------------------------------
 # TAB 1: INBOUND BORONGAN (DENGAN MASTER DATA)
@@ -43,7 +44,6 @@ with tab1:
         in_qty = st.number_input("Jumlah Pallet Masuk", min_value=1, step=1)
     
     with col_in2:
-        # BACA MASTER DATA
         try:
             try:
                 df_master = pd.read_csv("Master_Produk.csv", sep=";")
@@ -73,13 +73,12 @@ with tab1:
             st.error("⚠️ Nama Produk dan Part Number wajib diisi!")
         else:
             with st.spinner("Menyusun data ke dalam rak..."):
-                doc_ref = db.collection('visualisasi_rak').document(f"Kolom_{in_kolom}")
+                doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{in_kolom}")
                 doc = doc_ref.get()
                 all_data = doc.to_dict().get('data', []) if doc.exists else []
                 
                 baris_data = [d for d in all_data if str(d.get('Baris')) == str(in_baris)]
                 
-                # --- LOGIKA KAPASITAS MELAR (BOX D/G) ---
                 is_all_box = in_part.strip().upper().endswith(('D', 'G'))
                 for d in baris_data:
                     pn = str(d.get('Part Number', '')).strip().upper()
@@ -92,7 +91,6 @@ with tab1:
                 else:
                     max_slot = 31 if in_baris <= 16 else 44
                 
-                # Sabuk Pengaman Fisik
                 filled_pallets = [int(float(d.get('Pallet Ke', 0))) for d in baris_data if str(d.get('Pallet Ke', '')) != '']
                 current_qty = len(filled_pallets)
                 if current_qty > max_slot: max_slot = current_qty 
@@ -138,7 +136,7 @@ with tab2:
         out_kolom = st.selectbox("Lokasi Kolom", ["A", "B", "C", "D", "E", "F", "G"], key="outk")
         out_baris = st.number_input("Nomor Baris", min_value=1, max_value=28, value=1, key="outb")
         
-    doc_ref_out = db.collection('visualisasi_rak').document(f"Kolom_{out_kolom}")
+    doc_ref_out = db.collection(NAMA_DATABASE).document(f"Kolom_{out_kolom}")
     doc_out = doc_ref_out.get()
     all_out_data = doc_out.to_dict().get('data', []) if doc_out.exists else []
     
@@ -149,7 +147,6 @@ with tab2:
             df_out = pd.DataFrame(baris_out_data)
             df_out['Pallet Ke'] = pd.to_numeric(df_out['Pallet Ke'], errors='coerce')
             
-            # Deteksi Lot di baris tersebut
             if 'Lot Number' in df_out.columns:
                 tersedia_lot = df_out['Lot Number'].dropna().astype(str).unique().tolist()
             else:
@@ -157,7 +154,6 @@ with tab2:
                 
             pilih_lot = st.selectbox("🎯 Pilih No. Lot yang dikeluarkan:", tersedia_lot)
             
-            # Filter hanya data Lot yang dipilih (Urutkan dari terluar/LIFO)
             df_lot = df_out[df_out['Lot Number'].astype(str) == pilih_lot].sort_values('Pallet Ke', ascending=False)
             current_qty_lot = len(df_lot)
             
@@ -168,15 +164,13 @@ with tab2:
             with col_sisa1:
                 out_sisa_akhir = st.number_input(f"Sisa Akhir Pallet (0 - {current_qty_lot})", min_value=0, max_value=current_qty_lot, step=1, value=current_qty_lot)
             with col_sisa2:
-                out_sisa_dus = st.number_input("Sisa Pecahan (Dus/Box/Sak)", min_value=0, step=1, value=0, help="Opsional: Pecahan yang tertinggal di rak")
+                out_sisa_dus = st.number_input("Sisa Pecahan (Dus/Box/Sak)", min_value=0, step=1, value=0)
             
             if st.button("🚜 Sesuaikan Stok Lot Ini", type="primary", use_container_width=True):
                 if out_sisa_akhir == current_qty_lot and out_sisa_dus == 0:
                     st.info("Sisa pallet sama dengan sistem. Tidak ada yang diubah.")
                 else:
                     out_qty = current_qty_lot - out_sisa_akhir 
-                    
-                    # Target Pallet yang dihapus (dari posisi paling luar KHUSUS Lot ini)
                     pallets_to_remove = df_lot['Pallet Ke'].head(out_qty).tolist()
                     
                     new_all_out_data = []
@@ -185,11 +179,9 @@ with tab2:
                         p_val = pd.to_numeric(d.get('Pallet Ke', 0))
                         l_str = str(d.get('Lot Number', ''))
                         
-                        # 1. Hapus jika masuk daftar bongkar
                         if b_str == str(out_baris) and p_val in pallets_to_remove:
                             continue 
                         
-                        # 2. Sisipkan keterangan pecahan dus ke pallet terluar yang tersisa
                         if out_sisa_dus > 0 and b_str == str(out_baris) and l_str == pilih_lot:
                             sisa_pallets = df_lot[~df_lot['Pallet Ke'].isin(pallets_to_remove)]
                             if not sisa_pallets.empty and p_val == sisa_pallets['Pallet Ke'].max():
@@ -203,3 +195,67 @@ with tab2:
                     st.rerun()
         else:
             st.info(f"📍 Rak {out_kolom}-{out_baris} kosong melompong.")
+
+# ----------------------------------------------------------
+# TAB 3: PENGATURAN & BACKUP DATA
+# ----------------------------------------------------------
+with tab3:
+    st.header("⚙️ Ekspor dan Hapus Data")
+    
+    st.subheader("📥 Tarik Laporan (Export to CSV)")
+    st.write("Unduh kondisi terkini seluruh racking gudang menjadi file Excel (CSV).")
+    
+    if st.button("Persiapkan Data untuk Diunduh"):
+        with st.spinner("Menarik data dari Firebase..."):
+            docs = db.collection(NAMA_DATABASE).stream()
+            semua_data = []
+            for doc in docs:
+                doc_data = doc.to_dict()
+                if 'data' in doc_data:
+                    semua_data.extend(doc_data['data'])
+                    
+            if semua_data:
+                df_export = pd.DataFrame(semua_data)
+                kolom_harapan = ['Kolom', 'Baris', 'Pallet Ke', 'Part Number', 'Lot Number', 'Nama Produk', 'Saldo Awal', 'In', 'Out', 'Sisa', 'Keterangan', 'Status']
+                
+                for c in kolom_harapan:
+                    if c not in df_export.columns:
+                        df_export[c] = ""
+                        
+                df_export = df_export[kolom_harapan]
+                
+                csv_buffer = io.StringIO()
+                df_export.to_csv(csv_buffer, index=False, sep=";")
+                csv_data = csv_buffer.getvalue()
+                
+                st.success("✅ Data berhasil ditarik! Klik tombol di bawah untuk mengunduh.")
+                st.download_button(
+                    label="⬇️ Unduh Data (CSV)",
+                    data=csv_data,
+                    file_name="Backup_Racking_Hokkan.csv",
+                    mime="text/csv"
+                )
+            else:
+                st.warning("Database saat ini kosong. Tidak ada data yang bisa diunduh.")
+
+    st.divider()
+
+    st.subheader("⚠️ Zona Berbahaya: Reset Database")
+    st.error("Perhatian! Menekan tombol ini akan menghapus SELURUH data racking di aplikasi WMS. Pastikan Anda sudah mengunduh (backup) data terlebih dahulu.")
+    
+    hapus_pin = st.text_input("Masukkan PIN Reset (1234) untuk membuka tombol hapus:", type="password")
+    
+    if hapus_pin == "1234":
+        if st.button("🗑️ SAYA YAKIN, HAPUS SEMUA DATA SEKARANG!", type="primary", use_container_width=True):
+            with st.spinner("Menghapus data di Firebase..."):
+                try:
+                    docs = db.collection(NAMA_DATABASE).stream()
+                    batch = db.batch()
+                    for doc in docs:
+                        batch.delete(doc.reference)
+                    batch.commit()
+                    st.success("✅ Seluruh data berhasil dihapus dan dikosongkan!")
+                    time.sleep(1.5)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Gagal menghapus: {e}")
