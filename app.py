@@ -6,8 +6,7 @@ import time
 import io
 import copy
 import re
-from datetime import datetime
-import pytz
+from datetime import datetime, timedelta
 
 # ==========================================================
 # 1. KONFIGURASI WEB & DATABASE
@@ -30,10 +29,10 @@ db = firestore.client()
 st.title("📝 WMS Entry Form (Inbound & Outbound)")
 st.caption(f"Alat khusus PPIC. Terhubung ke database: {NAMA_DATABASE}")
 
-# --- FUNGSI PENCATAT LOG MUTASI OTOMATIS ---
+# --- FUNGSI PENCATAT LOG MUTASI OTOMATIS (Tanpa pytz) ---
 def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh, pecahan, keterangan=""):
-    tz = pytz.timezone('Asia/Jakarta')
-    waktu_sekarang = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+    # Menggunakan UTC+7 untuk Waktu Indonesia Barat (WIB)
+    waktu_sekarang = (datetime.utcnow() + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S")
     
     log_data = {
         "Waktu Transaksi": waktu_sekarang,
@@ -195,14 +194,13 @@ with tab1:
                     st.error("⚠️ Masukkan minimal 1 Pallet Utuh atau Pecahan!")
                 else:
                     with st.spinner("Menyusun data ke dalam rak..."):
-                        # Tarik data ulang untuk memastikan akurasi saat eksekusi
                         doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{k_pilih}")
                         doc = doc_ref.get()
                         all_data_raw2 = doc.to_dict().get('data', []) if doc.exists else []
                         
                         data_sebelum = copy.deepcopy(all_data_raw2)
                         
-                        # Pembersihan data hantu (Hanya di baris yang dituju)
+                        # Pembersihan data hantu
                         all_data = []
                         for d in all_data_raw2:
                             is_baris_sama = float(d.get('Baris', 0) or 0) == float(b_pilih)
@@ -213,7 +211,6 @@ with tab1:
                         
                         baris_data_actual = [d for d in all_data if float(d.get('Baris', 0) or 0) == float(b_pilih)]
                         
-                        # Cek produk campur Box/Sak termasuk inputan terbaru
                         is_all_box_actual = in_part.strip().upper().endswith(('D', 'G'))
                         for d in baris_data_actual:
                             pn = str(d.get('Part Number', '')).strip().upper()
@@ -275,7 +272,6 @@ with tab1:
         else:
             st.info("👈 Silakan tentukan Lokasi Kolom dan Baris di sebelah kiri, lalu klik 'Cek Status Rak'.")
 
-
 # ----------------------------------------------------------
 # TAB 2: OUTBOUND (PENYESUAIAN SISA BERDASARKAN LOT)
 # ----------------------------------------------------------
@@ -334,7 +330,6 @@ with tab2:
                     df_lot = df_out[df_out['Lot Number'].astype(str) == pilih_lot].sort_values('Pallet Ke', ascending=False)
                     current_qty_lot = len(df_lot)
                     
-                    # LOGIKA MATEMATIKA AWAL UNTUK MENGHITUNG OUTBOUND 
                     jml_utuh_awal = df_lot[~df_lot['Keterangan'].astype(str).str.contains('Pecahan', case=False, na=False)].shape[0]
                     pecahan_rows = df_lot[df_lot['Keterangan'].astype(str).str.contains('Pecahan', case=False, na=False)]
                     pecahan_awal = 0
@@ -478,14 +473,12 @@ with tab4:
             if log_list:
                 df_log = pd.DataFrame(log_list)
                 
-                # Susun ulang kolom agar enak dibaca
                 ordered_cols = ["Waktu Transaksi", "Jenis Transaksi", "Lokasi Rak", "Nama Produk", "No Lot", "Mutasi Pallet", "Mutasi Pecahan (Dus/Sak)", "Part Number", "Keterangan"]
                 avail_cols = [c for c in ordered_cols if c in df_log.columns]
                 df_log = df_log[avail_cols]
                 
                 st.dataframe(df_log, use_container_width=True, hide_index=True)
                 
-                # Tombol Download Excel Log
                 csv_log_buffer = io.StringIO()
                 df_log.to_csv(csv_log_buffer, index=False, sep=";")
                 csv_log_data = csv_log_buffer.getvalue()
@@ -493,7 +486,7 @@ with tab4:
                 st.download_button(
                     label="⬇️ Unduh Laporan Mutasi (CSV)",
                     data=csv_log_data,
-                    file_name=f"Mutasi_WMS_{datetime.now().strftime('%Y%m%d')}.csv",
+                    file_name=f"Mutasi_WMS_{(datetime.utcnow() + timedelta(hours=7)).strftime('%Y%m%d')}.csv",
                     mime="text/csv",
                     help="Unduh catatan In/Out untuk dilaporkan ke manajemen."
                 )
