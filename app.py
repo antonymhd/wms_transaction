@@ -34,7 +34,7 @@ if 'undo_data' not in st.session_state:
     st.session_state['redo_data'] = None
     st.session_state['action_msg'] = ""
     st.session_state['action_kolom'] = ""
-    st.session_state['action_status'] = None # Status: 'DONE' (bisa Undo) atau 'UNDONE' (bisa Redo)
+    st.session_state['action_status'] = None 
 
 if st.session_state['action_status'] == 'DONE':
     st.info(f"🔄 **Aksi Terakhir:** {st.session_state['action_msg']}")
@@ -42,7 +42,7 @@ if st.session_state['action_status'] == 'DONE':
         with st.spinner("Mengembalikan data seperti semula..."):
             doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{st.session_state['action_kolom']}")
             doc_ref.set({'data': st.session_state['undo_data']})
-            st.session_state['action_status'] = 'UNDONE' # Ubah status agar bisa di-Redo
+            st.session_state['action_status'] = 'UNDONE'
             st.success("✅ Aksi dibatalkan (Undo)! Data kembali seperti semula.")
             time.sleep(1.5)
             st.rerun()
@@ -53,7 +53,7 @@ elif st.session_state['action_status'] == 'UNDONE':
         with st.spinner("Memulihkan aksi..."):
             doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{st.session_state['action_kolom']}")
             doc_ref.set({'data': st.session_state['redo_data']})
-            st.session_state['action_status'] = 'DONE' # Ubah status agar bisa di-Undo lagi
+            st.session_state['action_status'] = 'DONE'
             st.success("✅ Aksi dipulihkan (Redo)!")
             time.sleep(1.5)
             st.rerun()
@@ -67,7 +67,7 @@ if st.session_state['action_status'] is not None:
 tab1, tab2, tab3 = st.tabs(["📥 1. Inbound Borongan", "📤 2. Penyesuaian Outbound", "⚙️ 3. Pengaturan & Backup Data"])
 
 # ----------------------------------------------------------
-# TAB 1: INBOUND BORONGAN
+# TAB 1: INBOUND BORONGAN (KINI MENDUKUNG PECAHAN)
 # ----------------------------------------------------------
 with tab1:
     st.header("Input Data Kertas (Borongan)")
@@ -77,7 +77,13 @@ with tab1:
     with col_in1:
         in_kolom = st.selectbox("Lokasi Kolom", ["A", "B", "C", "D", "E", "F", "G"])
         in_baris = st.number_input("Nomor Baris (Inbound)", min_value=1, max_value=28, value=1)
-        in_qty = st.number_input("Jumlah Pallet Masuk", min_value=1, step=1)
+        
+        # --- PERUBAHAN: DIBAGI DUA (UTUH & PECAHAN) ---
+        col_qty1, col_qty2 = st.columns(2)
+        with col_qty1:
+            in_qty = st.number_input("Pallet Masuk UTUH", min_value=0, step=1, value=1)
+        with col_qty2:
+            in_pecahan = st.number_input("Sisa Pecahan (Qty)", min_value=0, step=1, value=0)
     
     with col_in2:
         try:
@@ -107,6 +113,8 @@ with tab1:
     if st.button("🚀 Simpan Inbound", type="primary", use_container_width=True):
         if not in_produk or not in_part:
             st.error("⚠️ Nama Produk dan Part Number wajib diisi!")
+        elif in_qty == 0 and in_pecahan == 0:
+            st.error("⚠️ Masukkan minimal 1 Pallet Utuh atau Pecahan!")
         else:
             with st.spinner("Menyusun data ke dalam rak..."):
                 doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{in_kolom}")
@@ -134,28 +142,47 @@ with tab1:
                 current_qty = len(filled_pallets)
                 if current_qty > max_slot: max_slot = current_qty 
                 
-                if current_qty + in_qty > max_slot:
-                    st.error(f"❌ **Kapasitas Penuh!** Baris ini maksimal muat {max_slot} pallet. Terisi {current_qty}. Sisa ruang {max_slot - current_qty} slot.")
+                # Hitung Slot Fisik Inbound: Pallet Utuh + (1 jika ada pecahan)
+                total_inbound_slots = in_qty + (1 if in_pecahan > 0 else 0)
+                
+                if current_qty + total_inbound_slots > max_slot:
+                    st.error(f"❌ **Kapasitas Penuh!** Anda memasukkan {total_inbound_slots} Slot Fisik. Rak maksimal muat {max_slot}. Terisi {current_qty}. Sisa ruang {max_slot - current_qty} slot.")
                 else:
                     next_pallet = max(filled_pallets) + 1 if filled_pallets else 1
                     new_records = []
-                    added = 0
-                    curr_p = next_pallet
                     
-                    while added < in_qty:
-                        if curr_p not in filled_pallets:
-                            new_records.append({
-                                'Kolom': in_kolom,
-                                'Baris': float(in_baris),
-                                'Pallet Ke': float(curr_p),
-                                'Part Number': in_part,
-                                'Lot Number': in_lot,
-                                'Nama Produk': in_produk,
-                                'In': 1, 'Out': 0, 'Sisa': 1, 'Status': 'Terisi',
-                                'Keterangan': ''
-                            })
-                            added += 1
-                        curr_p += 1
+                    # 1. Eksekusi Pallet Utuh
+                    for _ in range(int(in_qty)):
+                        while next_pallet in filled_pallets:
+                            next_pallet += 1
+                        new_records.append({
+                            'Kolom': in_kolom,
+                            'Baris': float(in_baris),
+                            'Pallet Ke': float(next_pallet),
+                            'Part Number': in_part,
+                            'Lot Number': in_lot,
+                            'Nama Produk': in_produk,
+                            'In': 1, 'Out': 0, 'Sisa': 1, 'Status': 'Terisi',
+                            'Keterangan': ''
+                        })
+                        filled_pallets.append(next_pallet)
+                        next_pallet += 1
+                        
+                    # 2. Eksekusi Pallet Pecahan (Di posisi terluar)
+                    if in_pecahan > 0:
+                        while next_pallet in filled_pallets:
+                            next_pallet += 1
+                        new_records.append({
+                            'Kolom': in_kolom,
+                            'Baris': float(in_baris),
+                            'Pallet Ke': float(next_pallet),
+                            'Part Number': in_part,
+                            'Lot Number': in_lot,
+                            'Nama Produk': in_produk,
+                            'In': 1, 'Out': 0, 'Sisa': 1, 'Status': 'Terisi',
+                            'Keterangan': f"Pecahan: {in_pecahan} qty"
+                        })
+                        filled_pallets.append(next_pallet)
                         
                     all_data.extend(new_records)
                     
@@ -163,12 +190,12 @@ with tab1:
                     st.session_state['undo_data'] = data_sebelum
                     st.session_state['redo_data'] = copy.deepcopy(all_data)
                     st.session_state['action_kolom'] = in_kolom
-                    st.session_state['action_msg'] = f"Inbound {in_qty} Pallet '{in_produk}' ke Rak {in_kolom}-{in_baris}"
+                    st.session_state['action_msg'] = f"Inbound {total_inbound_slots} Slot Fisik '{in_produk}' ke Rak {in_kolom}-{in_baris}"
                     st.session_state['action_status'] = 'DONE'
                     
                     doc_ref.set({'data': all_data})
-                    st.success(f"✅ Berhasil menyuntikkan {in_qty} pallet ke rak {in_kolom}-{in_baris}!")
-                    time.sleep(1)
+                    st.success(f"✅ Berhasil menyuntikkan data! Memakan {total_inbound_slots} Slot Fisik di rak {in_kolom}-{in_baris}.")
+                    time.sleep(1.5)
                     st.rerun()
 
 # ----------------------------------------------------------
@@ -225,7 +252,6 @@ with tab2:
                 elif total_slot_dibutuhkan == current_qty_lot and out_sisa_dus == 0:
                     st.info("Sisa pallet sama dengan sistem. Tidak ada yang diubah.")
                 else:
-                    # 📸 Simpan versi SEBELUM untuk Undo
                     data_sebelum_out = copy.deepcopy(all_out_data)
                     
                     out_qty = current_qty_lot - total_slot_dibutuhkan
@@ -251,7 +277,6 @@ with tab2:
                                 
                         new_all_out_data.append(d)
                     
-                    # 📸 FOTOKOPI STATE UNTUK UNDO & REDO
                     st.session_state['undo_data'] = data_sebelum_out
                     st.session_state['redo_data'] = copy.deepcopy(new_all_out_data)
                     st.session_state['action_kolom'] = out_kolom
@@ -324,7 +349,6 @@ with tab3:
                         batch.delete(doc.reference)
                     batch.commit()
                     
-                    # Kosongkan memori jika data di-reset
                     st.session_state['action_status'] = None
                     
                     st.success("✅ Seluruh data berhasil dihapus dan dikosongkan!")
