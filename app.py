@@ -75,7 +75,8 @@ with tab1:
     
     col_in1, col_in2 = st.columns(2)
     with col_in1:
-        in_kolom = st.selectbox("Lokasi Kolom", ["A", "B", "C", "D", "E", "F", "G"])
+        # PERBAIKAN: Menambahkan key="in_kolom"
+        in_kolom = st.selectbox("Lokasi Kolom", ["A", "B", "C", "D", "E", "F", "G"], key="in_kolom")
         in_baris = st.number_input("Nomor Baris (Inbound)", min_value=1, max_value=28, value=1)
         
         col_qty1, col_qty2 = st.columns(2)
@@ -199,7 +200,6 @@ with tab2:
     st.header("Penyesuaian Sisa Stok (Berdasarkan No. Lot)")
     st.caption("Pilih No. Lot yang dibongkar, lalu masukkan SISA AKHIR pallet sesuai coretan di kertas.")
     
-    # --- FITUR TOMBOL CARI RAK ---
     if 'out_lokasi_dicari' not in st.session_state:
         st.session_state['out_lokasi_dicari'] = False
         st.session_state['out_k_pilih'] = "A"
@@ -208,8 +208,9 @@ with tab2:
     col_out1, col_out2 = st.columns([1, 2])
     with col_out1:
         st.markdown("**1. Pilih Lokasi Rak**")
-        out_kolom = st.selectbox("Lokasi Kolom", ["A", "B", "C", "D", "E", "F", "G"])
-        out_baris = st.number_input("Nomor Baris", min_value=1, max_value=28, value=1)
+        # PERBAIKAN: Menambahkan key="out_kolom" agar tidak bentrok dengan Tab 1
+        out_kolom = st.selectbox("Lokasi Kolom", ["A", "B", "C", "D", "E", "F", "G"], key="out_kolom")
+        out_baris = st.number_input("Nomor Baris (Outbound)", min_value=1, max_value=28, value=1)
         
         if st.button("🔍 Cari Data Rak", use_container_width=True):
             st.session_state['out_lokasi_dicari'] = True
@@ -218,7 +219,6 @@ with tab2:
             
     with col_out2:
         if st.session_state['out_lokasi_dicari']:
-            # Panggil database HANYA jika tombol Cari ditekan
             k_pilih = st.session_state['out_k_pilih']
             b_pilih = st.session_state['out_b_pilih']
             
@@ -232,9 +232,7 @@ with tab2:
                 df_out = pd.DataFrame(baris_out_data)
                 df_out['Pallet Ke'] = pd.to_numeric(df_out['Pallet Ke'], errors='coerce')
                 
-                # --- FITUR NAMA PRODUK + NO LOT DI DROPDOWN ---
                 if 'Lot Number' in df_out.columns:
-                    # Gabungkan Nama Produk dan Lot Number untuk tampilan Dropdown
                     tersedia_lot = []
                     mapping_lot = {}
                     
@@ -252,7 +250,6 @@ with tab2:
                 st.markdown(f"**2. Eksekusi Pembongkaran di Rak {k_pilih}-{b_pilih}**")
                 pilihan_label = st.selectbox("🎯 Pilih Produk & No. Lot yang dikeluarkan:", tersedia_lot)
                 
-                # Ambil Lot aslinya kembali dari dictionary
                 pilih_lot = mapping_lot[pilihan_label]
                 
                 df_lot = df_out[df_out['Lot Number'].astype(str) == pilih_lot].sort_values('Pallet Ke', ascending=False)
@@ -313,7 +310,6 @@ with tab2:
                         doc_ref_out.set({'data': new_all_out_data})
                         st.success(f"✅ Selesai! Menggunakan {total_slot_dibutuhkan} Slot Fisik.")
                         
-                        # Reset pencarian setelah sukses agar UI segar kembali
                         st.session_state['out_lokasi_dicari'] = False
                         time.sleep(1.5)
                         st.rerun()
