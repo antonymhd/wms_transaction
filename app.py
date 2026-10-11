@@ -14,7 +14,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# 💡 UBAH NAMA INI MENJADI 'visualisasi_rak' AGAR TERHUBUNG KE GUDANG ASLI
+# 💡 NAMA DATABASE SAMA DENGAN APP.PY
 NAMA_DATABASE = 'uji_coba_rak'
 
 if not firebase_admin._apps:
@@ -31,7 +31,7 @@ st.caption(f"Alat khusus PPIC. Terhubung ke database: {NAMA_DATABASE}")
 tab1, tab2, tab3 = st.tabs(["📥 1. Inbound Borongan", "📤 2. Penyesuaian Outbound", "⚙️ 3. Pengaturan & Backup Data"])
 
 # ----------------------------------------------------------
-# TAB 1: INBOUND BORONGAN (DENGAN MASTER DATA)
+# TAB 1: INBOUND BORONGAN
 # ----------------------------------------------------------
 with tab1:
     st.header("Input Data Kertas (Borongan)")
@@ -77,7 +77,8 @@ with tab1:
                 doc = doc_ref.get()
                 all_data = doc.to_dict().get('data', []) if doc.exists else []
                 
-                baris_data = [d for d in all_data if str(d.get('Baris')) == str(in_baris)]
+                # PERBAIKAN: Gunakan float() agar kebal terhadap "1.0"
+                baris_data = [d for d in all_data if float(d.get('Baris', 0) or 0) == float(in_baris)]
                 
                 is_all_box = in_part.strip().upper().endswith(('D', 'G'))
                 for d in baris_data:
@@ -91,7 +92,7 @@ with tab1:
                 else:
                     max_slot = 31 if in_baris <= 16 else 44
                 
-                filled_pallets = [int(float(d.get('Pallet Ke', 0))) for d in baris_data if str(d.get('Pallet Ke', '')) != '']
+                filled_pallets = [int(float(d.get('Pallet Ke', 0) or 0)) for d in baris_data if pd.notna(d.get('Pallet Ke')) and str(d.get('Pallet Ke')).strip() != '']
                 current_qty = len(filled_pallets)
                 if current_qty > max_slot: max_slot = current_qty 
                 
@@ -107,8 +108,8 @@ with tab1:
                         if curr_p not in filled_pallets:
                             new_records.append({
                                 'Kolom': in_kolom,
-                                'Baris': in_baris,
-                                'Pallet Ke': curr_p,
+                                'Baris': float(in_baris), # Simpan sebagai angka yang bersih
+                                'Pallet Ke': float(curr_p),
                                 'Part Number': in_part,
                                 'Lot Number': in_lot,
                                 'Nama Produk': in_produk,
@@ -140,7 +141,8 @@ with tab2:
     doc_out = doc_ref_out.get()
     all_out_data = doc_out.to_dict().get('data', []) if doc_out.exists else []
     
-    baris_out_data = [d for d in all_out_data if str(d.get('Baris')) == str(out_baris)]
+    # PERBAIKAN: Gunakan float() untuk membaca data
+    baris_out_data = [d for d in all_out_data if float(d.get('Baris', 0) or 0) == float(out_baris)]
     
     with col_out2:
         if baris_out_data:
@@ -175,14 +177,15 @@ with tab2:
                     
                     new_all_out_data = []
                     for d in all_out_data:
-                        b_str = str(d.get('Baris'))
+                        # PERBAIKAN: Gunakan float() di sini juga
+                        b_val = float(d.get('Baris', 0) or 0)
                         p_val = pd.to_numeric(d.get('Pallet Ke', 0))
                         l_str = str(d.get('Lot Number', ''))
                         
-                        if b_str == str(out_baris) and p_val in pallets_to_remove:
+                        if b_val == float(out_baris) and p_val in pallets_to_remove:
                             continue 
                         
-                        if out_sisa_dus > 0 and b_str == str(out_baris) and l_str == pilih_lot:
+                        if out_sisa_dus > 0 and b_val == float(out_baris) and l_str == pilih_lot:
                             sisa_pallets = df_lot[~df_lot['Pallet Ke'].isin(pallets_to_remove)]
                             if not sisa_pallets.empty and p_val == sisa_pallets['Pallet Ke'].max():
                                 d['Keterangan'] = f"Sisa pecahan: {out_sisa_dus} qty"
