@@ -1,222 +1,157 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime
 import firebase_admin
-from firebase_admin import credentials
-from firebase_admin import firestore
+from firebase_admin import credentials, firestore
+import time
 
 # ==========================================================
-# 1. KONFIGURASI HALAMAN & INISIALISASI FIREBASE
+# 1. KONFIGURASI WEB
 # ==========================================================
-st.set_page_config(page_title="WMS - Form Transaksi", page_icon="⚡", layout="centered")
+st.set_page_config(
+    page_title="WMS Data Entry - Hokkan Deltapack",
+    page_icon="📝",
+    layout="wide"
+)
 
-# Inisialisasi Firebase menggunakan kunci rahasia dari Streamlit Secrets
+# ==========================================================
+# 2. INISIALISASI FIREBASE
+# ==========================================================
 if not firebase_admin._apps:
     cred = credentials.Certificate(dict(st.secrets["firebase"]))
     firebase_admin.initialize_app(cred)
-
 db = firestore.client()
 
-# ==========================================================
-# 2. LOAD DATA (PRODUK DARI SHEETS, STOK DARI FIREBASE)
-# ==========================================================
-# Data produk tetap dari Sheets agar mudah diedit (Cache 1 Jam)
-@st.cache_data(ttl=3600)
-def load_product_mapping():
-    try:
-        sheet_url = "https://docs.google.com/spreadsheets/d/1rPODgznxi5QxPWk6paIK0-SsTPwIByJPcGYZ8YAUEwc/export?format=csv&gid=0"
-        df = pd.read_csv(sheet_url)
-        df.columns = df.columns.astype(str).str.strip()
-        product_col = 'Nama Produk' if 'Nama Produk' in df.columns else 'Nama Barang'
-        part_col = 'Part Number' if 'Part Number' in df.columns else 'Part Number'
-        return df[[product_col, part_col]].dropna().drop_duplicates()
-    except Exception as e:
-        st.error("Gagal memuat daftar produk.")
-        return pd.DataFrame({'Nama Produk': ['-'], 'Part Number': ['-']})
-
-product_mapping = load_product_mapping()
-product_col = product_mapping.columns[0]
-part_col = product_mapping.columns[1]
-list_nama_produk = sorted(product_mapping[product_col].astype(str).tolist())
-baris_list = list(range(1, 29))
+st.title("📝 WMS Entry Form (Inbound & Outbound)")
+st.caption("Alat khusus PPIC untuk konversi laporan kertas lapangan secara instan ke sistem visualisasi WMS.")
 
 # ==========================================================
-# 3. TAMPILAN UI FORM
+# 3. TABS MENU (INBOUND & OUTBOUND)
 # ==========================================================
-st.title("⚡ Form Transaksi Gudang (Firebase)")
-st.caption("Didukung oleh Firebase Firestore. Sinkronisasi Real-time di bawah 1 detik.")
-st.divider()
+tab1, tab2 = st.tabs(["📥 1. Inbound Borongan (Masuk)", "📤 2. Outbound LIFO (Keluar)"])
 
-tipe_trx = st.selectbox("Jenis Pergerakan:", ["INBOUND (Barang Masuk) ⬇️", "OUTBOUND (Barang Keluar) ⬆️"])
-is_inbound = "INBOUND" in tipe_trx
-
-st.markdown("### 1️⃣ Tentukan Lokasi Rak")
-pilih_baris = st.selectbox("Pilih Baris Rak (1 - 28):", options=baris_list)
-
-if pilih_baris <= 4:
-    kolom_tersedia, info_kolom = ['A', 'B', 'C', 'D', 'E'], "Baris 1–4 (Kolom A - E)"
-elif pilih_baris <= 16:
-    kolom_tersedia, info_kolom = ['A', 'B', 'C', 'D', 'E', 'F'], "Baris 5–16 (Kolom A - F)"
-else:
-    kolom_tersedia, info_kolom = ['A', 'B', 'C', 'D', 'E', 'F', 'G'], "Baris 17–28 (Kolom A - G)"
+# ----------------------------------------------------------
+# TAB 1: INBOUND BORONGAN
+# ----------------------------------------------------------
+with tab1:
+    st.header("Input Data Kertas (Borongan)")
+    st.info("Ketik data dari form kertas. Sistem otomatis mendeteksi sisa ruang dan menyusun pallet berurutan.")
     
-pilih_kolom = st.selectbox(f"Pilih Kolom Rak ({info_kolom}):", options=kolom_tersedia)
-max_pallet = 31 if pilih_baris <= 16 else 44
-st.caption(f"ℹ️ Kapasitas maksimal Baris {pilih_baris} = **{max_pallet} Pallet**.")
-
-c1, c2 = st.columns(2)
-with c1:
-    pallet_dari = st.number_input("Dari Pallet ke-:", min_value=1, max_value=max_pallet, step=1, value=1)
-with c2:
-    pallet_sampai = st.number_input("Sampai Pallet ke-:", min_value=1, max_value=max_pallet, step=1, value=1)
-
-# ==========================================================
-# 4. VALIDASI SMART REAL-TIME (LANGSUNG DARI FIREBASE)
-# ==========================================================
-# Tarik data rak yang dipilih langsung dari Firebase (Seketika/Tanpa Cache)
-docs = db.collection('master_rak').where('Kolom', '==', pilih_kolom).where('Baris', '==', pilih_baris).stream()
-semua_pallet = [doc.to_dict() for doc in docs]
-df_lokasi = pd.DataFrame(semua_pallet)
-
-status_terisi = 0
-acuan_in = acuan_out = acuan_sisa = 0
-
-# Filter rentang pallet di Python agar tidak kena error Index Firebase
-if not df_lokasi.empty:
-    df_lokasi['Pallet_Ke'] = pd.to_numeric(df_lokasi['Pallet_Ke'], errors='coerce')
-    df_lokasi = df_lokasi[(df_lokasi['Pallet_Ke'] >= pallet_dari) & (df_lokasi['Pallet_Ke'] <= pallet_sampai)]
+    col_in1, col_in2 = st.columns(2)
+    with col_in1:
+        in_kolom = st.selectbox("Lokasi Kolom", ["A", "B", "C", "D", "E", "F", "G"])
+        in_baris = st.number_input("Nomor Baris", min_value=1, max_value=28, value=1)
+        in_qty = st.number_input("Jumlah Pallet Masuk", min_value=1, step=1)
     
-    if not df_lokasi.empty:
-        status_terisi = (df_lokasi['Status'] == 'Terisi').sum()
-        acuan_in = pd.to_numeric(df_lokasi['In'], errors='coerce').fillna(0).max()
-        acuan_out = pd.to_numeric(df_lokasi['Out'], errors='coerce').fillna(0).max()
-        sisa_di_db = pd.to_numeric(df_lokasi['Sisa'], errors='coerce').fillna(0).max()
-        acuan_sisa = sisa_di_db if sisa_di_db > 0 else (acuan_in - acuan_out)
-
-st.divider()
-
-# ==========================================================
-# 5. INPUT IDENTITAS & KUANTITAS
-# ==========================================================
-st.markdown("### 2️⃣ Kuantitas & Identitas Produk")
-
-valid_to_submit = True
-qty_in_final = qty_out_final = sisa_stok_final = 0
-
-if is_inbound:
-    if status_terisi > 0:
-        st.error(f"🚨 **TIDAK BISA DIPROSES:** Ada **{status_terisi} pallet** di lokasi ini yang masih Terisi. Pilih slot yang kosong!")
-        valid_to_submit = False
-    else:
-        st.success("✅ Lokasi Kosong, siap untuk Inbound.")
-        selected_product = st.selectbox("Pilih Nama Produk (Wajib):", options=list_nama_produk)
-        matched_row = product_mapping[product_mapping[product_col].astype(str) == selected_product]
-        part_number = matched_row[part_col].values[0] if not matched_row.empty else ""
+    with col_in2:
+        in_produk = st.text_input("Nama Produk")
+        in_part = st.text_input("Part Number", help="Jika berakhiran D/G, sistem akan otomatis membaca kemasan Box.")
+        in_lot = st.text_input("No. Lot Produksi / Mesin Shift")
         
-        st.text_input("Part Number (Auto):", value=part_number, disabled=True)
-        lot_number = st.text_input("Lot Number / No. Lot (Wajib):")
-        
-        qty_in_final = st.number_input("Input Qty IN (Masuk):", min_value=1, step=1, value=1)
-        qty_out_final = 0
-        sisa_stok_final = qty_in_final
-
-else:
-    if status_terisi == 0 and acuan_sisa <= 0:
-        st.error("🚨 **TIDAK BISA DIPROSES:** Lokasi ini **KOSONG** (Sisa: 0).")
-        valid_to_submit = False
-    else:
-        st.info(f"📊 **Data Stok Real-time:** In Awal = {int(acuan_in)} | Out Terdahulu = {int(acuan_out)} | **SISA = {int(acuan_sisa)}**")
-        
-        produk_lama = df_lokasi['Nama_Produk'].iloc[0] if 'Nama_Produk' in df_lokasi.columns else list_nama_produk[0]
-        selected_product = st.selectbox("Pilih Nama Produk (Wajib):", options=list_nama_produk, index=list_nama_produk.index(produk_lama) if produk_lama in list_nama_produk else 0)
-        
-        matched_row = product_mapping[product_mapping[product_col].astype(str) == selected_product]
-        part_number = matched_row[part_col].values[0] if not matched_row.empty else ""
-        st.text_input("Part Number (Auto):", value=part_number, disabled=True)
-        
-        lot_lama = df_lokasi['Lot_Number'].iloc[0] if 'Lot_Number' in df_lokasi.columns else ""
-        lot_number = st.text_input("Lot Number / No. Lot (Wajib):", value=lot_lama)
-        
-        qty_out_input = st.number_input(f"Input Qty OUT (Maks: {int(acuan_sisa)}):", min_value=1, max_value=int(acuan_sisa) if int(acuan_sisa) > 0 else 1, step=1, value=1)
-        
-        qty_in_final = acuan_in
-        qty_out_final = acuan_out + qty_out_input
-        sisa_stok_final = qty_in_final - qty_out_final
-
-keterangan = st.text_area("Keterangan Tambahan (Opsional):")
-submitted = st.button("🚀 Simpan Transaksi Instan", type="primary", use_container_width=True, disabled=not valid_to_submit)
-
-# ==========================================================
-# 6. PENYIMPANAN KE FIREBASE (SUPER CEPAT)
-# ==========================================================
-if submitted and valid_to_submit:
-    if not lot_number.strip():
-        st.error("🚨 Gagal: **Lot Number** wajib diisi!")
-    elif pallet_sampai < pallet_dari:
-        st.error("🚨 Gagal: Rentang pallet tidak logis.")
-    else:
-        with st.spinner("Menulis ke Firebase... ⚡"):
-            try:
-                # Menggunakan sistem Batch agar puluhan pallet ter-update dalam 1 kedipan mata
-                batch = db.batch()
+    if st.button("🚀 Simpan Inbound", type="primary", use_container_width=True):
+        if not in_produk or not in_part:
+            st.error("⚠️ Nama Produk dan Part Number wajib diisi!")
+        else:
+            with st.spinner("Menganalisis kapasitas fisik rak..."):
+                doc_ref = db.collection('visualisasi_rak').document(f"Kolom_{in_kolom}")
+                doc = doc_ref.get()
+                all_data = doc.to_dict().get('data', []) if doc.exists else []
                 
-                # A. Menulis ke Log Transaksi
-                log_ref = db.collection('log_transaksi').document()
-                batch.set(log_ref, {
-                    "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "Tipe_Transaksi": "INBOUND" if is_inbound else "OUTBOUND",
-                    "Part_Number": part_number,
-                    "Nama_Produk": selected_product,
-                    "Lot_Number": lot_number,
-                    "Lokasi_Rak": f"{pilih_kolom}{pilih_baris}",
-                    "Rentang_Pallet": f"{pallet_dari} - {pallet_sampai}",
-                    "Qty_In": qty_in_final,
-                    "Qty_Out": qty_out_final,
-                    "Sisa_Stok": sisa_stok_final,
-                    "Keterangan": keterangan
-                })
+                # Filter barang yang ada di baris terpilih
+                baris_data = [d for d in all_data if str(d.get('Baris')) == str(in_baris)]
                 
-                # B. Mengubah Status Fisik Rak
-                is_terisi = (sisa_stok_final > 0)
-                for pallet in range(pallet_dari, pallet_sampai + 1):
-                    doc_id = f"{pilih_kolom}{pilih_baris}-{pallet}" # Format ID unik: A1-1, A1-2, dst.
-                    rak_ref = db.collection('master_rak').document(doc_id)
-                    batch.set(rak_ref, {
-                        "Kolom": pilih_kolom,
-                        "Baris": pilih_baris,
-                        "Pallet_Ke": pallet,
-                        "Part_Number": part_number if is_terisi else "",
-                        "Lot_Number": lot_number if is_terisi else "",
-                        "Nama_Produk": selected_product if is_terisi else "",
-                        "In": qty_in_final if is_terisi else 0,
-                        "Out": qty_out_final if is_terisi else 0,
-                        "Sisa": sisa_stok_final if is_terisi else 0,
-                        "Status": "Terisi" if is_terisi else "Kosong",
-                        "Keterangan": keterangan if is_terisi else ""
-                    }, merge=True)
+                # --- LOGIKA KAPASITAS MELAR (BOX D/G) ---
+                is_all_box = in_part.strip().upper().endswith(('D', 'G'))
+                for d in baris_data:
+                    pn = str(d.get('Part Number', '')).strip().upper()
+                    if pn and not pn.endswith(('D', 'G')):
+                        is_all_box = False # Gagal melar jika ada campuran/Sak
+                        break
+                        
+                if is_all_box:
+                    max_slot = 32 if in_baris <= 16 else 46
+                else:
+                    max_slot = 31 if in_baris <= 16 else 44
                 
-                # Eksekusi semua perintah sekaligus
-                batch.commit()
-                st.success(f"✅ Transaksi Berhasil dalam Sekejap! Sisa Stok sekarang: **{sisa_stok_final}**.")
+                # Cek slot terpakai
+                filled_pallets = [int(float(d.get('Pallet Ke', 0))) for d in baris_data if str(d.get('Pallet Ke', '')) != '']
+                current_qty = len(filled_pallets)
                 
-            except Exception as e:
-                st.error(f"❌ Terjadi kesalahan jaringan Firebase: {e}")
+                # Validasi Overcapacity Fisik
+                if current_qty + in_qty > max_slot:
+                    st.error(f"❌ **Kapasitas Fisik Penuh!** Baris ini maksimal muat {max_slot} pallet. Saat ini sudah terisi {current_qty} pallet. Sisa ruang hanya {max_slot - current_qty} slot.")
+                else:
+                    # Cari urutan pallet terdepan
+                    next_pallet = max(filled_pallets) + 1 if filled_pallets else 1
+                    
+                    new_records = []
+                    added = 0
+                    curr_p = next_pallet
+                    
+                    while added < in_qty:
+                        if curr_p not in filled_pallets:
+                            new_records.append({
+                                'Kolom': in_kolom,
+                                'Baris': in_baris,
+                                'Pallet Ke': curr_p,
+                                'Part Number': in_part,
+                                'Lot Number': in_lot,
+                                'Nama Produk': in_produk,
+                                'In': 1, 'Out': 0, 'Sisa': 1, 'Status': 'Terisi'
+                            })
+                            added += 1
+                        curr_p += 1
+                        
+                    # Simpan pergerakan data ke Firestore
+                    all_data.extend(new_records)
+                    doc_ref.set({'data': all_data})
+                    st.success(f"✅ Berhasil menyuntikkan {in_qty} pallet ke rak {in_kolom}-{in_baris}!")
+                    time.sleep(1)
+                    st.rerun()
 
-# ==========================================================
-# 7. MENAMPILKAN RIWAYAT TRANSAKSI DARI FIREBASE
-# ==========================================================
-st.divider()
-st.subheader("📜 Riwayat Log Terakhir (Firebase)")
-try:
-    log_docs = db.collection('log_transaksi').order_by('Timestamp', direction=firestore.Query.DESCENDING).limit(5).stream()
-    log_data = [doc.to_dict() for doc in log_docs]
+# ----------------------------------------------------------
+# TAB 2: OUTBOUND (LIFO)
+# ----------------------------------------------------------
+with tab2:
+    st.header("Eksekusi Pengeluaran Barang")
+    st.warning("Sistem mematuhi logika Last-In-First-Out (LIFO). Pallet terluar/terdepan akan dikeluarkan terlebih dahulu.")
     
-    if log_data:
-        df_log = pd.DataFrame(log_data)
-        # Susun ulang urutan kolom agar enak dibaca
-        kolom_rapi = ['Timestamp', 'Tipe_Transaksi', 'Lokasi_Rak', 'Rentang_Pallet', 'Nama_Produk', 'Lot_Number', 'Qty_In', 'Qty_Out', 'Sisa_Stok']
-        st.dataframe(df_log[kolom_rapi], use_container_width=True, hide_index=True)
-    else:
-        st.info("Belum ada log transaksi. Coba input satu data Inbound!")
-except Exception as e:
-    st.warning("Menunggu data transaksi pertama masuk...")
+    col_out1, col_out2 = st.columns([1, 2])
+    with col_out1:
+        out_kolom = st.selectbox("Lokasi Kolom Racking", ["A", "B", "C", "D", "E", "F", "G"], key="outk")
+        out_baris = st.number_input("Nomor Baris", min_value=1, max_value=28, value=1, key="outb")
+        
+    doc_ref_out = db.collection('visualisasi_rak').document(f"Kolom_{out_kolom}")
+    doc_out = doc_ref_out.get()
+    all_out_data = doc_out.to_dict().get('data', []) if doc_out.exists else []
+    baris_out_data = [d for d in all_out_data if str(d.get('Baris')) == str(out_baris)]
+    
+    with col_out2:
+        if baris_out_data:
+            df_out = pd.DataFrame(baris_out_data)
+            df_out['Pallet Ke'] = pd.to_numeric(df_out['Pallet Ke'], errors='coerce')
+            df_out = df_out.sort_values('Pallet Ke', ascending=False) # LIFO (Nomor Terbesar di atas)
+            
+            st.markdown(f"**📦 Posisi Terluar di Rak {out_kolom}-{out_baris} saat ini:**")
+            st.dataframe(df_out[['Pallet Ke', 'Nama Produk', 'Lot Number']].head(5), hide_index=True)
+            
+            out_qty = st.number_input("Jumlah Pallet yang di-Bongkar (Outbound)", min_value=1, max_value=len(baris_out_data), step=1)
+            
+            if st.button("🚜 Eksekusi Outbound", type="primary", use_container_width=True):
+                # Ambil ID/Pallet Ke dari N barang teratas
+                pallets_to_remove = df_out['Pallet Ke'].head(out_qty).tolist()
+                
+                new_all_out_data = []
+                removed = 0
+                for d in all_out_data:
+                    # Filter: Hapus data jika Baris & Pallet Ke-nya cocok dengan yang dibongkar
+                    if str(d.get('Baris')) == str(out_baris) and pd.to_numeric(d.get('Pallet Ke', 0)) in pallets_to_remove:
+                        removed += 1
+                        continue 
+                    new_all_out_data.append(d)
+                
+                doc_ref_out.set({'data': new_all_out_data})
+                st.success(f"✅ {removed} Pallet sukses dikeluarkan dari posisi terdepan rak {out_kolom}-{out_baris}!")
+                time.sleep(1)
+                st.rerun()
+        else:
+            st.info(f"📍 Rak {out_kolom}-{out_baris} dalam keadaan kosong melompong.")
