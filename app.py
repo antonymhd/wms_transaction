@@ -75,7 +75,6 @@ with tab1:
     
     col_in1, col_in2 = st.columns(2)
     with col_in1:
-        # PERBAIKAN: Menambahkan key="in_kolom"
         in_kolom = st.selectbox("Lokasi Kolom", ["A", "B", "C", "D", "E", "F", "G"], key="in_kolom")
         in_baris = st.number_input("Nomor Baris (Inbound)", min_value=1, max_value=28, value=1)
         
@@ -119,9 +118,19 @@ with tab1:
             with st.spinner("Menyusun data ke dalam rak..."):
                 doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{in_kolom}")
                 doc = doc_ref.get()
-                all_data = doc.to_dict().get('data', []) if doc.exists else []
+                all_data_raw = doc.to_dict().get('data', []) if doc.exists else []
                 
-                data_sebelum = copy.deepcopy(all_data)
+                data_sebelum = copy.deepcopy(all_data_raw)
+                
+                # --- PERBAIKAN KRUSIAL: Sapu bersih data "Hantu" (Baris yg kosong melompong dari CSV awal) ---
+                # Hanya singkirkan data kosong DI BARIS YANG SEDANG DIPILIH SAJA.
+                all_data = []
+                for d in all_data_raw:
+                    is_baris_sama = float(d.get('Baris', 0) or 0) == float(in_baris)
+                    is_hantu = str(d.get('Part Number', '')).strip() == ''
+                    if is_baris_sama and is_hantu:
+                        continue # Abaikan data hantu ini (jangan dimasukkan ke all_data)
+                    all_data.append(d)
                 
                 baris_data = [d for d in all_data if float(d.get('Baris', 0) or 0) == float(in_baris)]
                 
@@ -137,6 +146,7 @@ with tab1:
                 else:
                     max_slot = 31 if in_baris <= 16 else 44
                 
+                # Sekarang perhitungan terisi menjadi 100% akurat sesuai fisik aktual
                 filled_pallets = [int(float(d.get('Pallet Ke', 0) or 0)) for d in baris_data if pd.notna(d.get('Pallet Ke')) and str(d.get('Pallet Ke')).strip() != '']
                 current_qty = len(filled_pallets)
                 if current_qty > max_slot: max_slot = current_qty 
@@ -208,7 +218,6 @@ with tab2:
     col_out1, col_out2 = st.columns([1, 2])
     with col_out1:
         st.markdown("**1. Pilih Lokasi Rak**")
-        # PERBAIKAN: Menambahkan key="out_kolom" agar tidak bentrok dengan Tab 1
         out_kolom = st.selectbox("Lokasi Kolom", ["A", "B", "C", "D", "E", "F", "G"], key="out_kolom")
         out_baris = st.number_input("Nomor Baris (Outbound)", min_value=1, max_value=28, value=1)
         
@@ -232,7 +241,10 @@ with tab2:
                 df_out = pd.DataFrame(baris_out_data)
                 df_out['Pallet Ke'] = pd.to_numeric(df_out['Pallet Ke'], errors='coerce')
                 
-                if 'Lot Number' in df_out.columns:
+                # Saring hanya yang ada Part Number-nya (Bukan Hantu)
+                df_out = df_out[df_out['Part Number'].astype(str).str.strip() != ""]
+                
+                if not df_out.empty and 'Lot Number' in df_out.columns:
                     tersedia_lot = []
                     mapping_lot = {}
                     
@@ -243,78 +255,77 @@ with tab2:
                         
                         tersedia_lot.append(label_dropdown)
                         mapping_lot[label_dropdown] = lot_asli
+                        
+                    st.markdown(f"**2. Eksekusi Pembongkaran di Rak {k_pilih}-{b_pilih}**")
+                    pilihan_label = st.selectbox("🎯 Pilih Produk & No. Lot yang dikeluarkan:", tersedia_lot)
+                    
+                    pilih_lot = mapping_lot[pilihan_label]
+                    
+                    df_lot = df_out[df_out['Lot Number'].astype(str) == pilih_lot].sort_values('Pallet Ke', ascending=False)
+                    current_qty_lot = len(df_lot)
+                    
+                    st.markdown(f"**📦 Total Lot `{pilih_lot}` di Rak ini: `{current_qty_lot}` Slot Fisik**")
+                    
+                    kolom_tampil = ['Pallet Ke', 'Part Number', 'Nama Produk', 'Lot Number', 'Keterangan']
+                    kolom_tersedia = [c for c in kolom_tampil if c in df_lot.columns]
+                    st.dataframe(df_lot[kolom_tersedia].head(5), hide_index=True)
+                    
+                    col_sisa1, col_sisa2 = st.columns(2)
+                    with col_sisa1:
+                        out_sisa_akhir = st.number_input(f"Sisa Pallet UTUH (0 - {current_qty_lot})", min_value=0, max_value=current_qty_lot, step=1, value=current_qty_lot)
+                    with col_sisa2:
+                        out_sisa_dus = st.number_input("Sisa Pecahan (Dus/Box/Sak)", min_value=0, step=1, value=0)
+                    
+                    if st.button("🚜 Sesuaikan Stok Lot Ini", type="primary", use_container_width=True):
+                        slot_tambahan = 1 if out_sisa_dus > 0 else 0
+                        total_slot_dibutuhkan = out_sisa_akhir + slot_tambahan
+                        
+                        if total_slot_dibutuhkan > current_qty_lot:
+                            st.error(f"❌ Tidak logis! Anda mengklaim sisa fisik {total_slot_dibutuhkan} Slot, padahal di sistem hanya ada {current_qty_lot} Pallet.")
+                        elif total_slot_dibutuhkan == current_qty_lot and out_sisa_dus == 0:
+                            st.info("Sisa pallet sama dengan sistem. Tidak ada yang diubah.")
+                        else:
+                            data_sebelum_out = copy.deepcopy(all_out_data)
+                            
+                            out_qty = current_qty_lot - total_slot_dibutuhkan
+                            pallets_to_remove = df_lot['Pallet Ke'].head(out_qty).tolist() if out_qty > 0 else []
+                            
+                            new_all_out_data = []
+                            for d in all_out_data:
+                                b_val = float(d.get('Baris', 0) or 0)
+                                p_val = pd.to_numeric(d.get('Pallet Ke', 0))
+                                l_str = str(d.get('Lot Number', ''))
+                                
+                                if b_val == float(b_pilih) and p_val in pallets_to_remove:
+                                    continue 
+                                
+                                if out_sisa_dus > 0 and b_val == float(b_pilih) and l_str == pilih_lot:
+                                    sisa_pallets = df_lot[~df_lot['Pallet Ke'].isin(pallets_to_remove)]
+                                    if not sisa_pallets.empty and p_val == sisa_pallets['Pallet Ke'].max():
+                                        d['Keterangan'] = f"Pecahan: {out_sisa_dus} qty"
+                                
+                                elif out_sisa_dus == 0 and b_val == float(b_pilih) and l_str == pilih_lot:
+                                    if 'Pecahan' in str(d.get('Keterangan', '')):
+                                        d['Keterangan'] = ""
+                                        
+                                new_all_out_data.append(d)
+                            
+                            st.session_state['undo_data'] = data_sebelum_out
+                            st.session_state['redo_data'] = copy.deepcopy(new_all_out_data)
+                            st.session_state['action_kolom'] = k_pilih
+                            st.session_state['action_msg'] = f"Penyesuaian Outbound Lot '{pilih_lot}' di Rak {k_pilih}-{b_pilih}"
+                            st.session_state['action_status'] = 'DONE'
+                            
+                            doc_ref_out.set({'data': new_all_out_data})
+                            st.success(f"✅ Selesai! Menggunakan {total_slot_dibutuhkan} Slot Fisik.")
+                            
+                            st.session_state['out_lokasi_dicari'] = False
+                            time.sleep(1.5)
+                            st.rerun()
                 else:
-                    tersedia_lot = ["Tidak ada data Lot"]
-                    mapping_lot = {"Tidak ada data Lot": "Tidak ada data Lot"}
-                    
-                st.markdown(f"**2. Eksekusi Pembongkaran di Rak {k_pilih}-{b_pilih}**")
-                pilihan_label = st.selectbox("🎯 Pilih Produk & No. Lot yang dikeluarkan:", tersedia_lot)
-                
-                pilih_lot = mapping_lot[pilihan_label]
-                
-                df_lot = df_out[df_out['Lot Number'].astype(str) == pilih_lot].sort_values('Pallet Ke', ascending=False)
-                current_qty_lot = len(df_lot)
-                
-                st.markdown(f"**📦 Total Lot `{pilih_lot}` di Rak ini: `{current_qty_lot}` Slot Fisik**")
-                
-                kolom_tampil = ['Pallet Ke', 'Part Number', 'Nama Produk', 'Lot Number', 'Keterangan']
-                kolom_tersedia = [c for c in kolom_tampil if c in df_lot.columns]
-                st.dataframe(df_lot[kolom_tersedia].head(5), hide_index=True)
-                
-                col_sisa1, col_sisa2 = st.columns(2)
-                with col_sisa1:
-                    out_sisa_akhir = st.number_input(f"Sisa Pallet UTUH (0 - {current_qty_lot})", min_value=0, max_value=current_qty_lot, step=1, value=current_qty_lot)
-                with col_sisa2:
-                    out_sisa_dus = st.number_input("Sisa Pecahan (Dus/Box/Sak)", min_value=0, step=1, value=0)
-                
-                if st.button("🚜 Sesuaikan Stok Lot Ini", type="primary", use_container_width=True):
-                    slot_tambahan = 1 if out_sisa_dus > 0 else 0
-                    total_slot_dibutuhkan = out_sisa_akhir + slot_tambahan
-                    
-                    if total_slot_dibutuhkan > current_qty_lot:
-                        st.error(f"❌ Tidak logis! Anda mengklaim sisa fisik {total_slot_dibutuhkan} Slot, padahal di sistem hanya ada {current_qty_lot} Pallet.")
-                    elif total_slot_dibutuhkan == current_qty_lot and out_sisa_dus == 0:
-                        st.info("Sisa pallet sama dengan sistem. Tidak ada yang diubah.")
-                    else:
-                        data_sebelum_out = copy.deepcopy(all_out_data)
-                        
-                        out_qty = current_qty_lot - total_slot_dibutuhkan
-                        pallets_to_remove = df_lot['Pallet Ke'].head(out_qty).tolist() if out_qty > 0 else []
-                        
-                        new_all_out_data = []
-                        for d in all_out_data:
-                            b_val = float(d.get('Baris', 0) or 0)
-                            p_val = pd.to_numeric(d.get('Pallet Ke', 0))
-                            l_str = str(d.get('Lot Number', ''))
-                            
-                            if b_val == float(b_pilih) and p_val in pallets_to_remove:
-                                continue 
-                            
-                            if out_sisa_dus > 0 and b_val == float(b_pilih) and l_str == pilih_lot:
-                                sisa_pallets = df_lot[~df_lot['Pallet Ke'].isin(pallets_to_remove)]
-                                if not sisa_pallets.empty and p_val == sisa_pallets['Pallet Ke'].max():
-                                    d['Keterangan'] = f"Pecahan: {out_sisa_dus} qty"
-                            
-                            elif out_sisa_dus == 0 and b_val == float(b_pilih) and l_str == pilih_lot:
-                                if 'Pecahan' in str(d.get('Keterangan', '')):
-                                    d['Keterangan'] = ""
-                                    
-                            new_all_out_data.append(d)
-                        
-                        st.session_state['undo_data'] = data_sebelum_out
-                        st.session_state['redo_data'] = copy.deepcopy(new_all_out_data)
-                        st.session_state['action_kolom'] = k_pilih
-                        st.session_state['action_msg'] = f"Penyesuaian Outbound Lot '{pilih_lot}' di Rak {k_pilih}-{b_pilih}"
-                        st.session_state['action_status'] = 'DONE'
-                        
-                        doc_ref_out.set({'data': new_all_out_data})
-                        st.success(f"✅ Selesai! Menggunakan {total_slot_dibutuhkan} Slot Fisik.")
-                        
-                        st.session_state['out_lokasi_dicari'] = False
-                        time.sleep(1.5)
-                        st.rerun()
+                    st.info(f"📍 Rak {k_pilih}-{b_pilih} masih kosong melompong (Hanya berisi slot kosong / hantu).")
             else:
-                st.info(f"📍 Rak {k_pilih}-{b_pilih} kosong melompong.")
+                st.info(f"📍 Rak {k_pilih}-{b_pilih} belum ada data sama sekali.")
         else:
             st.info("👈 Silakan tentukan Lokasi Kolom dan Baris di sebelah kiri, lalu klik 'Cari Data Rak'.")
 
