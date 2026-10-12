@@ -429,7 +429,6 @@ with tab3:
             if semua_data:
                 df_export = pd.DataFrame(semua_data)
                 
-                # --- LOAD MASTER PRODUK UNTUK KALKULASI ---
                 try:
                     try: df_master = pd.read_csv("Master_Produk.csv", sep=";")
                     except: df_master = pd.read_csv("Master_Produk.csv", sep=",")
@@ -438,14 +437,12 @@ with tab3:
                     df_master = pd.DataFrame()
                     st.warning("Master_Produk.csv tidak ditemukan, konversi Pcs mungkin bernilai 0.")
 
-                # --- PROSES KALKULASI PER BARIS (CSV SUPER) ---
                 qty_utuh_list = []
                 qty_dus_list = []
                 qty_pcs_list = []
                 grand_total_list = []
                 
                 for idx, row in df_export.iterrows():
-                    # Abaikan data hantu
                     if pd.isna(row.get('Part Number')) or str(row.get('Part Number')).strip() == '':
                         qty_utuh_list.append(0); qty_dus_list.append(0); qty_pcs_list.append(0); grand_total_list.append(0)
                         continue
@@ -491,18 +488,16 @@ with tab3:
                 df_export['Qty Pcs Eceran'] = qty_pcs_list
                 df_export['Grand Total Pcs'] = grand_total_list
                 
-                # --- KOLOM FINAL CSV AUDIT ---
                 kolom_harapan = ['Kolom', 'Baris', 'Pallet Ke', 'Part Number', 'Lot Number', 'Nama Produk', 'Keterangan', 'Status', 'Qty Utuh', 'Qty Dus/Sak', 'Qty Pcs Eceran', 'Grand Total Pcs']
                 
                 for c in kolom_harapan:
                     if c not in df_export.columns:
                         df_export[c] = ""
                         
-                # Menghilangkan angka desimal (.0)
                 for col in ['Baris', 'Pallet Ke', 'Qty Utuh', 'Qty Dus/Sak', 'Qty Pcs Eceran', 'Grand Total Pcs']:
                     df_export[col] = pd.to_numeric(df_export[col], errors='coerce').fillna(0).astype(int)
                     if col in ['Baris', 'Pallet Ke']:
-                        df_export[col] = df_export[col].replace(0, "") # Biarkan kosong jika 0
+                        df_export[col] = df_export[col].replace(0, "")
                         
                 df_export = df_export[kolom_harapan]
                 
@@ -550,7 +545,7 @@ with tab4:
             st.error(f"Gagal memuat log mutasi: {e}")
 
 # ----------------------------------------------------------
-# TAB 5: PELACAK LOKASI (FIFO) - FITUR BARU
+# TAB 5: PELACAK LOKASI & FIFO (+ TOTAL PCS)
 # ----------------------------------------------------------
 with tab5:
     st.header("🔎 Pelacak Lokasi Rak & FIFO")
@@ -566,7 +561,6 @@ with tab5:
     df_fifo_raw = pd.DataFrame(all_fifo_data)
     
     if not df_fifo_raw.empty and 'Nama Produk' in df_fifo_raw.columns:
-        # Buang data hantu
         df_fifo_raw = df_fifo_raw[df_fifo_raw['Part Number'].astype(str).str.strip() != ""]
         
         if not df_fifo_raw.empty:
@@ -576,8 +570,31 @@ with tab5:
             if pilih_produk_fifo != "-- Pilih Produk --":
                 df_prod_fifo = df_fifo_raw[df_fifo_raw['Nama Produk'] == pilih_produk_fifo]
                 
+                # --- LOAD DATA MASTER UNTUK KALKULASI PCS ---
+                try:
+                    try: df_master = pd.read_csv("Master_Produk.csv", sep=";")
+                    except: df_master = pd.read_csv("Master_Produk.csv", sep=",")
+                    df_master['Part Number Clean'] = df_master['Part Number'].astype(str).str.strip().str.upper()
+                except:
+                    df_master = pd.DataFrame()
+                
+                # Ambil part number dari barang yang dipilih
+                part_num_fifo = str(df_prod_fifo['Part Number'].iloc[0]).strip().upper()
+                isi_pallet_fifo = 0
+                pcs_per_satuan_fifo = 0
+                
+                if not df_master.empty and part_num_fifo in df_master['Part Number Clean'].values:
+                    m_row = df_master[df_master['Part Number Clean'] == part_num_fifo].iloc[0]
+                    isi_pallet_fifo = pd.to_numeric(m_row.get('Isi 1 Pallet (pcs)', 0), errors='coerce')
+                    isi_pallet_fifo = 0 if pd.isna(isi_pallet_fifo) else isi_pallet_fifo
+                    
+                    is_box_fifo = part_num_fifo.endswith('D')
+                    val_satuan_fifo = pd.to_numeric(m_row.get('Box / Pallet' if is_box_fifo else 'Sac / Pallet', 0), errors='coerce')
+                    pcs_per_satuan_fifo = 0 if pd.isna(val_satuan_fifo) else val_satuan_fifo
+
                 summary_fifo = []
-                # Kelompokkan berdasarkan No Lot dan Lokasi Rak
+                grand_total_pcs = 0
+                
                 for (lot, k, b), group in df_prod_fifo.groupby(['Lot Number', 'Kolom', 'Baris']):
                     jml_utuh = 0
                     pecahan_val = 0
@@ -597,20 +614,28 @@ with tab5:
                             
                             match_ec = re.search(r'eceran:\s*(\d+)', ket)
                             if match_ec: eceran_val += int(match_ec.group(1))
-                            
+                    
+                    # --- MATEMATIKA TOTAL PCS PER BARIS RAK ---
+                    total_pcs_baris = (jml_utuh * isi_pallet_fifo) + (pecahan_val * pcs_per_satuan_fifo) + eceran_val
+                    grand_total_pcs += total_pcs_baris
+                    
                     summary_fifo.append({
                         'Lot Number (Urut FIFO)': str(lot),
                         'Lokasi Rak': f"{k}-{int(float(b))}",
                         'Qty Pallet Utuh': jml_utuh,
                         'Qty Dus/Sak': pecahan_val,
-                        'Qty Eceran (Pcs)': eceran_val
+                        'Qty Eceran (Pcs)': eceran_val,
+                        'Total Qty (Pcs)': f"{total_pcs_baris:,.0f}"
                     })
                     
                 df_summary = pd.DataFrame(summary_fifo)
-                # Mengurutkan berdasarkan No Lot (Alphanumeric dari yang terkecil/tertua)
                 df_summary = df_summary.sort_values(by=['Lot Number (Urut FIFO)', 'Lokasi Rak'])
                 
-                st.success(f"📍 Ditemukan **{len(df_summary)} lokasi penyimpanan** untuk produk ini.")
+                # --- TAMPILAN KARTU METRIK DAN TABEL ---
+                col_met1, col_met2 = st.columns(2)
+                col_met1.metric("📍 Lokasi Penyimpanan", f"{len(df_summary)} Titik Rak")
+                col_met2.metric("📦 Grand Total Stok", f"{grand_total_pcs:,.0f} Pcs")
+                
                 st.dataframe(df_summary, use_container_width=True, hide_index=True)
         else:
             st.info("Gudang saat ini kosong (tidak ada data produk riil).")
