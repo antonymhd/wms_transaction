@@ -465,7 +465,9 @@ with tab4:
         
     with st.spinner("Memuat buku catatan..."):
         try:
-            log_docs = db.collection(DB_LOG_MUTASI).order_by("Waktu Transaksi", direction=firestore.Query.DESCENDING).limit(100).stream()
+            # --- PERBAIKAN: Menggunakan Timestamp_System agar tidak error spasi ---
+            log_docs = db.collection(DB_LOG_MUTASI).order_by("Timestamp_System", direction=firestore.Query.DESCENDING).limit(100).stream()
+            
             log_list = []
             for d in log_docs:
                 log_list.append(d.to_dict())
