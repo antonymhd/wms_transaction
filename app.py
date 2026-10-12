@@ -78,7 +78,7 @@ if st.session_state['action_status'] is not None:
 # ==========================================================
 # 3. TABS MENU UTAMA
 # ==========================================================
-tab1, tab2, tab3, tab4 = st.tabs(["📥 1. Inbound Borongan", "📤 2. Penyesuaian Outbound", "⚙️ 3. Pengaturan & Backup", "📊 4. Laporan Mutasi Harian"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📥 1. Inbound", "📤 2. Outbound", "⚙️ 3. Audit & Backup", "📊 4. Log Mutasi", "🔎 5. Pelacak FIFO"])
 
 # ----------------------------------------------------------
 # TAB 1: INBOUND BORONGAN
@@ -166,7 +166,6 @@ with tab1:
                 
             in_lot = st.text_input("No. Lot Produksi / Mesin Shift")
             
-            # --- FORM INPUT 3 BAGIAN (PALLET, DUS, PCS) ---
             col_qty1, col_qty2, col_qty3 = st.columns(3)
             with col_qty1:
                 in_qty = st.number_input("Pallet Masuk UTUH", min_value=0, step=1, value=1)
@@ -411,14 +410,15 @@ with tab2:
             st.info("👈 Silakan tentukan Lokasi Kolom dan Baris di sebelah kiri, lalu klik 'Cari Data Rak'.")
 
 # ----------------------------------------------------------
-# TAB 3: PENGATURAN & BACKUP DATA
+# TAB 3: PENGATURAN, AUDIT, & BACKUP DATA (CSV SUPER)
 # ----------------------------------------------------------
 with tab3:
-    st.header("⚙️ Ekspor dan Hapus Data")
-    st.subheader("📥 Tarik Laporan Master (Export to CSV)")
+    st.header("⚙️ Audit Stok & Ekspor Data")
+    st.subheader("📥 Tarik Laporan Audit (CSV Super)")
+    st.write("Sistem akan otomatis menghitung total pcs tiap baris rak menggunakan referensi Master Produk. Bebas angka desimal (koma nol)!")
     
-    if st.button("Persiapkan Data Racking Terkini untuk Diunduh"):
-        with st.spinner("Menarik data dari Firebase..."):
+    if st.button("Racik Laporan Audit Stok Sekarang", type="primary"):
+        with st.spinner("Membaca database dan mengkalkulasi Pcs..."):
             docs = db.collection(NAMA_DATABASE).stream()
             semua_data = []
             for doc in docs:
@@ -428,19 +428,90 @@ with tab3:
                     
             if semua_data:
                 df_export = pd.DataFrame(semua_data)
-                kolom_harapan = ['Kolom', 'Baris', 'Pallet Ke', 'Part Number', 'Lot Number', 'Nama Produk', 'Saldo Awal', 'In', 'Out', 'Sisa', 'Keterangan', 'Status']
+                
+                # --- LOAD MASTER PRODUK UNTUK KALKULASI ---
+                try:
+                    try: df_master = pd.read_csv("Master_Produk.csv", sep=";")
+                    except: df_master = pd.read_csv("Master_Produk.csv", sep=",")
+                    df_master['Part Number Clean'] = df_master['Part Number'].astype(str).str.strip().str.upper()
+                except:
+                    df_master = pd.DataFrame()
+                    st.warning("Master_Produk.csv tidak ditemukan, konversi Pcs mungkin bernilai 0.")
+
+                # --- PROSES KALKULASI PER BARIS (CSV SUPER) ---
+                qty_utuh_list = []
+                qty_dus_list = []
+                qty_pcs_list = []
+                grand_total_list = []
+                
+                for idx, row in df_export.iterrows():
+                    # Abaikan data hantu
+                    if pd.isna(row.get('Part Number')) or str(row.get('Part Number')).strip() == '':
+                        qty_utuh_list.append(0); qty_dus_list.append(0); qty_pcs_list.append(0); grand_total_list.append(0)
+                        continue
+                        
+                    ket = str(row.get('Keterangan', '')).lower()
+                    is_pecahan = 'pecahan' in ket or 'eceran' in ket
+                    
+                    q_utuh = 0 if is_pecahan else 1
+                    q_dus = 0
+                    q_pcs = 0
+                    
+                    if is_pecahan:
+                        match_pec = re.search(r'pecahan:\s*(\d+)', ket)
+                        if match_pec: q_dus = int(match_pec.group(1))
+                        else:
+                            nums = re.findall(r'\d+', ket)
+                            if nums and 'pecahan' in ket: q_dus = int(nums[0])
+                            
+                        match_ec = re.search(r'eceran:\s*(\d+)', ket)
+                        if match_ec: q_pcs = int(match_ec.group(1))
+                        
+                    qty_utuh_list.append(q_utuh)
+                    qty_dus_list.append(q_dus)
+                    qty_pcs_list.append(q_pcs)
+                    
+                    part_num_clean = str(row.get('Part Number', '')).strip().upper()
+                    isi_pallet = 0; pcs_per_satuan = 0
+                    
+                    if not df_master.empty and part_num_clean in df_master['Part Number Clean'].values:
+                        m_row = df_master[df_master['Part Number Clean'] == part_num_clean].iloc[0]
+                        isi_pallet = pd.to_numeric(m_row.get('Isi 1 Pallet (pcs)', 0), errors='coerce')
+                        isi_pallet = 0 if pd.isna(isi_pallet) else isi_pallet
+                        
+                        is_box = part_num_clean.endswith('D')
+                        val_satuan = pd.to_numeric(m_row.get('Box / Pallet' if is_box else 'Sac / Pallet', 0), errors='coerce')
+                        pcs_per_satuan = 0 if pd.isna(val_satuan) else val_satuan
+                        
+                    tot_pcs = (q_utuh * isi_pallet) + (q_dus * pcs_per_satuan) + q_pcs
+                    grand_total_list.append(tot_pcs)
+                    
+                df_export['Qty Utuh'] = qty_utuh_list
+                df_export['Qty Dus/Sak'] = qty_dus_list
+                df_export['Qty Pcs Eceran'] = qty_pcs_list
+                df_export['Grand Total Pcs'] = grand_total_list
+                
+                # --- KOLOM FINAL CSV AUDIT ---
+                kolom_harapan = ['Kolom', 'Baris', 'Pallet Ke', 'Part Number', 'Lot Number', 'Nama Produk', 'Keterangan', 'Status', 'Qty Utuh', 'Qty Dus/Sak', 'Qty Pcs Eceran', 'Grand Total Pcs']
                 
                 for c in kolom_harapan:
                     if c not in df_export.columns:
                         df_export[c] = ""
+                        
+                # Menghilangkan angka desimal (.0)
+                for col in ['Baris', 'Pallet Ke', 'Qty Utuh', 'Qty Dus/Sak', 'Qty Pcs Eceran', 'Grand Total Pcs']:
+                    df_export[col] = pd.to_numeric(df_export[col], errors='coerce').fillna(0).astype(int)
+                    if col in ['Baris', 'Pallet Ke']:
+                        df_export[col] = df_export[col].replace(0, "") # Biarkan kosong jika 0
+                        
                 df_export = df_export[kolom_harapan]
                 
                 csv_buffer = io.StringIO()
                 df_export.to_csv(csv_buffer, index=False, sep=";")
                 csv_data = csv_buffer.getvalue()
                 
-                st.success("✅ Data berhasil ditarik! Klik tombol di bawah untuk mengunduh.")
-                st.download_button(label="⬇️ Unduh Data (CSV)", data=csv_data, file_name="Backup_Racking_Hokkan.csv", mime="text/csv")
+                st.success("✅ CSV Super berhasil diracik! Kolom 'In' dan 'Out' yang usang sudah diganti dengan kalkulasi stok akurat.")
+                st.download_button(label="⬇️ Unduh CSV Super (Untuk Pivot Excel)", data=csv_data, file_name=f"Audit_Stok_WMS_{(datetime.utcnow() + timedelta(hours=7)).strftime('%Y%m%d')}.csv", mime="text/csv")
             else:
                 st.warning("Database saat ini kosong. Tidak ada data yang bisa diunduh.")
 
@@ -477,3 +548,71 @@ with tab4:
                 st.info("Belum ada transaksi mutasi yang tercatat hari ini.")
         except Exception as e:
             st.error(f"Gagal memuat log mutasi: {e}")
+
+# ----------------------------------------------------------
+# TAB 5: PELACAK LOKASI (FIFO) - FITUR BARU
+# ----------------------------------------------------------
+with tab5:
+    st.header("🔎 Pelacak Lokasi Rak & FIFO")
+    st.caption("Gunakan alat ini untuk mencari di rak mana saja sebuah produk tersebar. Hasil otomatis diurutkan dari Lot yang tertua.")
+    
+    with st.spinner("Memindai seluruh isi gudang..."):
+        docs = db.collection(NAMA_DATABASE).stream()
+        all_fifo_data = []
+        for doc in docs:
+            d_data = doc.to_dict().get('data', [])
+            all_fifo_data.extend(d_data)
+            
+    df_fifo_raw = pd.DataFrame(all_fifo_data)
+    
+    if not df_fifo_raw.empty and 'Nama Produk' in df_fifo_raw.columns:
+        # Buang data hantu
+        df_fifo_raw = df_fifo_raw[df_fifo_raw['Part Number'].astype(str).str.strip() != ""]
+        
+        if not df_fifo_raw.empty:
+            daftar_produk_fifo = sorted(df_fifo_raw['Nama Produk'].astype(str).unique().tolist())
+            pilih_produk_fifo = st.selectbox("Pilih Produk yang dicari:", ["-- Pilih Produk --"] + daftar_produk_fifo)
+            
+            if pilih_produk_fifo != "-- Pilih Produk --":
+                df_prod_fifo = df_fifo_raw[df_fifo_raw['Nama Produk'] == pilih_produk_fifo]
+                
+                summary_fifo = []
+                # Kelompokkan berdasarkan No Lot dan Lokasi Rak
+                for (lot, k, b), group in df_prod_fifo.groupby(['Lot Number', 'Kolom', 'Baris']):
+                    jml_utuh = 0
+                    pecahan_val = 0
+                    eceran_val = 0
+                    
+                    for _, row in group.iterrows():
+                        ket = str(row.get('Keterangan', '')).lower()
+                        is_pecahan = 'pecahan' in ket or 'eceran' in ket
+                        if not is_pecahan:
+                            jml_utuh += 1
+                        else:
+                            match_pec = re.search(r'pecahan:\s*(\d+)', ket)
+                            if match_pec: pecahan_val += int(match_pec.group(1))
+                            else:
+                                nums = re.findall(r'\d+', ket)
+                                if nums and 'pecahan' in ket: pecahan_val += int(nums[0])
+                            
+                            match_ec = re.search(r'eceran:\s*(\d+)', ket)
+                            if match_ec: eceran_val += int(match_ec.group(1))
+                            
+                    summary_fifo.append({
+                        'Lot Number (Urut FIFO)': str(lot),
+                        'Lokasi Rak': f"{k}-{int(float(b))}",
+                        'Qty Pallet Utuh': jml_utuh,
+                        'Qty Dus/Sak': pecahan_val,
+                        'Qty Eceran (Pcs)': eceran_val
+                    })
+                    
+                df_summary = pd.DataFrame(summary_fifo)
+                # Mengurutkan berdasarkan No Lot (Alphanumeric dari yang terkecil/tertua)
+                df_summary = df_summary.sort_values(by=['Lot Number (Urut FIFO)', 'Lokasi Rak'])
+                
+                st.success(f"📍 Ditemukan **{len(df_summary)} lokasi penyimpanan** untuk produk ini.")
+                st.dataframe(df_summary, use_container_width=True, hide_index=True)
+        else:
+            st.info("Gudang saat ini kosong (tidak ada data produk riil).")
+    else:
+        st.info("Gudang saat ini kosong.")
