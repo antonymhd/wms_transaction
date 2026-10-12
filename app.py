@@ -166,7 +166,7 @@ with tab1:
                 
             in_lot = st.text_input("No. Lot Produksi / Mesin Shift")
             
-            # --- FORM INPUT 3 BAGIAN (+ ECERAN) ---
+            # --- FORM INPUT 3 BAGIAN (PALLET, DUS, PCS) ---
             col_qty1, col_qty2, col_qty3 = st.columns(3)
             with col_qty1:
                 in_qty = st.number_input("Pallet Masuk UTUH", min_value=0, step=1, value=1)
@@ -335,7 +335,6 @@ with tab2:
                     kolom_tersedia = [c for c in kolom_tampil if c in df_lot.columns]
                     st.dataframe(df_lot[kolom_tersedia].head(5), hide_index=True)
                     
-                    # --- FORM OUTBOUND 3 BAGIAN ---
                     col_sisa1, col_sisa2, col_sisa3 = st.columns(3)
                     with col_sisa1:
                         out_sisa_akhir = st.number_input(f"Sisa Pallet UTUH Fisik", min_value=0, max_value=jml_utuh_awal, step=1, value=jml_utuh_awal)
@@ -371,7 +370,6 @@ with tab2:
                                 if b_val == float(b_pilih) and p_val in pallets_to_remove:
                                     continue 
                                 
-                                # Mengupdate atau mereset keterangan pecahan/eceran pada slot terakhir dari lot ini
                                 if b_val == float(b_pilih) and l_str == pilih_lot:
                                     sisa_pallets = df_lot[~df_lot['Pallet Ke'].isin(pallets_to_remove)]
                                     if not sisa_pallets.empty and p_val == sisa_pallets['Pallet Ke'].max():
@@ -384,7 +382,6 @@ with tab2:
                                             if 'Pecahan' in str(d.get('Keterangan', '')) or 'Eceran' in str(d.get('Keterangan', '')):
                                                 d['Keterangan'] = ""
                                     else:
-                                        # Hapus keterangan di slot utuh
                                         if 'Pecahan' in str(d.get('Keterangan', '')) or 'Eceran' in str(d.get('Keterangan', '')):
                                             d['Keterangan'] = ""
                                             
