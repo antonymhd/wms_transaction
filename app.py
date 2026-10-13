@@ -81,9 +81,9 @@ if st.session_state['action_status'] is not None:
     st.divider()
 
 # ==========================================================
-# 3. TABS MENU UTAMA
+# 3. TABS MENU UTAMA (Menambahkan Tab 5: Sinkronisasi CSV)
 # ==========================================================
-tab1, tab2, tab3, tab4 = st.tabs(["📥 1. Inbound Borongan", "📤 2. Penyesuaian Outbound", "⚙️ 3. Pengaturan & Backup", "📊 4. Laporan Mutasi Harian"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📥 1. Inbound Borongan", "📤 2. Penyesuaian Outbound", "⚙️ 3. Pengaturan & Backup", "📊 4. Laporan Mutasi Harian", "🚀 5. Sinkronisasi CSV"])
 
 # ----------------------------------------------------------
 # TAB 1: INBOUND BORONGAN (DENGAN TOMBOL CEK RAK)
@@ -454,7 +454,7 @@ with tab3:
                 st.warning("Database saat ini kosong. Tidak ada data yang bisa diunduh.")
 
 # ----------------------------------------------------------
-# TAB 4: LAPORAN MUTASI HARIAN (FITUR BARU)
+# TAB 4: LAPORAN MUTASI HARIAN
 # ----------------------------------------------------------
 with tab4:
     st.header("📊 Buku Laporan Mutasi (Log Keluar/Masuk)")
@@ -496,3 +496,58 @@ with tab4:
                 st.info("Belum ada transaksi mutasi yang tercatat hari ini.")
         except Exception as e:
             st.error(f"Gagal memuat log mutasi: {e}")
+
+# ----------------------------------------------------------
+# TAB 5: SINKRONISASI DATA MANUAL (UPLOAD CSV)
+# ----------------------------------------------------------
+with tab5:
+    st.header("🚀 Sinkronisasi Data Manual (Upload CSV)")
+    st.warning("⚠️ **PERHATIAN:** Sinkronisasi ini akan **menghapus semua data lama** dan menggantinya 100% dengan isi CSV yang Anda unggah. Pastikan file sudah final dan valid!")
+    
+    uploaded_file = st.file_uploader("Pilih file CSV (Hasil kerja manual di Excel)", type=['csv'])
+    
+    if uploaded_file is not None:
+        try:
+            # Deteksi delimiter (koma atau titik koma)
+            try: 
+                df_sync = pd.read_csv(uploaded_file, sep=";")
+            except: 
+                df_sync = pd.read_csv(uploaded_file, sep=",")
+            
+            # Standarisasi nama kolom Pallet Ke
+            for c in df_sync.columns:
+                if c.strip().lower() in ['palet ke', 'pallet ke']: 
+                    df_sync.rename(columns={c: 'Pallet Ke'}, inplace=True)
+            
+            # Bersihkan nilai NaN menjadi string kosong
+            df_sync = df_sync.fillna("")
+            
+            if 'Kolom' in df_sync.columns:
+                st.write("Pratinjau Data yang akan disuntikkan ke Database:")
+                st.dataframe(df_sync.head(5))
+                
+                if st.button("⚡ MULAI SINKRONISASI KE DATABASE", type="primary"):
+                    with st.spinner("Proses menimpa database (Mohon tunggu 1-2 menit)..."):
+                        # 1. Hapus semua data lama agar bersih
+                        docs = db.collection(NAMA_DATABASE).stream()
+                        for doc in docs: 
+                            doc.reference.delete()
+                        
+                        # 2. Tulis data baru sesuai format aplikasi (Dikelompokkan per Kolom_A, Kolom_B, dst)
+                        batch = db.batch()
+                        for k, group in df_sync.groupby('Kolom'):
+                            if str(k).strip() != "":
+                                doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{k}")
+                                # Konversi DataFrame ke format list dictionary
+                                records = group.to_dict(orient='records')
+                                batch.set(doc_ref, {'data': records})
+                        
+                        # Eksekusi penulisan batch
+                        batch.commit()
+                        
+                        st.success("✅ BINGO! Sinkronisasi berhasil! Data lama telah terhapus dan ditimpa dengan data Excel terbaru Anda.")
+                        st.balloons()
+            else:
+                st.error("❌ Kolom bernama 'Kolom' (lokasi rak) tidak ditemukan di dalam CSV Anda. Harap periksa kembali format file CSV Anda.")
+        except Exception as e:
+            st.error(f"Terjadi kesalahan saat membaca file: {e}")
