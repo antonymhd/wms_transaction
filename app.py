@@ -10,10 +10,9 @@ st.set_page_config(page_title="WMS Transaksi", page_icon="📝", layout="wide")
 # FIREBASE INIT
 # ==========================================================
 if not firebase_admin._apps:
-    cert_dict = json.loads(st.secrets["textkey"])
-    cred = credentials.Certificate(cert_dict)
+    # Mengambil rahasia dari blok [firebase] dan langsung mengubahnya jadi dictionary
+    cred = credentials.Certificate(dict(st.secrets["firebase"]))
     firebase_admin.initialize_app(cred)
-db = firestore.client()
 
 @st.cache_data(ttl=900)
 def fetch_all_data():
