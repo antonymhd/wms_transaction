@@ -511,38 +511,41 @@ with tab3:
                 st.warning("Database saat ini kosong. Tidak ada data yang bisa diunduh.")
 
 # ----------------------------------------------------------
-# TAB 4: LAPORAN MUTASI HARIAN
+# TAB 4: LAPORAN MUTASI HARIAN (VERSI HEMAT KUOTA)
 # ----------------------------------------------------------
 with tab4:
     st.header("📊 Buku Laporan Mutasi (Log Keluar/Masuk)")
-    st.caption("Semua histori transaksi Inbound dan Outbound yang Anda lakukan di aplikasi ini akan tercatat rapi di sini secara otomatis.")
+    st.caption("Klik tombol di bawah untuk melihat histori mutasi. (Dikunci agar tidak memakan kuota saat Anda sedang input data Inbound/Outbound).")
     
-    if st.button("🔄 Segarkan Data Mutasi", type="primary"):
-        st.rerun()
+    if st.button("📥 Tarik & Tampilkan 100 Mutasi Terbaru", type="primary"):
+        with st.spinner("Menarik data log dari server..."):
+            try:
+                log_docs = db.collection(DB_LOG_MUTASI).order_by("Timestamp_System", direction=firestore.Query.DESCENDING).limit(100).stream()
+                log_list = []
+                for d in log_docs: log_list.append(d.to_dict())
+                    
+                if log_list:
+                    df_log = pd.DataFrame(log_list)
+                    ordered_cols = ["Waktu Transaksi", "Jenis Transaksi", "Lokasi Rak", "Nama Produk", "No Lot", "Mutasi Pallet", "Mutasi Pecahan (Dus/Sak)", "Mutasi Eceran (Pcs)", "Part Number", "Keterangan"]
+                    avail_cols = [c for c in ordered_cols if c in df_log.columns]
+                    df_log = df_log[avail_cols]
+                    
+                    # Simpan ke memori lokal agar tidak reload saat ngetik
+                    st.session_state['tabel_mutasi'] = df_log
+                else:
+                    st.info("Belum ada transaksi mutasi yang tercatat hari ini.")
+            except Exception as e:
+                st.error(f"Gagal memuat log mutasi: {e}")
+                
+    # Selalu tampilkan dari memori lokal (0 Reads Firebase)
+    if 'tabel_mutasi' in st.session_state:
+        st.dataframe(st.session_state['tabel_mutasi'], use_container_width=True, hide_index=True)
         
-    with st.spinner("Memuat buku catatan..."):
-        try:
-            log_docs = db.collection(DB_LOG_MUTASI).order_by("Timestamp_System", direction=firestore.Query.DESCENDING).limit(100).stream()
-            log_list = []
-            for d in log_docs: log_list.append(d.to_dict())
-                
-            if log_list:
-                df_log = pd.DataFrame(log_list)
-                ordered_cols = ["Waktu Transaksi", "Jenis Transaksi", "Lokasi Rak", "Nama Produk", "No Lot", "Mutasi Pallet", "Mutasi Pecahan (Dus/Sak)", "Mutasi Eceran (Pcs)", "Part Number", "Keterangan"]
-                avail_cols = [c for c in ordered_cols if c in df_log.columns]
-                df_log = df_log[avail_cols]
-                
-                st.dataframe(df_log, use_container_width=True, hide_index=True)
-                
-                csv_log_buffer = io.StringIO()
-                df_log.to_csv(csv_log_buffer, index=False, sep=";")
-                csv_log_data = csv_log_buffer.getvalue()
-                
-                st.download_button(label="⬇️ Unduh Laporan Mutasi (CSV)", data=csv_log_data, file_name=f"Mutasi_WMS_{(datetime.utcnow() + timedelta(hours=7)).strftime('%Y%m%d')}.csv", mime="text/csv")
-            else:
-                st.info("Belum ada transaksi mutasi yang tercatat hari ini.")
-        except Exception as e:
-            st.error(f"Gagal memuat log mutasi: {e}")
+        csv_log_buffer = io.StringIO()
+        st.session_state['tabel_mutasi'].to_csv(csv_log_buffer, index=False, sep=";")
+        csv_log_data = csv_log_buffer.getvalue()
+        
+        st.download_button(label="⬇️ Unduh Laporan Mutasi (CSV)", data=csv_log_data, file_name=f"Mutasi_WMS_{(datetime.utcnow() + timedelta(hours=7)).strftime('%Y%m%d')}.csv", mime="text/csv")
 
 # ----------------------------------------------------------
 # TAB 5: SINKRONISASI DATA MANUAL (UPLOAD CSV)
