@@ -28,9 +28,21 @@ db = firestore.client()
 st.title("📝 WMS Entry Form (Inbound & Outbound)")
 st.caption(f"Alat khusus PPIC. Terhubung ke database: {NAMA_DATABASE}")
 
-# --- FUNGSI PENCATAT LOG MUTASI OTOMATIS (+ ECERAN) ---
+# --- CACHE: MASTER PRODUK UNTUK PERFORMA (1 JAM) ---
+@st.cache_data(ttl=3600)
+def load_master_produk():
+    try:
+        try: df = pd.read_csv("Master_Produk.csv", sep=";")
+        except: df = pd.read_csv("Master_Produk.csv", sep=",")
+        df['Part Number Clean'] = df['Part Number'].astype(str).str.strip().str.upper()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+# --- FUNGSI PENCATAT LOG MUTASI OTOMATIS ---
 def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh, pecahan, eceran, keterangan=""):
     waktu_sekarang = (datetime.utcnow() + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S")
+    no_lot_final = no_lot if str(no_lot).strip() != "" else "-"
     
     log_data = {
         "Waktu Transaksi": waktu_sekarang,
@@ -38,7 +50,7 @@ def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh,
         "Lokasi Rak": f"{kolom}-{baris}",
         "Nama Produk": produk,
         "Part Number": part_num,
-        "No Lot": no_lot,
+        "No Lot": no_lot_final,
         "Mutasi Pallet": float(pallet_utuh),
         "Mutasi Pecahan (Dus/Sak)": float(pecahan),
         "Mutasi Eceran (Pcs)": float(eceran),
@@ -145,12 +157,11 @@ with tab1:
             st.divider()
             st.markdown(f"**2. Eksekusi Inbound (Tujuan: {k_pilih}-{b_pilih})**")
             
-            try:
-                try: df_master = pd.read_csv("Master_Produk.csv", sep=";")
-                except: df_master = pd.read_csv("Master_Produk.csv", sep=",")
+            df_master = load_master_produk()
+            if not df_master.empty:
                 daftar_produk = df_master['Nama Barang'].dropna().astype(str).unique().tolist()
-            except FileNotFoundError:
-                df_master = pd.DataFrame(); daftar_produk = []
+            else:
+                daftar_produk = []
                 st.warning("⚠️ File 'Master_Produk.csv' tidak ditemukan. Mode manual.")
                 
             pilihan_barang = st.selectbox("Pilih Produk", ["-- Ketik Manual --"] + daftar_produk)
@@ -164,7 +175,7 @@ with tab1:
                 in_produk = st.text_input("Nama Produk (Ketik Manual)")
                 in_part = st.text_input("Part Number (Ketik Manual)")
                 
-            in_lot = st.text_input("No. Lot Produksi / Mesin Shift")
+            in_lot = st.text_input("No. Lot Produksi / Mesin Shift", placeholder="Kosongkan jika tidak ada, sistem akan otomatis mengisi '-'")
             
             col_qty1, col_qty2, col_qty3 = st.columns(3)
             with col_qty1:
@@ -175,7 +186,14 @@ with tab1:
                 in_eceran = st.number_input("Eceran (Pcs)", min_value=0, step=1, value=0)
                 
             if st.button("🚀 Simpan Inbound", type="primary", use_container_width=True):
-                if not in_produk or not in_part:
+                # EVALUASI 1: Pembersihan Input Part Number (Uppercase paksa)
+                in_part_clean = in_part.strip().upper() if in_part else ""
+                in_produk_clean = in_produk.strip() if in_produk else ""
+                
+                # EVALUASI 2: Default Value Lot Number
+                in_lot_final = in_lot.strip() if in_lot and in_lot.strip() != "" else "-"
+
+                if not in_produk_clean or not in_part_clean:
                     st.error("⚠️ Nama Produk dan Part Number wajib diisi!")
                 elif in_qty == 0 and in_pecahan == 0 and in_eceran == 0:
                     st.error("⚠️ Masukkan minimal 1 Qty (Pallet/Pecahan/Eceran)!")
@@ -189,7 +207,7 @@ with tab1:
                         all_data = [d for d in all_data_raw2 if not (float(d.get('Baris', 0) or 0) == float(b_pilih) and str(d.get('Part Number', '')).strip() == '')]
                         baris_data_actual = [d for d in all_data if float(d.get('Baris', 0) or 0) == float(b_pilih)]
                         
-                        is_all_box_actual = in_part.strip().upper().endswith(('D', 'G'))
+                        is_all_box_actual = in_part_clean.endswith(('D', 'G'))
                         for d in baris_data_actual:
                             pn = str(d.get('Part Number', '')).strip().upper()
                             if pn and not pn.endswith(('D', 'G')):
@@ -213,8 +231,8 @@ with tab1:
                                 while next_pallet in filled_pallets: next_pallet += 1
                                 new_records.append({
                                     'Kolom': k_pilih, 'Baris': float(b_pilih), 'Pallet Ke': float(next_pallet),
-                                    'Part Number': in_part, 'Lot Number': in_lot, 'Nama Produk': in_produk,
-                                    'In': 1, 'Out': 0, 'Sisa': 1, 'Status': 'Terisi', 'Keterangan': ''
+                                    'Part Number': in_part_clean, 'Lot Number': in_lot_final, 'Nama Produk': in_produk_clean,
+                                    'Status': 'Terisi', 'Keterangan': '', 'Catatan': ''
                                 })
                                 filled_pallets.append(next_pallet)
                                 next_pallet += 1
@@ -228,8 +246,8 @@ with tab1:
                                 
                                 new_records.append({
                                     'Kolom': k_pilih, 'Baris': float(b_pilih), 'Pallet Ke': float(next_pallet),
-                                    'Part Number': in_part, 'Lot Number': in_lot, 'Nama Produk': in_produk,
-                                    'In': 1, 'Out': 0, 'Sisa': 1, 'Status': 'Terisi',
+                                    'Part Number': in_part_clean, 'Lot Number': in_lot_final, 'Nama Produk': in_produk_clean,
+                                    'Status': 'Terisi', 'Catatan': '',
                                     'Keterangan': " | ".join(ket_parts)
                                 })
                                 filled_pallets.append(next_pallet)
@@ -239,12 +257,12 @@ with tab1:
                             st.session_state['undo_data'] = data_sebelum
                             st.session_state['redo_data'] = copy.deepcopy(all_data)
                             st.session_state['action_kolom'] = k_pilih
-                            st.session_state['action_msg'] = f"Inbound {total_inbound_slots} Slot Fisik '{in_produk}' ke Rak {k_pilih}-{b_pilih}"
+                            st.session_state['action_msg'] = f"Inbound {total_inbound_slots} Slot Fisik '{in_produk_clean}' ke Rak {k_pilih}-{b_pilih}"
                             st.session_state['action_status'] = 'DONE'
                             
                             doc_ref.set({'data': all_data})
                             
-                            catat_log_mutasi("INBOUND", k_pilih, b_pilih, in_produk, in_part, in_lot, in_qty, in_pecahan, in_eceran)
+                            catat_log_mutasi("INBOUND", k_pilih, b_pilih, in_produk_clean, in_part_clean, in_lot_final, in_qty, in_pecahan, in_eceran)
                             
                             st.success(f"✅ Berhasil menyuntikkan data! Memakan {total_inbound_slots} Slot Fisik di rak {k_pilih}-{b_pilih}.")
                             st.session_state['in_lokasi_dicari'] = False
@@ -341,6 +359,8 @@ with tab2:
                         out_sisa_dus = st.number_input("Sisa Pecahan Fisik (Dus/Sak)", min_value=0, step=1, value=pecahan_awal)
                     with col_sisa3:
                         out_sisa_pcs = st.number_input("Sisa Eceran Fisik (Pcs)", min_value=0, step=1, value=eceran_awal)
+
+                    out_catatan = st.text_input("📝 Catatan Penyesuaian Fisik (Opsional)", placeholder="Kosongkan jika stok fisik di lapangan sesuai dengan sistem...")
                 
                     if st.button("🚜 Sesuaikan Stok Lot Ini (OUTBOUND)", type="primary", use_container_width=True):
                         slot_tambahan = 1 if (out_sisa_dus > 0 or out_sisa_pcs > 0) else 0
@@ -348,8 +368,8 @@ with tab2:
                         
                         if total_slot_dibutuhkan > current_qty_lot:
                             st.error(f"❌ Tidak logis! Anda mengklaim sisa fisik {total_slot_dibutuhkan} Slot, padahal di sistem hanya ada {current_qty_lot} Pallet.")
-                        elif out_sisa_akhir == jml_utuh_awal and out_sisa_dus == pecahan_awal and out_sisa_pcs == eceran_awal:
-                            st.info("Sisa stok persis sama dengan di sistem. Tidak ada pergerakan Outbound yang dicatat.")
+                        elif out_sisa_akhir == jml_utuh_awal and out_sisa_dus == pecahan_awal and out_sisa_pcs == eceran_awal and out_catatan == "":
+                            st.info("Sisa stok persis sama dengan di sistem dan tidak ada catatan. Tidak ada pergerakan Outbound yang dicatat.")
                         else:
                             keluar_utuh = jml_utuh_awal - out_sisa_akhir
                             keluar_pecahan = pecahan_awal - out_sisa_dus
@@ -370,6 +390,8 @@ with tab2:
                                     continue 
                                 
                                 if b_val == float(b_pilih) and l_str == pilih_lot:
+                                    d['Catatan'] = out_catatan
+                                    
                                     sisa_pallets = df_lot[~df_lot['Pallet Ke'].isin(pallets_to_remove)]
                                     if not sisa_pallets.empty and p_val == sisa_pallets['Pallet Ke'].max():
                                         if out_sisa_dus > 0 or out_sisa_pcs > 0:
@@ -396,7 +418,7 @@ with tab2:
                             
                             nama_prod_keluar = str(df_lot['Nama Produk'].iloc[0])
                             part_num_keluar = str(df_lot['Part Number'].iloc[0])
-                            catat_log_mutasi("OUTBOUND (Penyesuaian)", k_pilih, b_pilih, nama_prod_keluar, part_num_keluar, pilih_lot, keluar_utuh, keluar_pecahan, keluar_eceran)
+                            catat_log_mutasi("OUTBOUND (Penyesuaian)", k_pilih, b_pilih, nama_prod_keluar, part_num_keluar, pilih_lot, keluar_utuh, keluar_pecahan, keluar_eceran, out_catatan)
                             
                             st.success(f"✅ Selesai! Sisa di rak menjadi {total_slot_dibutuhkan} Slot Fisik.")
                             st.session_state['out_lokasi_dicari'] = False
@@ -428,13 +450,9 @@ with tab3:
                     
             if semua_data:
                 df_export = pd.DataFrame(semua_data)
+                df_master = load_master_produk()
                 
-                try:
-                    try: df_master = pd.read_csv("Master_Produk.csv", sep=";")
-                    except: df_master = pd.read_csv("Master_Produk.csv", sep=",")
-                    df_master['Part Number Clean'] = df_master['Part Number'].astype(str).str.strip().str.upper()
-                except:
-                    df_master = pd.DataFrame()
+                if df_master.empty:
                     st.warning("Master_Produk.csv tidak ditemukan, konversi Pcs mungkin bernilai 0.")
 
                 qty_utuh_list = []
@@ -488,7 +506,7 @@ with tab3:
                 df_export['Qty Pcs Eceran'] = qty_pcs_list
                 df_export['Grand Total Pcs'] = grand_total_list
                 
-                kolom_harapan = ['Kolom', 'Baris', 'Pallet Ke', 'Part Number', 'Lot Number', 'Nama Produk', 'Keterangan', 'Status', 'Qty Utuh', 'Qty Dus/Sak', 'Qty Pcs Eceran', 'Grand Total Pcs']
+                kolom_harapan = ['Kolom', 'Baris', 'Pallet Ke', 'Part Number', 'Lot Number', 'Nama Produk', 'Keterangan', 'Catatan', 'Status', 'Qty Utuh', 'Qty Dus/Sak', 'Qty Pcs Eceran', 'Grand Total Pcs']
                 
                 for c in kolom_harapan:
                     if c not in df_export.columns:
@@ -505,22 +523,28 @@ with tab3:
                 df_export.to_csv(csv_buffer, index=False, sep=";")
                 csv_data = csv_buffer.getvalue()
                 
-                st.success("✅ CSV Super berhasil diracik! Kolom 'In' dan 'Out' yang usang sudah diganti dengan kalkulasi stok akurat.")
+                st.success("✅ CSV Super berhasil diracik! Kolom 'Catatan' dan kalkulasi Pcs sudah ditambahkan.")
                 st.download_button(label="⬇️ Unduh CSV Super (Untuk Pivot Excel)", data=csv_data, file_name=f"Audit_Stok_WMS_{(datetime.utcnow() + timedelta(hours=7)).strftime('%Y%m%d')}.csv", mime="text/csv")
             else:
                 st.warning("Database saat ini kosong. Tidak ada data yang bisa diunduh.")
 
 # ----------------------------------------------------------
-# TAB 4: LAPORAN MUTASI HARIAN (VERSI HEMAT KUOTA)
+# TAB 4: LAPORAN MUTASI HARIAN (24 JAM TERAKHIR)
 # ----------------------------------------------------------
 with tab4:
-    st.header("📊 Buku Laporan Mutasi (Log Keluar/Masuk)")
-    st.caption("Klik tombol di bawah untuk melihat histori mutasi. (Dikunci agar tidak memakan kuota saat Anda sedang input data Inbound/Outbound).")
+    st.header("📊 Laporan Mutasi Harian (24 Jam Terakhir)")
+    st.write("Sistem akan menarik riwayat pergerakan barang (Inbound/Outbound) dalam 24 jam terakhir langsung menjadi file CSV.")
     
-    if st.button("📥 Tarik & Tampilkan 100 Mutasi Terbaru", type="primary"):
-        with st.spinner("Menarik data log dari server..."):
+    if st.button("Racik Laporan Mutasi Sekarang", type="primary"):
+        with st.spinner("Menarik data log mutasi dari server..."):
             try:
-                log_docs = db.collection(DB_LOG_MUTASI).order_by("Timestamp_System", direction=firestore.Query.DESCENDING).limit(100).stream()
+                waktu_24_jam_lalu = (datetime.utcnow() + timedelta(hours=7) - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+                
+                log_docs = db.collection(DB_LOG_MUTASI)\
+                    .where("Waktu Transaksi", ">=", waktu_24_jam_lalu)\
+                    .order_by("Waktu Transaksi", direction=firestore.Query.DESCENDING)\
+                    .stream()
+                    
                 log_list = []
                 for d in log_docs: log_list.append(d.to_dict())
                     
@@ -530,22 +554,21 @@ with tab4:
                     avail_cols = [c for c in ordered_cols if c in df_log.columns]
                     df_log = df_log[avail_cols]
                     
-                    # Simpan ke memori lokal agar tidak reload saat ngetik
-                    st.session_state['tabel_mutasi'] = df_log
+                    csv_log_buffer = io.StringIO()
+                    df_log.to_csv(csv_log_buffer, index=False, sep=";")
+                    csv_log_data = csv_log_buffer.getvalue()
+                    
+                    st.success("✅ Laporan Mutasi berhasil diracik dan siap diunduh!")
+                    st.download_button(
+                        label="⬇️ Unduh Laporan Mutasi (CSV)", 
+                        data=csv_log_data, 
+                        file_name=f"Mutasi_WMS_{(datetime.utcnow() + timedelta(hours=7)).strftime('%Y%m%d')}.csv", 
+                        mime="text/csv"
+                    )
                 else:
-                    st.info("Belum ada transaksi mutasi yang tercatat hari ini.")
+                    st.info("Belum ada transaksi mutasi dalam 24 jam terakhir. Tidak ada data untuk diunduh.")
             except Exception as e:
                 st.error(f"Gagal memuat log mutasi: {e}")
-                
-    # Selalu tampilkan dari memori lokal (0 Reads Firebase)
-    if 'tabel_mutasi' in st.session_state:
-        st.dataframe(st.session_state['tabel_mutasi'], use_container_width=True, hide_index=True)
-        
-        csv_log_buffer = io.StringIO()
-        st.session_state['tabel_mutasi'].to_csv(csv_log_buffer, index=False, sep=";")
-        csv_log_data = csv_log_buffer.getvalue()
-        
-        st.download_button(label="⬇️ Unduh Laporan Mutasi (CSV)", data=csv_log_data, file_name=f"Mutasi_WMS_{(datetime.utcnow() + timedelta(hours=7)).strftime('%Y%m%d')}.csv", mime="text/csv")
 
 # ----------------------------------------------------------
 # TAB 5: SINKRONISASI DATA MANUAL (UPLOAD CSV)
@@ -574,21 +597,24 @@ with tab5:
                 st.dataframe(df_sync.head(5))
                 
                 if st.button("⚡ MULAI SINKRONISASI KE DATABASE", type="primary"):
-                    with st.spinner("Proses menimpa database (Mohon tunggu 1-2 menit)..."):
-                        docs = db.collection(NAMA_DATABASE).stream()
-                        for doc in docs: 
-                            doc.reference.delete()
-                        
-                        batch = db.batch()
-                        for k, group in df_sync.groupby('Kolom'):
-                            if str(k).strip() != "":
-                                doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{k}")
-                                records = group.to_dict(orient='records')
-                                batch.set(doc_ref, {'data': records})
-                        
-                        batch.commit()
-                        st.success("✅ BINGO! Sinkronisasi berhasil! Data lama telah terhapus dan ditimpa dengan data Excel terbaru Anda.")
-                        st.balloons()
+                    if len(df_sync) < 50:
+                        st.error("Gagal! File CSV ditolak karena isinya terlalu sedikit (kurang dari 50 baris data).")
+                    else:
+                        with st.spinner("Proses menimpa database (Mohon tunggu 1-2 menit)..."):
+                            docs = db.collection(NAMA_DATABASE).stream()
+                            for doc in docs: 
+                                doc.reference.delete()
+                            
+                            batch = db.batch()
+                            for k, group in df_sync.groupby('Kolom'):
+                                if str(k).strip() != "":
+                                    doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{k}")
+                                    records = group.to_dict(orient='records')
+                                    batch.set(doc_ref, {'data': records})
+                            
+                            batch.commit()
+                            st.success("✅ BINGO! Sinkronisasi berhasil! Data lama telah terhapus dan ditimpa dengan data Excel terbaru Anda.")
+                            st.balloons()
             else:
                 st.error("❌ Kolom bernama 'Kolom' (lokasi rak) tidak ditemukan di dalam CSV Anda. Harap periksa kembali format file CSV Anda.")
         except Exception as e:
