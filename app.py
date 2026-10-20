@@ -96,7 +96,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(["📥 1. Inbound", "📤 2. Outbound", "
 # TAB 1: INBOUND BORONGAN
 # ----------------------------------------------------------
 with tab1:
-    st.header("Input Data Kertas (Borongan)")
+    st.header("Input Data Kertas (List Stock)")
     st.caption("Cek status rak terlebih dahulu, lalu masukkan data barang masuk.")
     
     if 'in_lokasi_dicari' not in st.session_state:
