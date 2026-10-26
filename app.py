@@ -76,7 +76,7 @@ if st.session_state['action_status'] is not None: st.divider()
 # ==========================================================
 # 3. TABS MENU UTAMA
 # ==========================================================
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📥 1. Inbound", "📤 2. Outbound", "⚙️ 3. Audit & Backup", "📊 4. Log Mutasi", "🚀 5. Sinkronisasi CSV"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📥 1. Inbound", "📤 2. Outbound", "⚙️ 3. Audit & Backup", "📊 4. Log Mutasi", "🚀 5. Sinkronisasi CSV", "📅 6. Jadwal Kirim"])
 
 # ----------------------------------------------------------
 # TAB 1: INBOUND BORONGAN (SOFT-WARNING PALLET BAYANGAN)
@@ -616,3 +616,95 @@ with tab5:
                 st.error("❌ Kolom bernama 'Kolom' (lokasi rak) tidak ditemukan di dalam CSV Anda. Harap periksa kembali format file CSV Anda.")
         except Exception as e:
             st.error(f"Terjadi kesalahan saat membaca file: {e}")
+
+# ----------------------------------------------------------
+# TAB 6: PENJADWALAN KIRIM (BOOKING STOK LOKAL)
+# ----------------------------------------------------------
+with tab6:
+    st.header("📅 Penjadwalan Pengiriman (Booking Pallet)")
+    st.caption("Kunci pallet di rak tertentu agar ditandai sebagai persiapan muat (Soft Allocation).")
+    
+    if 'book_lokasi_dicari' not in st.session_state:
+        st.session_state.update({'book_lokasi_dicari': False, 'book_k_pilih': "A", 'book_b_pilih': 1})
+
+    col_b1, col_b2 = st.columns([1, 2])
+    with col_b1:
+        st.markdown("**1. Pilih Lokasi Rak**")
+        book_kolom = st.selectbox("Lokasi Kolom", ["A", "B", "C", "D", "E", "F", "G"], key="book_kolom")
+        book_baris = st.number_input("Nomor Baris (Booking)", min_value=1, max_value=28, value=1)
+        
+        if st.button("🔍 Cari Data Rak (Booking)", use_container_width=True):
+            st.session_state.update({'book_lokasi_dicari': True, 'book_k_pilih': book_kolom, 'book_b_pilih': book_baris})
+            
+    with col_b2:
+        if st.session_state['book_lokasi_dicari']:
+            k_pilih, b_pilih = st.session_state['book_k_pilih'], st.session_state['book_b_pilih']
+            doc_ref_book = db.collection(NAMA_DATABASE).document(f"Kolom_{k_pilih}")
+            doc_book = doc_ref_book.get()
+            all_book_data = doc_book.to_dict().get('data', []) if doc_book.exists else []
+            baris_book_data = [d for d in all_book_data if float(d.get('Baris', 0) or 0) == float(b_pilih)]
+            
+            if baris_book_data:
+                df_book = pd.DataFrame(baris_book_data)
+                df_book['Pallet Ke'] = pd.to_numeric(df_book['Pallet Ke'], errors='coerce')
+                df_book = df_book[df_book['Part Number'].astype(str).str.strip() != ""]
+                
+                if not df_book.empty and 'Lot Number' in df_book.columns:
+                    tersedia_lot = []
+                    mapping_lot = {}
+                    for _, row in df_book.drop_duplicates(subset=['Lot Number', 'Nama Produk']).iterrows():
+                        lot_asli = str(row['Lot Number'])
+                        label_dropdown = f"{str(row['Nama Produk'])} (Lot: {lot_asli})"
+                        tersedia_lot.append(label_dropdown)
+                        mapping_lot[label_dropdown] = lot_asli
+                        
+                    st.markdown(f"**2. Pilih Produk & Lot untuk di-Booking di {k_pilih}-{b_pilih}**")
+                    pilihan_label = st.selectbox("🎯 Pilih Produk:", tersedia_lot, key="book_lot")
+                    pilih_lot = mapping_lot[pilihan_label]
+                    
+                    df_lot = df_book[df_book['Lot Number'].astype(str) == pilih_lot].sort_values('Pallet Ke', ascending=True)
+                    
+                    # Filter: Hitung yang belum di-booking
+                    df_belum_book = df_lot[~df_lot['Catatan'].astype(str).str.contains('BOOKED', case=False, na=False)]
+                    qty_tersedia = len(df_belum_book)
+                    
+                    st.markdown(f"**📦 Tersedia untuk di-Booking: `{qty_tersedia}` Slot Fisik**")
+                    
+                    kolom_tersedia = [c for c in ['Pallet Ke', 'Part Number', 'Lot Number', 'Catatan'] if c in df_lot.columns]
+                    st.dataframe(df_lot[kolom_tersedia], hide_index=True, height=150)
+                    
+                    book_qty = st.number_input("Jumlah Pallet UTUH yang akan di-Booking", min_value=1, max_value=qty_tersedia if qty_tersedia > 0 else 1, step=1, value=qty_tersedia if qty_tersedia > 0 else 0)
+                    book_do = st.text_input("📝 Terjadwal Untuk (Cth: DO-123 / Tgl 28)", placeholder="Ketik keterangan pengiriman...")
+                    
+                    if st.button("🔒 Kunci / Booking Pallet Sekarang", type="primary", use_container_width=True):
+                        if qty_tersedia == 0:
+                            st.error("❌ Semua pallet Lot ini di rak tersebut sudah berstatus Booked.")
+                        elif book_do.strip() == "":
+                            st.error("❌ Keterangan jadwal wajib diisi!")
+                        else:
+                            with st.spinner("Menyematkan label booking..."):
+                                pallets_to_book = df_belum_book['Pallet Ke'].head(book_qty).tolist()
+                                data_sebelum_book = copy.deepcopy(all_book_data)
+                                new_all_book_data = []
+                                
+                                for d in all_book_data:
+                                    b_val = float(d.get('Baris', 0) or 0)
+                                    p_val = pd.to_numeric(d.get('Pallet Ke', 0))
+                                    
+                                    if b_val == float(b_pilih) and p_val in pallets_to_book:
+                                        catatan_lama = str(d.get('Catatan', ''))
+                                        tambahan_booking = f"[BOOKED: {book_do.strip()}]"
+                                        d['Catatan'] = (tambahan_booking + " " + catatan_lama).strip()
+                                        
+                                    new_all_book_data.append(d)
+                                    
+                                doc_ref_book.set({'data': new_all_book_data})
+                                
+                                st.session_state.update({'undo_data': data_sebelum_book, 'redo_data': copy.deepcopy(new_all_book_data), 'action_kolom': k_pilih, 'action_msg': f"Booking {book_qty} Pallet Lot '{pilih_lot}' untuk '{book_do}' di Rak {k_pilih}-{b_pilih}", 'action_status': 'DONE'})
+                                
+                                st.success(f"✅ Berhasil! {book_qty} pallet telah dikunci untuk jadwal: {book_do}")
+                                st.session_state['book_lokasi_dicari'] = False
+                                time.sleep(2)
+                                st.rerun()
+            else:
+                st.info(f"📍 Rak {k_pilih}-{b_pilih} masih kosong atau belum ada data.")
