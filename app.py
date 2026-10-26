@@ -398,6 +398,22 @@ with tab2:
                 st.info(f"📍 Rak {k_pilih}-{b_pilih} belum ada data sama sekali.")
         else:
             st.info("👈 Silakan tentukan Lokasi Kolom dan Baris di sebelah kiri, lalu klik 'Cari Data Rak'.")
+# 2. Terapkan nomor urut baru dan bersihkan status Bayangan/Booking
+                            for urutan_baru, d in enumerate(data_rak_ini, start=1):
+                                d['Pallet Ke'] = float(urutan_baru)
+                                
+                                catatan_lama = str(d.get('Catatan', ''))
+                                
+                                # HAPUS OTOMATIS LABEL BOOKING UNTUK SISA BARANG (RETUR BATAL MUAT)
+                                import re
+                                catatan_lama = re.sub(r'\[BOOKED:.*?\]', '', catatan_lama, flags=re.IGNORECASE).strip()
+                                
+                                if urutan_baru <= max_slot_out and 'BAYANGAN' in catatan_lama.upper():
+                                    d['Catatan'] = catatan_lama.replace("[BAYANGAN - OVERCAPACITY]", "").strip()
+                                elif urutan_baru > max_slot_out and 'BAYANGAN' not in catatan_lama.upper():
+                                    d['Catatan'] = ("[BAYANGAN - OVERCAPACITY] " + catatan_lama).strip()
+                                else:
+                                    d['Catatan'] = catatan_lama
 
 # ----------------------------------------------------------
 # TAB 3, 4, 5 (Audit, Log, Sinkronisasi CSV)
