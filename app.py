@@ -74,7 +74,7 @@ if st.session_state['action_status'] == 'DONE':
 if st.session_state['action_status'] is not None: st.divider()
 
 # ==========================================================
-# 3. TABS MENU UTAMA
+# 3. TABS MENU UTAMA (6 TAB)
 # ==========================================================
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📥 1. Inbound", "📤 2. Outbound", "⚙️ 3. Audit & Backup", "📊 4. Log Mutasi", "🚀 5. Sinkronisasi CSV", "📅 6. Jadwal Kirim"])
 
@@ -184,7 +184,6 @@ with tab1:
                         slot_tambahan_in = 1 if (in_pecahan > 0 or in_eceran > 0) else 0
                         total_inbound_slots = in_qty + slot_tambahan_in
                         
-                        # --- CABUT HARD-BLOCK KELONGGARAN KAPASITAS ---
                         next_pallet = max(filled_pallets) + 1 if filled_pallets else 1
                         new_records = []
                         
@@ -239,7 +238,7 @@ with tab1:
             st.info("👈 Silakan tentukan Lokasi Kolom dan Baris di sebelah kiri, lalu klik 'Cek Status Rak'.")
 
 # ----------------------------------------------------------
-# TAB 2: OUTBOUND DENGAN RE-INDEXING (URUTAN PALLET MAJU)
+# TAB 2: OUTBOUND DENGAN RE-INDEXING & AUTO-CLEAR BOOKING/BAYANGAN
 # ----------------------------------------------------------
 with tab2:
     st.header("Penyesuaian Sisa Stok (Berdasarkan No. Lot)")
@@ -302,7 +301,7 @@ with tab2:
                     st.markdown(f"**📦 Total Lot `{pilih_lot}` di Rak ini: `{current_qty_lot}` Slot Fisik**")
                     st.caption(f"*(Fisik asli: {jml_utuh_awal} Pallet Utuh, {pecahan_awal} Dus/Sak, {eceran_awal} Pcs Eceran)*")
                     
-                    kolom_tersedia = [c for c in ['Pallet Ke', 'Part Number', 'Nama Produk', 'Lot Number', 'Keterangan'] if c in df_lot.columns]
+                    kolom_tersedia = [c for c in ['Pallet Ke', 'Part Number', 'Nama Produk', 'Lot Number', 'Keterangan', 'Catatan'] if c in df_lot.columns]
                     st.dataframe(df_lot[kolom_tersedia].head(5), hide_index=True)
                     
                     col_sisa1, col_sisa2, col_sisa3 = st.columns(3)
@@ -354,14 +353,13 @@ with tab2:
                                 new_all_out_data.append(d)
                             
                             # ==========================================================
-                            # PENOMORAN ULANG (RE-INDEXING) AGAR PALLET MAJU KE DEPAN
+                            # PENOMORAN ULANG (RE-INDEXING) & BERSIHKAN BOOKING / BAYANGAN
                             # ==========================================================
                             data_rak_ini = [d for d in new_all_out_data if float(d.get('Baris', 0) or 0) == float(b_pilih)]
                             data_rak_lain = [d for d in new_all_out_data if float(d.get('Baris', 0) or 0) != float(b_pilih)]
                             
                             data_rak_ini = sorted(data_rak_ini, key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
                             
-                            # 1. Cek apakah rak ini Full Box atau Campur untuk menentukan batas maksimal
                             valid_items = [x for x in data_rak_ini if str(x.get('Part Number', '')).strip() != '']
                             is_all_box_out = False
                             if valid_items:
@@ -370,15 +368,20 @@ with tab2:
                             b_val_float = float(b_pilih)
                             max_slot_out = int(32 if b_val_float <= 16 else 46) if is_all_box_out else int(31 if b_val_float <= 16 else 44)
                             
-                            # 2. Terapkan nomor urut baru dan bersihkan status Bayangan jika sudah masuk zona aman
                             for urutan_baru, d in enumerate(data_rak_ini, start=1):
                                 d['Pallet Ke'] = float(urutan_baru)
                                 
                                 catatan_lama = str(d.get('Catatan', ''))
+                                
+                                # Hapus otomatis label [BOOKED: ...] pada sisa barang yang batal muat/retur
+                                catatan_lama = re.sub(r'\[BOOKED:.*?\]', '', catatan_lama, flags=re.IGNORECASE).strip()
+                                
                                 if urutan_baru <= max_slot_out and 'BAYANGAN' in catatan_lama.upper():
                                     d['Catatan'] = catatan_lama.replace("[BAYANGAN - OVERCAPACITY]", "").strip()
                                 elif urutan_baru > max_slot_out and 'BAYANGAN' not in catatan_lama.upper():
                                     d['Catatan'] = ("[BAYANGAN - OVERCAPACITY] " + catatan_lama).strip()
+                                else:
+                                    d['Catatan'] = catatan_lama
                                     
                             new_all_out_data = data_rak_lain + data_rak_ini
                             # ==========================================================
@@ -398,25 +401,9 @@ with tab2:
                 st.info(f"📍 Rak {k_pilih}-{b_pilih} belum ada data sama sekali.")
         else:
             st.info("👈 Silakan tentukan Lokasi Kolom dan Baris di sebelah kiri, lalu klik 'Cari Data Rak'.")
-# 2. Terapkan nomor urut baru dan bersihkan status Bayangan/Booking
-                            for urutan_baru, d in enumerate(data_rak_ini, start=1):
-                                d['Pallet Ke'] = float(urutan_baru)
-                                
-                                catatan_lama = str(d.get('Catatan', ''))
-                                
-                                # HAPUS OTOMATIS LABEL BOOKING UNTUK SISA BARANG (RETUR BATAL MUAT)
-                                import re
-                                catatan_lama = re.sub(r'\[BOOKED:.*?\]', '', catatan_lama, flags=re.IGNORECASE).strip()
-                                
-                                if urutan_baru <= max_slot_out and 'BAYANGAN' in catatan_lama.upper():
-                                    d['Catatan'] = catatan_lama.replace("[BAYANGAN - OVERCAPACITY]", "").strip()
-                                elif urutan_baru > max_slot_out and 'BAYANGAN' not in catatan_lama.upper():
-                                    d['Catatan'] = ("[BAYANGAN - OVERCAPACITY] " + catatan_lama).strip()
-                                else:
-                                    d['Catatan'] = catatan_lama
 
 # ----------------------------------------------------------
-# TAB 3, 4, 5 (Audit, Log, Sinkronisasi CSV)
+# TAB 3: AUDIT STOK, BACKUP, & RE-INDEXING GLOBAL
 # ----------------------------------------------------------
 with tab3:
     st.header("⚙️ Audit Stok & Ekspor Data")
@@ -568,6 +555,9 @@ with tab3:
             else:
                 st.warning("Database saat ini kosong. Tidak ada data yang bisa diunduh.")
 
+# ----------------------------------------------------------
+# TAB 4: LAPORAN MUTASI HARIAN
+# ----------------------------------------------------------
 with tab4:
     st.header("📊 Laporan Mutasi Harian (24 Jam Terakhir)")
     st.write("Sistem akan menarik riwayat pergerakan barang (Inbound/Outbound) dalam 24 jam terakhir langsung menjadi file CSV.")
@@ -594,6 +584,9 @@ with tab4:
             except Exception as e:
                 st.error(f"Gagal memuat log mutasi: {e}")
 
+# ----------------------------------------------------------
+# TAB 5: SINKRONISASI MANUAL CSV
+# ----------------------------------------------------------
 with tab5:
     st.header("🚀 Sinkronisasi Data Manual (Upload CSV)")
     st.warning("⚠️ **PERHATIAN:** Sinkronisasi ini akan **menghapus semua data lama** dan menggantinya 100% dengan isi CSV yang Anda unggah. Pastikan file sudah final dan valid!")
@@ -680,7 +673,6 @@ with tab6:
                     
                     df_lot = df_book[df_book['Lot Number'].astype(str) == pilih_lot].sort_values('Pallet Ke', ascending=True)
                     
-                    # Filter: Hitung yang belum di-booking
                     df_belum_book = df_lot[~df_lot['Catatan'].astype(str).str.contains('BOOKED', case=False, na=False)]
                     qty_tersedia = len(df_belum_book)
                     
