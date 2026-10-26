@@ -387,6 +387,79 @@ with tab2:
 # ----------------------------------------------------------
 with tab3:
     st.header("⚙️ Audit Stok & Ekspor Data")
+    
+    # ----------------------------------------------------------
+    # FITUR MAINTENANCE: RE-INDEXING GLOBAL
+    # ----------------------------------------------------------
+    st.subheader("🔧 Maintenance: Re-Indexing Global")
+    st.write("Gunakan fitur ini jika nomor urut palet berantakan atau ada peringatan 'Rak Overlimit' palsu. Sistem akan mengurutkan ulang urutan palet dari nomor 1 di seluruh gudang tanpa mengubah isi barang.")
+    
+    if 'last_reindex' not in st.session_state:
+        st.session_state['last_reindex'] = "Belum pernah dijalankan pada sesi ini"
+        
+    st.caption(f"🕒 Terakhir Re-Index: **{st.session_state['last_reindex']}**")
+    
+    if st.button("⚙️ Jalankan Re-Indexing Semua Rak Sekarang", type="secondary"):
+        with st.spinner("Memperbaiki urutan index pallet dan membersihkan status bayangan palsu..."):
+            try:
+                docs = db.collection(NAMA_DATABASE).stream()
+                batch = db.batch()
+                total_koreksi = 0
+                
+                for doc in docs:
+                    kolom_id = doc.id
+                    doc_data = doc.to_dict().get('data', [])
+                    if not doc_data: continue
+                    
+                    df_col = pd.DataFrame(doc_data)
+                    if 'Baris' not in df_col.columns or 'Pallet Ke' not in df_col.columns: continue
+                    
+                    df_col['Baris'] = pd.to_numeric(df_col['Baris'], errors='coerce')
+                    df_col['Pallet Ke'] = pd.to_numeric(df_col['Pallet Ke'], errors='coerce')
+                    
+                    new_doc_data = []
+                    
+                    for baris, group in df_col.groupby('Baris'):
+                        group = group.sort_values('Pallet Ke', ascending=True)
+                        
+                        valid_group = group[~group['Part Number'].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>"])]
+                        is_all_box = False
+                        if not valid_group.empty:
+                            is_all_box = bool(valid_group['Part Number'].astype(str).str.upper().str.endswith(('D', 'G')).all())
+                            
+                        max_slot_actual = int(32 if baris <= 16 else 46) if is_all_box else int(31 if baris <= 16 else 44)
+                        
+                        for i, (idx, row) in enumerate(group.iterrows(), start=1):
+                            row_dict = row.to_dict()
+                            row_dict['Pallet Ke'] = float(i)
+                            
+                            catatan_lama = str(row_dict.get('Catatan', ''))
+                            
+                            if i <= max_slot_actual and 'BAYANGAN' in catatan_lama.upper():
+                                row_dict['Catatan'] = catatan_lama.replace("[BAYANGAN - OVERCAPACITY]", "").strip()
+                            elif i > max_slot_actual and 'BAYANGAN' not in catatan_lama.upper():
+                                row_dict['Catatan'] = ("[BAYANGAN - OVERCAPACITY] " + catatan_lama).strip()
+                                
+                            new_doc_data.append(row_dict)
+                    
+                    doc_ref = db.collection(NAMA_DATABASE).document(kolom_id)
+                    batch.set(doc_ref, {'data': new_doc_data})
+                    total_koreksi += 1
+                
+                batch.commit()
+                
+                waktu_sekarang = (datetime.utcnow() + timedelta(hours=7)).strftime("%d-%m-%Y %H:%M:%S")
+                st.session_state['last_reindex'] = waktu_sekarang
+                
+                st.success(f"✅ Re-Indexing Selesai! Sebanyak {total_koreksi} Kolom rak berhasil diurutkan ulang.")
+                st.balloons()
+                time.sleep(2)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Gagal menjalankan Re-Indexing: {e}")
+
+    st.divider()
+    
     st.subheader("📥 Tarik Laporan Audit (CSV Super)")
     st.write("Sistem akan otomatis menghitung total pcs tiap baris rak menggunakan referensi Master Produk. Bebas angka desimal (koma nol)!")
     
