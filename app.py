@@ -360,9 +360,26 @@ with tab2:
                             data_rak_lain = [d for d in new_all_out_data if float(d.get('Baris', 0) or 0) != float(b_pilih)]
                             
                             data_rak_ini = sorted(data_rak_ini, key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
+                            
+                            # 1. Cek apakah rak ini Full Box atau Campur untuk menentukan batas maksimal
+                            valid_items = [x for x in data_rak_ini if str(x.get('Part Number', '')).strip() != '']
+                            is_all_box_out = False
+                            if valid_items:
+                                is_all_box_out = all(str(x.get('Part Number', '')).strip().upper().endswith(('D', 'G')) for x in valid_items)
+                                
+                            b_val_float = float(b_pilih)
+                            max_slot_out = int(32 if b_val_float <= 16 else 46) if is_all_box_out else int(31 if b_val_float <= 16 else 44)
+                            
+                            # 2. Terapkan nomor urut baru dan bersihkan status Bayangan jika sudah masuk zona aman
                             for urutan_baru, d in enumerate(data_rak_ini, start=1):
                                 d['Pallet Ke'] = float(urutan_baru)
                                 
+                                catatan_lama = str(d.get('Catatan', ''))
+                                if urutan_baru <= max_slot_out and 'BAYANGAN' in catatan_lama.upper():
+                                    d['Catatan'] = catatan_lama.replace("[BAYANGAN - OVERCAPACITY]", "").strip()
+                                elif urutan_baru > max_slot_out and 'BAYANGAN' not in catatan_lama.upper():
+                                    d['Catatan'] = ("[BAYANGAN - OVERCAPACITY] " + catatan_lama).strip()
+                                    
                             new_all_out_data = data_rak_lain + data_rak_ini
                             # ==========================================================
                             
