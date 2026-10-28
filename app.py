@@ -566,7 +566,11 @@ with tab4:
         with st.spinner("Menarik data log mutasi dari server..."):
             try:
                 waktu_24_jam_lalu = (datetime.utcnow() + timedelta(hours=7) - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
-                log_docs = db.collection(DB_LOG_MUTASI).where("Waktu Transaksi", ">=", waktu_24_jam_lalu).order_by("Waktu Transaksi", direction=firestore.Query.DESCENDING).stream()
+                
+                # PERBAIKAN: Menggunakan firestore.FieldPath untuk kolom berspasi
+                field_waktu = firestore.FieldPath("Waktu Transaksi")
+                log_docs = db.collection(DB_LOG_MUTASI).where(field_waktu, ">=", waktu_24_jam_lalu).order_by(field_waktu, direction=firestore.Query.DESCENDING).stream()
+                
                 log_list = [d.to_dict() for d in log_docs]
                     
                 if log_list:
@@ -583,48 +587,6 @@ with tab4:
                     st.info("Belum ada transaksi mutasi dalam 24 jam terakhir. Tidak ada data untuk diunduh.")
             except Exception as e:
                 st.error(f"Gagal memuat log mutasi: {e}")
-
-# ----------------------------------------------------------
-# TAB 5: SINKRONISASI MANUAL CSV
-# ----------------------------------------------------------
-with tab5:
-    st.header("🚀 Sinkronisasi Data Manual (Upload CSV)")
-    st.warning("⚠️ **PERHATIAN:** Sinkronisasi ini akan **menghapus semua data lama** dan menggantinya 100% dengan isi CSV yang Anda unggah. Pastikan file sudah final dan valid!")
-    
-    uploaded_file = st.file_uploader("Pilih file CSV (Hasil kerja manual di Excel)", type=['csv'])
-    if uploaded_file is not None:
-        try:
-            try: df_sync = pd.read_csv(uploaded_file, sep=";")
-            except: df_sync = pd.read_csv(uploaded_file, sep=",")
-            
-            for c in df_sync.columns:
-                if c.strip().lower() in ['palet ke', 'pallet ke']: df_sync.rename(columns={c: 'Pallet Ke'}, inplace=True)
-            df_sync = df_sync.fillna("")
-            
-            if 'Kolom' in df_sync.columns:
-                st.write("Pratinjau Data yang akan disuntikkan ke Database:")
-                st.dataframe(df_sync.head(5))
-                
-                if st.button("⚡ MULAI SINKRONISASI KE DATABASE", type="primary"):
-                    if len(df_sync) < 50:
-                        st.error("Gagal! File CSV ditolak karena isinya terlalu sedikit (kurang dari 50 baris data).")
-                    else:
-                        with st.spinner("Proses menimpa database (Mohon tunggu 1-2 menit)..."):
-                            for doc in db.collection(NAMA_DATABASE).stream(): doc.reference.delete()
-                            
-                            batch = db.batch()
-                            for k, group in df_sync.groupby('Kolom'):
-                                if str(k).strip() != "":
-                                    doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{k}")
-                                    batch.set(doc_ref, {'data': group.to_dict(orient='records')})
-                            batch.commit()
-                            
-                            st.success("✅ BINGO! Sinkronisasi berhasil! Data lama telah terhapus dan ditimpa dengan data Excel terbaru Anda.")
-                            st.balloons()
-            else:
-                st.error("❌ Kolom bernama 'Kolom' (lokasi rak) tidak ditemukan di dalam CSV Anda. Harap periksa kembali format file CSV Anda.")
-        except Exception as e:
-            st.error(f"Terjadi kesalahan saat membaca file: {e}")
 
 # ----------------------------------------------------------
 # TAB 6: PENJADWALAN KIRIM (BOOKING STOK LOKAL) - AMAN DARI ERROR
