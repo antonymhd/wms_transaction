@@ -565,16 +565,19 @@ with tab4:
     if st.button("Racik Laporan Mutasi Sekarang", type="primary"):
         with st.spinner("Menarik data log mutasi dari server..."):
             try:
-                waktu_24_jam_lalu = (datetime.utcnow() + timedelta(hours=7) - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+                # PERBAIKAN: Selaraskan dengan field 'Timestamp_System' yang di-generate saat Inbound/Outbound.
+                # Menggunakan datetime murni (UTC) karena firestore.SERVER_TIMESTAMP berjalan di zona waktu UTC.
+                waktu_24_jam_lalu_utc = datetime.utcnow() - timedelta(hours=24)
                 
-                # PERBAIKAN: Menggunakan firestore.FieldPath untuk kolom berspasi
-                field_waktu = firestore.FieldPath("Waktu Transaksi")
-                log_docs = db.collection(DB_LOG_MUTASI).where(field_waktu, ">=", waktu_24_jam_lalu).order_by(field_waktu, direction=firestore.Query.DESCENDING).stream()
+                # Query sekarang menggunakan Timestamp_System (tanpa spasi, 100% aman dari error parsing)
+                log_docs = db.collection(DB_LOG_MUTASI).where("Timestamp_System", ">=", waktu_24_jam_lalu_utc).order_by("Timestamp_System", direction=firestore.Query.DESCENDING).stream()
                 
                 log_list = [d.to_dict() for d in log_docs]
                     
                 if log_list:
                     df_log = pd.DataFrame(log_list)
+                    
+                    # Kolom yang akan diekspor tetap "Waktu Transaksi" agar rapi saat dibaca di Excel
                     avail_cols = [c for c in ["Waktu Transaksi", "Jenis Transaksi", "Lokasi Rak", "Nama Produk", "No Lot", "Mutasi Pallet", "Mutasi Pecahan (Dus/Sak)", "Mutasi Eceran (Pcs)", "Part Number", "Keterangan"] if c in df_log.columns]
                     df_log = df_log[avail_cols]
                     
