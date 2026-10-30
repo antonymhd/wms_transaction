@@ -79,7 +79,7 @@ if st.session_state['action_status'] is not None: st.divider()
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📥 1. Inbound", "📤 2. Outbound", "⚙️ 3. Audit & Backup", "📊 4. Log Mutasi", "🚀 5. Sinkronisasi CSV", "📅 6. Jadwal Kirim"])
 
 # ----------------------------------------------------------
-# TAB 1: INBOUND BORONGAN (SOFT-WARNING PALLET BAYANGAN)
+# TAB 1: INBOUND BORONGAN (KONSOLIDASI PECAHAN 1 PALLET)
 # ----------------------------------------------------------
 with tab1:
     st.header("Input Data Kertas (List Stock)")
@@ -145,7 +145,7 @@ with tab1:
                 in_produk = st.text_input("Nama Produk (Ketik Manual)")
                 in_part = st.text_input("Part Number (Ketik Manual)")
                 
-            in_lot = st.text_input("No. Lot Produksi / Mesin Shift", placeholder="Kosongkan jika tidak ada, sistem akan otomatis mengisi '-'")
+            in_lot = st.text_input("No. Lot Produksi / Mesin Shift", placeholder="Kosongkan jika tidak ada, sistem otomatis mengisi '-'")
             
             col_qty1, col_qty2, col_qty3 = st.columns(3)
             with col_qty1: in_qty = st.number_input("Pallet Masuk UTUH", min_value=0, step=1, value=1)
@@ -172,21 +172,34 @@ with tab1:
                         baris_data_actual = [d for d in all_data if float(d.get('Baris', 0) or 0) == float(b_pilih)]
                         
                         is_all_box_actual = in_part_clean.endswith(('D', 'G'))
+                        existing_fraction_row = None
+                        
+                        # Cek apakah rak ini sepenuhnya box dan cari slot pecahan untuk Lot yang sama
                         for d in baris_data_actual:
                             pn = str(d.get('Part Number', '')).strip().upper()
                             if pn and not pn.endswith(('D', 'G')):
-                                is_all_box_actual = False; break
-                                
+                                is_all_box_actual = False
+                            
+                            # Identifikasi apakah sudah ada pallet pecahan untuk produk & lot ini
+                            if pn == in_part_clean and str(d.get('Lot Number', '')).strip() == in_lot_final:
+                                ket = str(d.get('Keterangan', ''))
+                                if 'Pecahan' in ket or 'Eceran' in ket:
+                                    existing_fraction_row = d
+                                    
                         max_slot_actual = 32 if (is_all_box_actual and b_pilih <= 16) else (46 if is_all_box_actual else (31 if b_pilih <= 16 else 44))
                         filled_pallets = [int(float(d.get('Pallet Ke', 0) or 0)) for d in baris_data_actual if pd.notna(d.get('Pallet Ke')) and str(d.get('Pallet Ke')).strip() != '']
                         current_qty_actual = len(filled_pallets)
                         
-                        slot_tambahan_in = 1 if (in_pecahan > 0 or in_eceran > 0) else 0
+                        # Jika ada pecahan masuk tapi slot pecahannya sudah ada, tidak butuh slot baru (0 slot tambahan)
+                        slot_tambahan_in = 0
+                        if (in_pecahan > 0 or in_eceran > 0) and not existing_fraction_row:
+                            slot_tambahan_in = 1
+                            
                         total_inbound_slots = in_qty + slot_tambahan_in
-                        
                         next_pallet = max(filled_pallets) + 1 if filled_pallets else 1
                         new_records = []
                         
+                        # Proses Pallet Utuh
                         for _ in range(int(in_qty)):
                             while next_pallet in filled_pallets: next_pallet += 1
                             
@@ -201,23 +214,48 @@ with tab1:
                             filled_pallets.append(next_pallet)
                             next_pallet += 1
                             
+                        # Proses Pecahan/Eceran (Digabungkan ke 1 Pallet)
                         if in_pecahan > 0 or in_eceran > 0:
-                            while next_pallet in filled_pallets: next_pallet += 1
-                            
-                            is_bayangan = next_pallet > max_slot_actual
-                            catatan_bayangan = "[BAYANGAN - OVERCAPACITY]" if is_bayangan else ""
+                            if existing_fraction_row:
+                                # Update data di pallet pecahan yang sudah ada
+                                ket_str = str(existing_fraction_row.get('Keterangan', '')).lower()
+                                ex_pecahan, ex_eceran = 0, 0
                                 
-                            ket_parts = []
-                            if in_pecahan > 0: ket_parts.append(f"Pecahan: {in_pecahan} qty")
-                            if in_eceran > 0: ket_parts.append(f"Eceran: {in_eceran} pcs")
-                            
-                            new_records.append({
-                                'Kolom': k_pilih, 'Baris': float(b_pilih), 'Pallet Ke': float(next_pallet),
-                                'Part Number': in_part_clean, 'Lot Number': in_lot_final, 'Nama Produk': in_produk_clean,
-                                'Status': 'Terisi', 'Catatan': catatan_bayangan,
-                                'Keterangan': " | ".join(ket_parts)
-                            })
-                            filled_pallets.append(next_pallet)
+                                match_pec = re.search(r'pecahan:\s*(\d+)', ket_str)
+                                if match_pec: ex_pecahan = int(match_pec.group(1))
+                                else:
+                                    nums = re.findall(r'\d+', ket_str)
+                                    if nums and 'pecahan' in ket_str: ex_pecahan = int(nums[0])
+                                    
+                                match_ec = re.search(r'eceran:\s*(\d+)', ket_str)
+                                if match_ec: ex_eceran = int(match_ec.group(1))
+                                
+                                new_pec = ex_pecahan + in_pecahan
+                                new_ec = ex_eceran + in_eceran
+                                
+                                ket_parts = []
+                                if new_pec > 0: ket_parts.append(f"Pecahan: {new_pec} qty")
+                                if new_ec > 0: ket_parts.append(f"Eceran: {new_ec} pcs")
+                                
+                                existing_fraction_row['Keterangan'] = " | ".join(ket_parts)
+                            else:
+                                # Buat slot pecahan baru jika belum ada
+                                while next_pallet in filled_pallets: next_pallet += 1
+                                
+                                is_bayangan = next_pallet > max_slot_actual
+                                catatan_bayangan = "[BAYANGAN - OVERCAPACITY]" if is_bayangan else ""
+                                    
+                                ket_parts = []
+                                if in_pecahan > 0: ket_parts.append(f"Pecahan: {in_pecahan} qty")
+                                if in_eceran > 0: ket_parts.append(f"Eceran: {in_eceran} pcs")
+                                
+                                new_records.append({
+                                    'Kolom': k_pilih, 'Baris': float(b_pilih), 'Pallet Ke': float(next_pallet),
+                                    'Part Number': in_part_clean, 'Lot Number': in_lot_final, 'Nama Produk': in_produk_clean,
+                                    'Status': 'Terisi', 'Catatan': catatan_bayangan,
+                                    'Keterangan': " | ".join(ket_parts)
+                                })
+                                filled_pallets.append(next_pallet)
                             
                         all_data.extend(new_records)
                         
@@ -238,7 +276,7 @@ with tab1:
             st.info("👈 Silakan tentukan Lokasi Kolom dan Baris di sebelah kiri, lalu klik 'Cek Status Rak'.")
 
 # ----------------------------------------------------------
-# TAB 2: OUTBOUND DENGAN RE-INDEXING & AUTO-CLEAR BOOKING/BAYANGAN
+# TAB 2: OUTBOUND DENGAN RE-INDEXING & AUTO-CLEAR BOOKING
 # ----------------------------------------------------------
 with tab2:
     st.header("Penyesuaian Sisa Stok (Berdasarkan No. Lot)")
@@ -287,16 +325,18 @@ with tab2:
                     jml_utuh_awal = df_lot[~df_lot['Keterangan'].astype(str).str.contains('Pecahan|Eceran', case=False, na=False)].shape[0]
                     pecahan_rows = df_lot[df_lot['Keterangan'].astype(str).str.contains('Pecahan|Eceran', case=False, na=False)]
                     
+                    # BUG FIX: Menjumlahkan seluruh pecahan dari semua baris (untuk kompatibilitas data lama)
                     pecahan_awal, eceran_awal = 0, 0
                     if not pecahan_rows.empty:
-                        ket_str = str(pecahan_rows['Keterangan'].iloc[0]).lower()
-                        match_pec = re.search(r'pecahan:\s*(\d+)', ket_str)
-                        if match_pec: pecahan_awal = int(match_pec.group(1))
-                        else:
-                            numbers = re.findall(r'\d+', ket_str)
-                            if numbers and 'pecahan' in ket_str: pecahan_awal = int(numbers[0])
-                        match_ec = re.search(r'eceran:\s*(\d+)', ket_str)
-                        if match_ec: eceran_awal = int(match_ec.group(1))
+                        for _, row_pecahan in pecahan_rows.iterrows():
+                            ket_str = str(row_pecahan['Keterangan']).lower()
+                            match_pec = re.search(r'pecahan:\s*(\d+)', ket_str)
+                            if match_pec: pecahan_awal += int(match_pec.group(1))
+                            else:
+                                numbers = re.findall(r'\d+', ket_str)
+                                if numbers and 'pecahan' in ket_str: pecahan_awal += int(numbers[0])
+                            match_ec = re.search(r'eceran:\s*(\d+)', ket_str)
+                            if match_ec: eceran_awal += int(match_ec.group(1))
                     
                     st.markdown(f"**📦 Total Lot `{pilih_lot}` di Rak ini: `{current_qty_lot}` Slot Fisik**")
                     st.caption(f"*(Fisik asli: {jml_utuh_awal} Pallet Utuh, {pecahan_awal} Dus/Sak, {eceran_awal} Pcs Eceran)*")
@@ -372,8 +412,6 @@ with tab2:
                                 d['Pallet Ke'] = float(urutan_baru)
                                 
                                 catatan_lama = str(d.get('Catatan', ''))
-                                
-                                # Hapus otomatis label [BOOKED: ...] pada sisa barang yang batal muat/retur
                                 catatan_lama = re.sub(r'\[BOOKED:.*?\]', '', catatan_lama, flags=re.IGNORECASE).strip()
                                 
                                 if urutan_baru <= max_slot_out and 'BAYANGAN' in catatan_lama.upper():
@@ -384,7 +422,6 @@ with tab2:
                                     d['Catatan'] = catatan_lama
                                     
                             new_all_out_data = data_rak_lain + data_rak_ini
-                            # ==========================================================
                             
                             st.session_state.update({'undo_data': data_sebelum_out, 'redo_data': copy.deepcopy(new_all_out_data), 'action_kolom': k_pilih, 'action_msg': f"Penyesuaian Outbound Lot '{pilih_lot}' di Rak {k_pilih}-{b_pilih}", 'action_status': 'DONE'})
                             
@@ -408,9 +445,6 @@ with tab2:
 with tab3:
     st.header("⚙️ Audit Stok & Ekspor Data")
     
-    # ----------------------------------------------------------
-    # FITUR MAINTENANCE: RE-INDEXING GLOBAL
-    # ----------------------------------------------------------
     st.subheader("🔧 Maintenance: Re-Indexing Global")
     st.write("Gunakan fitur ini jika nomor urut palet berantakan atau ada peringatan 'Rak Overlimit' palsu. Sistem akan mengurutkan ulang urutan palet dari nomor 1 di seluruh gudang tanpa mengubah isi barang.")
     
@@ -565,19 +599,14 @@ with tab4:
     if st.button("Racik Laporan Mutasi Sekarang", type="primary"):
         with st.spinner("Menarik data log mutasi dari server..."):
             try:
-                # PERBAIKAN: Selaraskan dengan field 'Timestamp_System' yang di-generate saat Inbound/Outbound.
-                # Menggunakan datetime murni (UTC) karena firestore.SERVER_TIMESTAMP berjalan di zona waktu UTC.
                 waktu_24_jam_lalu_utc = datetime.utcnow() - timedelta(hours=24)
                 
-                # Query sekarang menggunakan Timestamp_System (tanpa spasi, 100% aman dari error parsing)
                 log_docs = db.collection(DB_LOG_MUTASI).where("Timestamp_System", ">=", waktu_24_jam_lalu_utc).order_by("Timestamp_System", direction=firestore.Query.DESCENDING).stream()
-                
                 log_list = [d.to_dict() for d in log_docs]
                     
                 if log_list:
                     df_log = pd.DataFrame(log_list)
                     
-                    # Kolom yang akan diekspor tetap "Waktu Transaksi" agar rapi saat dibaca di Excel
                     avail_cols = [c for c in ["Waktu Transaksi", "Jenis Transaksi", "Lokasi Rak", "Nama Produk", "No Lot", "Mutasi Pallet", "Mutasi Pecahan (Dus/Sak)", "Mutasi Eceran (Pcs)", "Part Number", "Keterangan"] if c in df_log.columns]
                     df_log = df_log[avail_cols]
                     
@@ -592,7 +621,7 @@ with tab4:
                 st.error(f"Gagal memuat log mutasi: {e}")
 
 # ----------------------------------------------------------
-# TAB 6: PENJADWALAN KIRIM (BOOKING STOK LOKAL) - AMAN DARI ERROR
+# TAB 6: PENJADWALAN KIRIM (BOOKING STOK LOKAL)
 # ----------------------------------------------------------
 with tab6:
     st.header("📅 Penjadwalan Pengiriman (Booking Pallet)")
@@ -637,7 +666,6 @@ with tab6:
                     pilih_lot = mapping_lot[pilihan_label]
                     
                     df_lot = df_book[df_book['Lot Number'].astype(str) == pilih_lot].sort_values('Pallet Ke', ascending=True)
-                    
                     df_belum_book = df_lot[~df_lot['Catatan'].astype(str).str.contains('BOOKED', case=False, na=False)]
                     qty_tersedia = len(df_belum_book)
                     
@@ -646,7 +674,6 @@ with tab6:
                     kolom_tersedia = [c for c in ['Pallet Ke', 'Part Number', 'Lot Number', 'Catatan'] if c in df_lot.columns]
                     st.dataframe(df_lot[kolom_tersedia], hide_index=True, height=150)
                     
-                    # BLOK PENGAMANAN AGAR TIDAK TERJADI StreamlitValueBelowMinError
                     if qty_tersedia > 0:
                         book_qty = st.number_input("Jumlah Pallet UTUH yang akan di-Booking", min_value=1, max_value=qty_tersedia, step=1, value=qty_tersedia)
                         book_do = st.text_input("📝 Terjadwal Untuk (Cth: DO-123 / Tgl 28)", placeholder="Ketik keterangan pengiriman...")
@@ -672,7 +699,6 @@ with tab6:
                                         new_all_book_data.append(d)
                                         
                                     doc_ref_book.set({'data': new_all_book_data})
-                                    
                                     st.session_state.update({'undo_data': data_sebelum_book, 'redo_data': copy.deepcopy(new_all_book_data), 'action_kolom': k_pilih, 'action_msg': f"Booking {book_qty} Pallet Lot '{pilih_lot}' untuk '{book_do}' di Rak {k_pilih}-{b_pilih}", 'action_status': 'DONE'})
                                     
                                     st.success(f"✅ Berhasil! {book_qty} pallet telah dikunci untuk jadwal: {book_do}")
