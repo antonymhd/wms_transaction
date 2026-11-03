@@ -667,7 +667,7 @@ with tab6:
             else: st.info("Rak Kosong.")
 
 # ----------------------------------------------------------
-# TAB 7: RELOKASI RAK (DENGAN LABEL NAMA PRODUK & PUSH-BACK)
+# TAB 7: RELOKASI RAK (DENGAN LABEL NAMA PRODUK & INFO SLOT)
 # ----------------------------------------------------------
 with tab7:
     st.header("🔄 Relokasi Pallet (Pindah Rak / Subsidi Silang)")
@@ -713,8 +713,13 @@ with tab7:
             pilihan_label_relokasi = st.selectbox("Pilih Produk & Lot yang akan dipindah:", tersedia_lot_relokasi)
             lot_pilih = mapping_lot_relokasi[pilihan_label_relokasi]
             
+            # Hitung jumlah maksimum slot untuk Lot yang dipilih
             qty_maks = len(df_a[df_a['Lot Number']==lot_pilih])
-            qty_pindah = st.number_input("Berapa Slot Fisik yang dipindah?", min_value=1, max_value=qty_maks, step=1)
+            
+            # Tampilkan informasi slot fisik
+            st.info(f"📦 Total Slot Fisik untuk Lot ini di rak {r_asal_k}-{r_asal_b}: **{qty_maks} Slot**")
+            
+            qty_pindah = st.number_input(f"Berapa Slot Fisik yang dipindah? (Maks: {qty_maks})", min_value=1, max_value=qty_maks, step=1)
             is_masuk_depan = st.checkbox("📥 Di Rak Tujuan, masukkan barang dari DEPAN (Push-back)")
             
             if st.form_submit_button("🚚 Eksekusi Relokasi Pindah Rak"):
