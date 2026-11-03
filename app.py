@@ -667,7 +667,7 @@ with tab6:
             else: st.info("Rak Kosong.")
 
 # ----------------------------------------------------------
-# TAB 7: RELOKASI RAK (DENGAN LABEL NAMA PRODUK & INFO SLOT)
+# TAB 7: RELOKASI RAK (DENGAN LABEL NAMA PRODUK & INFO SLOT AKURAT)
 # ----------------------------------------------------------
 with tab7:
     st.header("🔄 Relokasi Pallet (Pindah Rak / Subsidi Silang)")
@@ -707,17 +707,21 @@ with tab7:
             nama_produk = str(row.get('Nama Produk', 'Unknown Product'))
             label_dropdown = f"{nama_produk} (Lot: {lot_asli})"
             tersedia_lot_relokasi.append(label_dropdown)
-            mapping_lot_relokasi[label_dropdown] = lot_asli
+            
+            # PERBAIKAN: Simpan relasi sebagai pasangan (Tuple) Nama Produk & Lot
+            mapping_lot_relokasi[label_dropdown] = (nama_produk, lot_asli)
             
         with st.form("form_relokasi"):
             pilihan_label_relokasi = st.selectbox("Pilih Produk & Lot yang akan dipindah:", tersedia_lot_relokasi)
-            lot_pilih = mapping_lot_relokasi[pilihan_label_relokasi]
             
-            # Hitung jumlah maksimum slot untuk Lot yang dipilih
-            qty_maks = len(df_a[df_a['Lot Number']==lot_pilih])
+            # PERBAIKAN: Ambil Nama dan Lot dari pilihan
+            nama_pilih, lot_pilih = mapping_lot_relokasi[pilihan_label_relokasi]
             
-            # Tampilkan informasi slot fisik
-            st.info(f"📦 Total Slot Fisik untuk Lot ini di rak {r_asal_k}-{r_asal_b}: **{qty_maks} Slot**")
+            # PERBAIKAN: Filter ketat berdasarkan Nama Produk DAN Lot Number
+            df_lot_target_all = df_a[(df_a['Lot Number'].astype(str) == lot_pilih) & (df_a['Nama Produk'].astype(str) == nama_pilih)]
+            qty_maks = len(df_lot_target_all)
+            
+            st.info(f"📦 Total Slot Fisik untuk item ini di rak {r_asal_k}-{r_asal_b}: **{qty_maks} Slot**")
             
             qty_pindah = st.number_input(f"Berapa Slot Fisik yang dipindah? (Maks: {qty_maks})", min_value=1, max_value=qty_maks, step=1)
             is_masuk_depan = st.checkbox("📥 Di Rak Tujuan, masukkan barang dari DEPAN (Push-back)")
@@ -727,13 +731,14 @@ with tab7:
                     st.error("Rak asal dan tujuan tidak boleh sama!")
                 else:
                     with st.spinner("Memindahkan fisik dan re-indexing..."):
-                        # Ekstrak dr Asal
-                        df_lot_target = df_a[df_a['Lot Number']==lot_pilih].sort_values('Pallet Ke', ascending=False)
+                        # Ekstrak dr Asal (Gunakan df_lot_target_all yang sudah difilter ganda)
+                        df_lot_target = df_lot_target_all.sort_values('Pallet Ke', ascending=False)
                         pallets_dipindah = df_lot_target['Pallet Ke'].head(qty_pindah).tolist()
                         
                         data_pindah = [d for d in st.session_state['relok_doc_asal'] if float(d.get('Baris',0) or 0)==float(r_asal_b) and pd.to_numeric(d.get('Pallet Ke',0)) in pallets_dipindah]
                         data_asal_sisa = [d for d in st.session_state['relok_doc_asal'] if not (float(d.get('Baris',0) or 0)==float(r_asal_b) and pd.to_numeric(d.get('Pallet Ke',0)) in pallets_dipindah)]
                         
+                        # Re-index Asal
                         baris_asal_sisa = sorted([d for d in data_asal_sisa if float(d.get('Baris',0) or 0)==float(r_asal_b)], key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
                         lain_asal = [d for d in data_asal_sisa if float(d.get('Baris',0) or 0)!=float(r_asal_b)]
                         for i, d in enumerate(baris_asal_sisa, 1): d['Pallet Ke'] = float(i)
