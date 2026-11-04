@@ -51,7 +51,7 @@ st.title("📝 WMS Entry Form (Inbound, Outbound & Relokasi)")
 st.caption(f"Alat khusus PPIC. Terhubung ke database: {NAMA_DATABASE}")
 
 # ==========================================================
-# 3. HELPER FUNCTIONS (CACHE MASTER & CATAT LOG)
+# 3. HELPER FUNCTIONS
 # ==========================================================
 @st.cache_data(ttl=3600)
 def load_master_produk():
@@ -80,41 +80,42 @@ def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh,
     except Exception as e: st.toast(f"⚠️ Peringatan: Gagal mencatat log mutasi ({e})", icon="⚠️")
 
 # ==========================================================
-# 4. NOTIFIKASI RAKSASA & FITUR UNDO (MULTI-KOLOM SUPPORT)
+# 4. NOTIFIKASI 1-LINER & FITUR UNDO
 # ==========================================================
 if 'undo_dict' not in st.session_state:
-    # undo_dict menyimpan format: {'A': data_awal_A, 'C': data_awal_C}
     st.session_state.update({'undo_dict': {}, 'action_msg': "", 'action_status': None})
 
 if st.session_state['action_status'] == 'DONE':
-    st.success(f"### 🎉 SUKSES MENGUBAH DATA!\n**{st.session_state['action_msg']}**", icon="✅")
-    
-    col_undo1, col_undo2 = st.columns([3, 1])
-    with col_undo1:
-        st.info("💡 **Aman!** Pesan ini tidak akan hilang sampai Anda melakukan input berikutnya. Silakan tinggalkan layar jika perlu mengecek fisik barang.")
-    with col_undo2:
-        if st.button("🔙 BATALKAN AKSI (UNDO)", type="primary", use_container_width=True):
-            with st.spinner("Mengembalikan data seperti semula..."):
-                batch_undo = db.batch()
-                kolom_terdampak = []
-                for kol, dat in st.session_state['undo_dict'].items():
-                    doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{kol}")
-                    batch_undo.set(doc_ref, {'data': dat})
-                    kolom_terdampak.append(kol)
-                batch_undo.commit()
-                
-                st.session_state['action_status'] = 'UNDONE'
-                catat_log_mutasi("PEMBATALAN (UNDO)", ",".join(kolom_terdampak), "ALL", "Koreksi Sistem", "-", "-", 0, 0, 0, f"Membatalkan aksi: {st.session_state['action_msg']}")
-                st.rerun()
+    # Desain notifikasi 1-Baris Tipis
+    notif_c1, notif_c2 = st.columns([4, 1])
+    notif_c1.success(f"✅ **Sukses:** {st.session_state['action_msg']}")
+    if notif_c2.button("🔙 UNDO AKSI INI", type="primary", use_container_width=True):
+        with st.spinner("Memulihkan data..."):
+            batch_undo = db.batch()
+            kolom_terdampak = []
+            for kol, dat in st.session_state['undo_dict'].items():
+                doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{kol}")
+                batch_undo.set(doc_ref, {'data': dat})
+                kolom_terdampak.append(kol)
+            batch_undo.commit()
+            
+            st.session_state['action_status'] = 'UNDONE'
+            catat_log_mutasi("PEMBATALAN (UNDO)", ",".join(kolom_terdampak), "ALL", "Koreksi Sistem", "-", "-", 0, 0, 0, f"Membatalkan: {st.session_state['action_msg']}")
+            st.rerun()
 
-elif st.session_state['action_status'] == 'UNDONE':
-    st.warning("### ⏪ PEMBATALAN BERHASIL\nAksi terakhir telah dibatalkan. Sistem dan database kembali seperti semula sebelum dieksekusi.", icon="⚠️")
+elif st.session_state['action_status'] == 'DONE_NO_UNDO':
+    # Notifikasi tanpa tombol undo (untuk fitur restore CSV)
+    st.success(f"✅ **Sukses:** {st.session_state['action_msg']}")
     if st.button("Tutup Pesan Ini"):
         st.session_state['action_status'] = None
         st.rerun()
 
-if st.session_state['action_status'] is not None: 
-    st.divider()
+elif st.session_state['action_status'] == 'UNDONE':
+    notif_c1, notif_c2 = st.columns([4, 1])
+    notif_c1.warning("⏪ **Berhasil dibatalkan.** Data telah kembali seperti semula.")
+    if notif_c2.button("Tutup Pesan", use_container_width=True):
+        st.session_state['action_status'] = None
+        st.rerun()
 
 # ==========================================================
 # 5. TABS MENU UTAMA
@@ -220,7 +221,6 @@ with tab1:
                         
                         new_records = []
                         
-                        # LOGIKA RE-INDEXING DARI DEPAN
                         if in_dari_depan and baris_data_actual:
                             for d in all_data:
                                 if float(d.get('Baris', 0) or 0) == float(b_pilih):
@@ -272,7 +272,6 @@ with tab1:
                                 
                         all_data.extend(new_records)
                         
-                        # SET BANNER NOTIFIKASI
                         st.session_state.update({
                             'undo_dict': {k_pilih: all_data_raw}, 
                             'action_msg': f"Inbound {total_inbound_slots} Slot '{in_produk_clean}' ke Rak {k_pilih}-{b_pilih} {'(Push-back)' if in_dari_depan else ''}", 
@@ -283,7 +282,7 @@ with tab1:
                         st.rerun()
 
 # ----------------------------------------------------------
-# TAB 2: OUTBOUND MULTI-LOT
+# TAB 2: OUTBOUND MULTI-LOT (Refaktor Layout Atas-Bawah)
 # ----------------------------------------------------------
 with tab2:
     st.header("Penyesuaian Sisa Stok (Outbound Multi-Lot)")
@@ -292,149 +291,153 @@ with tab2:
     if 'out_lokasi_dicari' not in st.session_state: 
         st.session_state.update({'out_lokasi_dicari': False, 'out_k_pilih': "A", 'out_b_pilih': 1})
 
-    col_out1, col_out2 = st.columns([1, 2.5])
-    with col_out1:
-        st.markdown("**1. Pilih Lokasi Rak**")
-        out_kolom = st.selectbox("Lokasi Kolom", ["A", "B", "C", "D", "E", "F", "G"], key="out_kolom_2")
-        out_baris = st.number_input("Nomor Baris (Outbound)", min_value=1, max_value=28, value=1, key="out_baris_2")
+    st.markdown("**1. Pilih Lokasi Rak**")
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1: out_kolom = st.selectbox("Lokasi Kolom", ["A", "B", "C", "D", "E", "F", "G"], key="out_kolom_2")
+    with c2: out_baris = st.number_input("Nomor Baris", min_value=1, max_value=28, value=1, key="out_baris_2")
+    with c3:
+        st.write("") # Spacer agar tombol sejajar dengan input
+        st.write("")
         if st.button("🔍 Cari Data Rak", use_container_width=True): 
             st.session_state.update({'out_lokasi_dicari': True, 'out_k_pilih': out_kolom, 'out_b_pilih': out_baris})
             
-    with col_out2:
-        if st.session_state['out_lokasi_dicari']:
-            k_pilih, b_pilih = st.session_state['out_k_pilih'], st.session_state['out_b_pilih']
-            doc_ref_out = db.collection(NAMA_DATABASE).document(f"Kolom_{k_pilih}")
-            doc_out = doc_ref_out.get()
-            all_out_data = doc_out.to_dict().get('data', []) if doc_out.exists else []
-            baris_out_data = [d for d in all_out_data if float(d.get('Baris', 0) or 0) == float(b_pilih) and str(d.get('Part Number', '')).strip() != '']
+    st.divider()
+    
+    if st.session_state['out_lokasi_dicari']:
+        k_pilih, b_pilih = st.session_state['out_k_pilih'], st.session_state['out_b_pilih']
+        doc_ref_out = db.collection(NAMA_DATABASE).document(f"Kolom_{k_pilih}")
+        doc_out = doc_ref_out.get()
+        all_out_data = doc_out.to_dict().get('data', []) if doc_out.exists else []
+        baris_out_data = [d for d in all_out_data if float(d.get('Baris', 0) or 0) == float(b_pilih) and str(d.get('Part Number', '')).strip() != '']
+        
+        if baris_out_data:
+            df_out = pd.DataFrame(baris_out_data)
+            df_out['Pallet Ke'] = pd.to_numeric(df_out['Pallet Ke'], errors='coerce')
             
-            if baris_out_data:
-                df_out = pd.DataFrame(baris_out_data)
-                df_out['Pallet Ke'] = pd.to_numeric(df_out['Pallet Ke'], errors='coerce')
+            rekap_lot = []
+            for _, row in df_out.drop_duplicates(subset=['Lot Number', 'Nama Produk']).iterrows():
+                l = str(row['Lot Number'])
+                nama_prod = str(row['Nama Produk'])
+                part_num = str(row['Part Number'])
+                df_lot = df_out[df_out['Lot Number'].astype(str) == l]
                 
-                rekap_lot = []
-                for _, row in df_out.drop_duplicates(subset=['Lot Number', 'Nama Produk']).iterrows():
+                jml_utuh_awal = df_lot[~df_lot['Keterangan'].astype(str).str.contains('Pecahan|Eceran', case=False, na=False)].shape[0]
+                pecahan_rows = df_lot[df_lot['Keterangan'].astype(str).str.contains('Pecahan|Eceran', case=False, na=False)]
+                pecahan_awal, eceran_awal = 0, 0
+                
+                for _, r in pecahan_rows.iterrows():
+                    ks = str(r['Keterangan']).lower()
+                    m1 = re.search(r'pecahan:\s*(\d+)', ks)
+                    if m1: pecahan_awal += int(m1.group(1))
+                    else:
+                        ns = re.findall(r'\d+', ks)
+                        if ns and 'pecahan' in ks: pecahan_awal += int(ns[0])
+                    m2 = re.search(r'eceran:\s*(\d+)', ks)
+                    if m2: eceran_awal += int(m2.group(1))
+                
+                rekap_lot.append({
+                    'Produk': nama_prod, 'Part Number': part_num, 'Lot Number': l,
+                    'Awal Utuh': int(jml_utuh_awal), 'Awal Dus': int(pecahan_awal), 'Awal Pcs': int(eceran_awal),
+                    'Sisa Utuh Baru': int(jml_utuh_awal), 'Sisa Dus Baru': int(pecahan_awal), 'Sisa Pcs Baru': int(eceran_awal),
+                    'Catatan Outbound': ""
+                })
+            
+            df_rekap = pd.DataFrame(rekap_lot)
+            st.markdown(f"**2. Edit Sisa Fisik Rak {k_pilih}-{b_pilih} (Tampilan Lebar)**")
+            
+            config_kolom = {
+                'Produk': st.column_config.TextColumn("Produk", disabled=True),
+                'Part Number': st.column_config.TextColumn("Part", disabled=True),
+                'Lot Number': st.column_config.TextColumn("Lot", disabled=True),
+                'Awal Utuh': st.column_config.NumberColumn("Sistem Utuh", disabled=True),
+                'Awal Dus': st.column_config.NumberColumn("Sistem Dus", disabled=True),
+                'Awal Pcs': st.column_config.NumberColumn("Sistem Pcs", disabled=True),
+                'Sisa Utuh Baru': st.column_config.NumberColumn("SISA UTUH BARU", min_value=0, required=True),
+                'Sisa Dus Baru': st.column_config.NumberColumn("SISA DUS BARU", min_value=0, required=True),
+                'Sisa Pcs Baru': st.column_config.NumberColumn("SISA PCS BARU", min_value=0, required=True),
+                'Catatan Outbound': st.column_config.TextColumn("Catatan", max_chars=100)
+            }
+            
+            # Editor diletakkan di bawah (Full Width)
+            edited_df = st.data_editor(df_rekap, column_config=config_kolom, hide_index=True, use_container_width=True, num_rows="fixed")
+            
+            if st.button("🚜 Simpan Penyesuaian Massal (OUTBOUND)", type="primary", use_container_width=True):
+                has_changes = False
+                error_msg = ""
+                new_all_out_data = []
+                
+                data_rak_ini = [d for d in all_out_data if float(d.get('Baris', 0) or 0) == float(b_pilih)]
+                data_rak_lain = [d for d in all_out_data if float(d.get('Baris', 0) or 0) != float(b_pilih)]
+                
+                for index, row in edited_df.iterrows():
                     l = str(row['Lot Number'])
-                    nama_prod = str(row['Nama Produk'])
-                    part_num = str(row['Part Number'])
-                    df_lot = df_out[df_out['Lot Number'].astype(str) == l]
+                    sisa_utuh = int(row['Sisa Utuh Baru'])
+                    sisa_dus = int(row['Sisa Dus Baru'])
+                    sisa_pcs = int(row['Sisa Pcs Baru'])
+                    catatan_out = str(row['Catatan Outbound'])
                     
-                    jml_utuh_awal = df_lot[~df_lot['Keterangan'].astype(str).str.contains('Pecahan|Eceran', case=False, na=False)].shape[0]
-                    pecahan_rows = df_lot[df_lot['Keterangan'].astype(str).str.contains('Pecahan|Eceran', case=False, na=False)]
-                    pecahan_awal, eceran_awal = 0, 0
+                    awal_utuh = int(row['Awal Utuh'])
+                    awal_dus = int(row['Awal Dus'])
+                    awal_pcs = int(row['Awal Pcs'])
                     
-                    for _, r in pecahan_rows.iterrows():
-                        ks = str(r['Keterangan']).lower()
-                        m1 = re.search(r'pecahan:\s*(\d+)', ks)
-                        if m1: pecahan_awal += int(m1.group(1))
-                        else:
-                            ns = re.findall(r'\d+', ks)
-                            if ns and 'pecahan' in ks: pecahan_awal += int(ns[0])
-                        m2 = re.search(r'eceran:\s*(\d+)', ks)
-                        if m2: eceran_awal += int(m2.group(1))
-                    
-                    rekap_lot.append({
-                        'Produk': nama_prod, 'Part Number': part_num, 'Lot Number': l,
-                        'Awal Utuh': int(jml_utuh_awal), 'Awal Dus': int(pecahan_awal), 'Awal Pcs': int(eceran_awal),
-                        'Sisa Utuh Baru': int(jml_utuh_awal), 'Sisa Dus Baru': int(pecahan_awal), 'Sisa Pcs Baru': int(eceran_awal),
-                        'Catatan Outbound': ""
-                    })
-                
-                df_rekap = pd.DataFrame(rekap_lot)
-                st.markdown(f"**2. Edit Sisa Fisik Rak {k_pilih}-{b_pilih}**")
-                
-                config_kolom = {
-                    'Produk': st.column_config.TextColumn("Produk", disabled=True),
-                    'Part Number': st.column_config.TextColumn("Part", disabled=True),
-                    'Lot Number': st.column_config.TextColumn("Lot", disabled=True),
-                    'Awal Utuh': st.column_config.NumberColumn("Sistem Utuh", disabled=True),
-                    'Awal Dus': st.column_config.NumberColumn("Sistem Dus", disabled=True),
-                    'Awal Pcs': st.column_config.NumberColumn("Sistem Pcs", disabled=True),
-                    'Sisa Utuh Baru': st.column_config.NumberColumn("SISA UTUH BARU", min_value=0, required=True),
-                    'Sisa Dus Baru': st.column_config.NumberColumn("SISA DUS BARU", min_value=0, required=True),
-                    'Sisa Pcs Baru': st.column_config.NumberColumn("SISA PCS BARU", min_value=0, required=True),
-                    'Catatan Outbound': st.column_config.TextColumn("Catatan", max_chars=100)
-                }
-                
-                edited_df = st.data_editor(df_rekap, column_config=config_kolom, hide_index=True, use_container_width=True, num_rows="fixed")
-                
-                if st.button("🚜 Simpan Penyesuaian Massal (OUTBOUND)", type="primary", use_container_width=True):
-                    has_changes = False
-                    error_msg = ""
-                    new_all_out_data = []
-                    
-                    data_rak_ini = [d for d in all_out_data if float(d.get('Baris', 0) or 0) == float(b_pilih)]
-                    data_rak_lain = [d for d in all_out_data if float(d.get('Baris', 0) or 0) != float(b_pilih)]
-                    
-                    for index, row in edited_df.iterrows():
-                        l = str(row['Lot Number'])
-                        sisa_utuh = int(row['Sisa Utuh Baru'])
-                        sisa_dus = int(row['Sisa Dus Baru'])
-                        sisa_pcs = int(row['Sisa Pcs Baru'])
-                        catatan_out = str(row['Catatan Outbound'])
-                        
-                        awal_utuh = int(row['Awal Utuh'])
-                        awal_dus = int(row['Awal Dus'])
-                        awal_pcs = int(row['Awal Pcs'])
-                        
-                        if sisa_utuh != awal_utuh or sisa_dus != awal_dus or sisa_pcs != awal_pcs or catatan_out != "":
-                            has_changes = True
-                            df_lot = pd.DataFrame([d for d in data_rak_ini if str(d.get('Lot Number', '')) == l])
-                            if not df_lot.empty:
-                                df_lot['Pallet Ke'] = pd.to_numeric(df_lot['Pallet Ke'])
-                                df_lot = df_lot.sort_values('Pallet Ke', ascending=False)
-                                
-                                slot_tambahan = 1 if (sisa_dus > 0 or sisa_pcs > 0) else 0
-                                total_slot_dibutuhkan = sisa_utuh + slot_tambahan
-                                
-                                if total_slot_dibutuhkan > len(df_lot):
-                                    error_msg = f"❌ Sisa akhir Lot {l} melebihi kapasitas awal."
-                                    break
-                                
-                                out_qty = len(df_lot) - total_slot_dibutuhkan
-                                pallets_to_remove = df_lot['Pallet Ke'].head(out_qty).tolist() if out_qty > 0 else []
-                                
-                                updated_rak_ini = []
-                                for d in data_rak_ini:
-                                    p_val = pd.to_numeric(d.get('Pallet Ke', 0))
-                                    if str(d.get('Lot Number', '')) == l:
-                                        if p_val in pallets_to_remove: continue 
-                                        d['Catatan'] = catatan_out
-                                        sisa_pallets = df_lot[~df_lot['Pallet Ke'].isin(pallets_to_remove)]
-                                        
-                                        if not sisa_pallets.empty and p_val == sisa_pallets['Pallet Ke'].max():
-                                            if sisa_dus > 0 or sisa_pcs > 0:
-                                                kp = []
-                                                if sisa_dus > 0: kp.append(f"Pecahan: {sisa_dus} qty")
-                                                if sisa_pcs > 0: kp.append(f"Eceran: {sisa_pcs} pcs")
-                                                d['Keterangan'] = " | ".join(kp)
-                                            else: d['Keterangan'] = ""
-                                        else:
-                                            if 'Pecahan' in str(d.get('Keterangan', '')) or 'Eceran' in str(d.get('Keterangan', '')): 
-                                                d['Keterangan'] = ""
-                                    updated_rak_ini.append(d)
-                                data_rak_ini = updated_rak_ini
-                                
-                                keluar_utuh = awal_utuh - sisa_utuh
-                                keluar_pecahan = awal_dus - sisa_dus
-                                keluar_eceran = awal_pcs - sisa_pcs
-                                catat_log_mutasi("OUTBOUND (Massal)", k_pilih, b_pilih, str(row['Produk']), str(row['Part Number']), l, keluar_utuh, keluar_pecahan, keluar_eceran, catatan_out)
+                    if sisa_utuh != awal_utuh or sisa_dus != awal_dus or sisa_pcs != awal_pcs or catatan_out != "":
+                        has_changes = True
+                        df_lot = pd.DataFrame([d for d in data_rak_ini if str(d.get('Lot Number', '')) == l])
+                        if not df_lot.empty:
+                            df_lot['Pallet Ke'] = pd.to_numeric(df_lot['Pallet Ke'])
+                            df_lot = df_lot.sort_values('Pallet Ke', ascending=False)
+                            
+                            slot_tambahan = 1 if (sisa_dus > 0 or sisa_pcs > 0) else 0
+                            total_slot_dibutuhkan = sisa_utuh + slot_tambahan
+                            
+                            if total_slot_dibutuhkan > len(df_lot):
+                                error_msg = f"❌ Sisa akhir Lot {l} melebihi kapasitas awal."
+                                break
+                            
+                            out_qty = len(df_lot) - total_slot_dibutuhkan
+                            pallets_to_remove = df_lot['Pallet Ke'].head(out_qty).tolist() if out_qty > 0 else []
+                            
+                            updated_rak_ini = []
+                            for d in data_rak_ini:
+                                p_val = pd.to_numeric(d.get('Pallet Ke', 0))
+                                if str(d.get('Lot Number', '')) == l:
+                                    if p_val in pallets_to_remove: continue 
+                                    d['Catatan'] = catatan_out
+                                    sisa_pallets = df_lot[~df_lot['Pallet Ke'].isin(pallets_to_remove)]
+                                    
+                                    if not sisa_pallets.empty and p_val == sisa_pallets['Pallet Ke'].max():
+                                        if sisa_dus > 0 or sisa_pcs > 0:
+                                            kp = []
+                                            if sisa_dus > 0: kp.append(f"Pecahan: {sisa_dus} qty")
+                                            if sisa_pcs > 0: kp.append(f"Eceran: {sisa_pcs} pcs")
+                                            d['Keterangan'] = " | ".join(kp)
+                                        else: d['Keterangan'] = ""
+                                    else:
+                                        if 'Pecahan' in str(d.get('Keterangan', '')) or 'Eceran' in str(d.get('Keterangan', '')): 
+                                            d['Keterangan'] = ""
+                                updated_rak_ini.append(d)
+                            data_rak_ini = updated_rak_ini
+                            
+                            keluar_utuh = awal_utuh - sisa_utuh
+                            keluar_pecahan = awal_dus - sisa_dus
+                            keluar_eceran = awal_pcs - sisa_pcs
+                            catat_log_mutasi("OUTBOUND (Massal)", k_pilih, b_pilih, str(row['Produk']), str(row['Part Number']), l, keluar_utuh, keluar_pecahan, keluar_eceran, catatan_out)
 
-                    if error_msg: st.error(error_msg)
-                    elif has_changes:
-                        data_rak_ini = sorted([d for d in data_rak_ini if float(d.get('Baris', 0) or 0) == float(b_pilih)], key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
-                        for i, d in enumerate(data_rak_ini, 1): d['Pallet Ke'] = float(i)
-                        
-                        doc_ref_out.set({'data': data_rak_lain + data_rak_ini})
-                        
-                        st.session_state.update({
-                            'undo_dict': {k_pilih: all_out_data},
-                            'action_msg': f"Penyesuaian Outbound Massal di Rak {k_pilih}-{b_pilih}",
-                            'action_status': 'DONE'
-                        })
-                        st.rerun()
-                    else: st.info("Tidak ada perubahan angka pada tabel. Outbound dibatalkan.")
-            else: st.info("Rak Kosong.")
+                if error_msg: st.error(error_msg)
+                elif has_changes:
+                    data_rak_ini = sorted([d for d in data_rak_ini if float(d.get('Baris', 0) or 0) == float(b_pilih)], key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
+                    for i, d in enumerate(data_rak_ini, 1): d['Pallet Ke'] = float(i)
+                    
+                    doc_ref_out.set({'data': data_rak_lain + data_rak_ini})
+                    
+                    st.session_state.update({
+                        'undo_dict': {k_pilih: all_out_data},
+                        'action_msg': f"Penyesuaian Outbound Massal di Rak {k_pilih}-{b_pilih}",
+                        'action_status': 'DONE'
+                    })
+                    st.rerun()
+                else: st.info("Tidak ada perubahan angka pada tabel. Outbound dibatalkan.")
+        else: st.info("Rak Kosong.")
 
 # ----------------------------------------------------------
 # TAB 3: AUDIT STOK & BACKUP
@@ -492,8 +495,7 @@ with tab3:
                 batch.commit()
                 st.session_state['last_reindex'] = (datetime.utcnow() + timedelta(hours=7)).strftime("%d-%m-%Y %H:%M:%S")
                 st.balloons()
-                st.success(f"✅ Re-Indexing Selesai! {total_koreksi} Kolom diperbarui.")
-                time.sleep(2)
+                st.session_state.update({'action_msg': f"Re-Indexing Selesai! {total_koreksi} Kolom diperbarui.", 'action_status': 'DONE_NO_UNDO'})
                 st.rerun()
             except Exception as e: st.error(f"Gagal Re-Indexing: {e}")
 
@@ -591,11 +593,56 @@ with tab4:
             except Exception as e: st.error(f"Gagal memuat log mutasi: {e}")
 
 # ----------------------------------------------------------
-# TAB 5: SYNC CSV
+# TAB 5: SYNC CSV (RESTORE)
 # ----------------------------------------------------------
 with tab5:
-    st.header("🚀 Sinkronisasi CSV / Master")
-    st.info("Fitur Upload Master/Sinkronisasi awal sistem. (Masih dalam tahap pengembangan).")
+    st.header("🚀 Restore Data Database dari CSV")
+    st.warning("⚠️ **PERINGATAN:** Fitur ini berfungsi sebagai *Disaster Recovery*. Jika dieksekusi, sistem akan **MENGHAPUS SELURUH ISI RAK** dan menimpanya dengan isi dari file CSV yang diunggah. Pastikan format CSV sesuai dengan output dari 'Tarik Laporan Audit'.")
+    
+    uploaded_file = st.file_uploader("Upload File Backup CSV (.csv)", type=['csv'])
+    if uploaded_file is not None:
+        if st.button("🚨 SAYA YAKIN, HAPUS DATABASE & TIMPA DENGAN CSV INI", type="primary", use_container_width=True):
+            with st.spinner("Membaca CSV dan menimpa database..."):
+                try:
+                    try: df_sync = pd.read_csv(uploaded_file, sep=";")
+                    except: df_sync = pd.read_csv(uploaded_file, sep=",")
+                    
+                    req_cols = ['Kolom', 'Baris', 'Pallet Ke', 'Part Number', 'Lot Number', 'Nama Produk']
+                    if not all(col in df_sync.columns for col in req_cols):
+                        st.error("❌ Format CSV tidak valid! Kolom wajib tidak ditemukan.")
+                    else:
+                        batch = db.batch()
+                        # Timpa Kolom A sampai G agar bersih
+                        for kol in ["A", "B", "C", "D", "E", "F", "G"]:
+                            df_kol = df_sync[df_sync['Kolom'] == kol]
+                            new_data = []
+                            if not df_kol.empty:
+                                df_kol = df_kol.sort_values(by=['Baris', 'Pallet Ke'])
+                                for _, row in df_kol.iterrows():
+                                    if pd.isna(row['Part Number']) or str(row['Part Number']).strip() == "":
+                                        continue
+                                    record = {
+                                        'Kolom': kol, 'Baris': float(row['Baris']), 'Pallet Ke': float(row['Pallet Ke']),
+                                        'Part Number': str(row['Part Number']).strip(), 'Lot Number': str(row['Lot Number']).strip(),
+                                        'Nama Produk': str(row['Nama Produk']).strip(),
+                                        'Keterangan': str(row.get('Keterangan', '')).strip(),
+                                        'Catatan': str(row.get('Catatan', '')).strip(),
+                                        'Status': 'Terisi'
+                                    }
+                                    if record['Keterangan'] == 'nan': record['Keterangan'] = ""
+                                    if record['Catatan'] == 'nan': record['Catatan'] = ""
+                                    new_data.append(record)
+                            
+                            doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{kol}")
+                            batch.set(doc_ref, {'data': new_data})
+                        
+                        batch.commit()
+                        catat_log_mutasi("RESTORE CSV", "ALL", "ALL", "Sistem Database", "-", "-", 0, 0, 0, "Hard Reset via CSV Upload")
+                        
+                        st.session_state.update({'action_msg': "Database berhasil di-restore dari file CSV!", 'action_status': 'DONE_NO_UNDO'})
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Terjadi kesalahan saat memproses CSV: {e}")
 
 # ----------------------------------------------------------
 # TAB 6: PENJADWALAN KIRIM (BOOKING)
@@ -734,11 +781,9 @@ with tab7:
                     st.error("Rak asal dan tujuan tidak boleh sama!")
                 else:
                     with st.spinner("Memindahkan fisik dan re-indexing..."):
-                        # Tangkap state rak tujuan SEBELUM diubah untuk fitur UNDO
                         doc_tuj = db.collection(NAMA_DATABASE).document(f"Kolom_{r_tuj_k}").get()
                         data_tuj = doc_tuj.to_dict().get('data', []) if doc_tuj.exists else []
                         
-                        # Setel dictionary Undo (1 rak jika sama, 2 rak jika pindah kolom)
                         undo_dict_setup = {r_asal_k: st.session_state['relok_doc_asal']}
                         if r_asal_k != r_tuj_k: 
                             undo_dict_setup[r_tuj_k] = copy.deepcopy(data_tuj)
