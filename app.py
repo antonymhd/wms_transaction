@@ -37,21 +37,6 @@ if not st.session_state['logged_in']:
 st.sidebar.button("🚪 Logout", on_click=lambda: st.session_state.update({'logged_in': False}))
 
 # ==========================================================
-# GLOBAL TOAST NOTIFICATION HANDLER (BUBBLE DARI BAWAH)
-# ==========================================================
-# Ini akan menangkap pesan sukses dari aksi sebelumnya dan menampilkannya sebagai Bubble
-if 'toast_msg' not in st.session_state:
-    st.session_state['toast_msg'] = None
-if 'toast_icon' not in st.session_state:
-    st.session_state['toast_icon'] = "✅"
-
-if st.session_state['toast_msg']:
-    st.toast(st.session_state['toast_msg'], icon=st.session_state['toast_icon'])
-    # Reset setelah ditampilkan
-    st.session_state['toast_msg'] = None 
-    st.session_state['toast_icon'] = "✅"
-
-# ==========================================================
 # 2. INIT DATABASE (FIREBASE)
 # ==========================================================
 NAMA_DATABASE = 'uji_coba_rak'
@@ -95,25 +80,41 @@ def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh,
     except Exception as e: st.toast(f"⚠️ Peringatan: Gagal mencatat log mutasi ({e})", icon="⚠️")
 
 # ==========================================================
-# 4. FITUR UNDO & REDO
+# 4. NOTIFIKASI RAKSASA & FITUR UNDO (MULTI-KOLOM SUPPORT)
 # ==========================================================
-if 'undo_data' not in st.session_state:
-    st.session_state.update({'undo_data': None, 'redo_data': None, 'action_msg': "", 'action_kolom': "", 'action_status': None})
+if 'undo_dict' not in st.session_state:
+    # undo_dict menyimpan format: {'A': data_awal_A, 'C': data_awal_C}
+    st.session_state.update({'undo_dict': {}, 'action_msg': "", 'action_status': None})
 
 if st.session_state['action_status'] == 'DONE':
-    st.info(f"🔄 **Aksi Terakhir:** {st.session_state['action_msg']}")
-    if st.button("🔙 BATALKAN AKSI TERAKHIR (UNDO)", type="primary"):
-        with st.spinner("Mengembalikan data seperti semula..."):
-            doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{st.session_state['action_kolom']}")
-            doc_ref.set({'data': st.session_state['undo_data']})
-            st.session_state['action_status'] = 'UNDONE'
-            catat_log_mutasi("PEMBATALAN (UNDO)", st.session_state['action_kolom'], "ALL", "Koreksi Sistem", "-", "-", 0, 0, 0, f"Membatalkan aksi: {st.session_state['action_msg']}")
-            
-            # TRIGGER TOAST BUBBLE
-            st.session_state['toast_msg'] = "Aksi dibatalkan (Undo)! Data kembali seperti semula."
-            st.session_state['toast_icon'] = "⏪"
-            st.rerun() # Langsung rerun tanpa time.sleep
-if st.session_state['action_status'] is not None: st.divider()
+    st.success(f"### 🎉 SUKSES MENGUBAH DATA!\n**{st.session_state['action_msg']}**", icon="✅")
+    
+    col_undo1, col_undo2 = st.columns([3, 1])
+    with col_undo1:
+        st.info("💡 **Aman!** Pesan ini tidak akan hilang sampai Anda melakukan input berikutnya. Silakan tinggalkan layar jika perlu mengecek fisik barang.")
+    with col_undo2:
+        if st.button("🔙 BATALKAN AKSI (UNDO)", type="primary", use_container_width=True):
+            with st.spinner("Mengembalikan data seperti semula..."):
+                batch_undo = db.batch()
+                kolom_terdampak = []
+                for kol, dat in st.session_state['undo_dict'].items():
+                    doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{kol}")
+                    batch_undo.set(doc_ref, {'data': dat})
+                    kolom_terdampak.append(kol)
+                batch_undo.commit()
+                
+                st.session_state['action_status'] = 'UNDONE'
+                catat_log_mutasi("PEMBATALAN (UNDO)", ",".join(kolom_terdampak), "ALL", "Koreksi Sistem", "-", "-", 0, 0, 0, f"Membatalkan aksi: {st.session_state['action_msg']}")
+                st.rerun()
+
+elif st.session_state['action_status'] == 'UNDONE':
+    st.warning("### ⏪ PEMBATALAN BERHASIL\nAksi terakhir telah dibatalkan. Sistem dan database kembali seperti semula sebelum dieksekusi.", icon="⚠️")
+    if st.button("Tutup Pesan Ini"):
+        st.session_state['action_status'] = None
+        st.rerun()
+
+if st.session_state['action_status'] is not None: 
+    st.divider()
 
 # ==========================================================
 # 5. TABS MENU UTAMA
@@ -185,7 +186,7 @@ with tab1:
             with col_qty2: in_pecahan = st.number_input("Sisa Pecahan (Dus/Sak)", min_value=0, step=1, value=0)
             with col_qty3: in_eceran = st.number_input("Eceran (Pcs)", min_value=0, step=1, value=0)
             
-            in_dari_depan = st.checkbox("📥 Masukkan dari DEPAN Rak (Geser/Dorong pallet lama ke belakang)")
+            in_dari_depan = st.checkbox("📥 Masukkan dari DEPAN Rak (Push-back)")
                 
             if st.button("🚀 Simpan Inbound", type="primary", use_container_width=True):
                 in_part_clean = in_part.strip().upper() if in_part else ""
@@ -219,7 +220,7 @@ with tab1:
                         
                         new_records = []
                         
-                        # --- LOGIKA RE-INDEXING JIKA DARI DEPAN ---
+                        # LOGIKA RE-INDEXING DARI DEPAN
                         if in_dari_depan and baris_data_actual:
                             for d in all_data:
                                 if float(d.get('Baris', 0) or 0) == float(b_pilih):
@@ -230,7 +231,6 @@ with tab1:
                             filled_pallets = [int(float(d.get('Pallet Ke', 0) or 0)) for d in baris_data_actual if pd.notna(d.get('Pallet Ke'))]
                             next_pallet = max(filled_pallets) + 1 if filled_pallets else 1
                             
-                        # Buat Pallet Utuh
                         for _ in range(int(in_qty)):
                             while not in_dari_depan and next_pallet in filled_pallets: next_pallet += 1
                             is_bayangan = next_pallet > max_slot_actual
@@ -242,7 +242,6 @@ with tab1:
                             filled_pallets.append(next_pallet)
                             next_pallet += 1
                             
-                        # Buat/Update Pecahan
                         if in_pecahan > 0 or in_eceran > 0:
                             if existing_fraction_row and not in_dari_depan:
                                 ket_str = str(existing_fraction_row.get('Keterangan', '')).lower()
@@ -272,13 +271,15 @@ with tab1:
                                 })
                                 
                         all_data.extend(new_records)
-                        st.session_state.update({'undo_data': all_data_raw, 'redo_data': copy.deepcopy(all_data), 'action_kolom': k_pilih, 'action_msg': f"Inbound {total_inbound_slots} Slot '{in_produk_clean}' ke Rak {k_pilih}-{b_pilih} ({'Dari Depan' if in_dari_depan else 'Dari Belakang'})", 'action_status': 'DONE'})
+                        
+                        # SET BANNER NOTIFIKASI
+                        st.session_state.update({
+                            'undo_dict': {k_pilih: all_data_raw}, 
+                            'action_msg': f"Inbound {total_inbound_slots} Slot '{in_produk_clean}' ke Rak {k_pilih}-{b_pilih} {'(Push-back)' if in_dari_depan else ''}", 
+                            'action_status': 'DONE'
+                        })
                         doc_ref_in.set({'data': all_data})
                         catat_log_mutasi("INBOUND", k_pilih, b_pilih, in_produk_clean, in_part_clean, in_lot_final, in_qty, in_pecahan, in_eceran)
-                        
-                        # TRIGGER TOAST BUBBLE
-                        st.session_state['toast_msg'] = f"Inbound berhasil! {'Re-indexing otomatis.' if in_dari_depan else ''}"
-                        st.session_state['toast_icon'] = "📥"
                         st.rerun()
 
 # ----------------------------------------------------------
@@ -286,7 +287,7 @@ with tab1:
 # ----------------------------------------------------------
 with tab2:
     st.header("Penyesuaian Sisa Stok (Outbound Multi-Lot)")
-    st.caption("Ubah angka sisa fisik pada tabel di bawah, lalu klik Simpan untuk mengeksekusi banyak Lot sekaligus.")
+    st.caption("Ubah angka sisa fisik pada tabel, lalu klik Simpan untuk eksekusi banyak Lot sekaligus.")
     
     if 'out_lokasi_dicari' not in st.session_state: 
         st.session_state.update({'out_lokasi_dicari': False, 'out_k_pilih': "A", 'out_b_pilih': 1})
@@ -333,20 +334,13 @@ with tab2:
                         if m2: eceran_awal += int(m2.group(1))
                     
                     rekap_lot.append({
-                        'Produk': nama_prod,
-                        'Part Number': part_num,
-                        'Lot Number': l,
-                        'Awal Utuh': int(jml_utuh_awal),
-                        'Awal Dus': int(pecahan_awal),
-                        'Awal Pcs': int(eceran_awal),
-                        'Sisa Utuh Baru': int(jml_utuh_awal),
-                        'Sisa Dus Baru': int(pecahan_awal),
-                        'Sisa Pcs Baru': int(eceran_awal),
+                        'Produk': nama_prod, 'Part Number': part_num, 'Lot Number': l,
+                        'Awal Utuh': int(jml_utuh_awal), 'Awal Dus': int(pecahan_awal), 'Awal Pcs': int(eceran_awal),
+                        'Sisa Utuh Baru': int(jml_utuh_awal), 'Sisa Dus Baru': int(pecahan_awal), 'Sisa Pcs Baru': int(eceran_awal),
                         'Catatan Outbound': ""
                     })
                 
                 df_rekap = pd.DataFrame(rekap_lot)
-                
                 st.markdown(f"**2. Edit Sisa Fisik Rak {k_pilih}-{b_pilih}**")
                 
                 config_kolom = {
@@ -362,13 +356,7 @@ with tab2:
                     'Catatan Outbound': st.column_config.TextColumn("Catatan", max_chars=100)
                 }
                 
-                edited_df = st.data_editor(
-                    df_rekap,
-                    column_config=config_kolom,
-                    hide_index=True,
-                    use_container_width=True,
-                    num_rows="fixed"
-                )
+                edited_df = st.data_editor(df_rekap, column_config=config_kolom, hide_index=True, use_container_width=True, num_rows="fixed")
                 
                 if st.button("🚜 Simpan Penyesuaian Massal (OUTBOUND)", type="primary", use_container_width=True):
                     has_changes = False
@@ -391,7 +379,6 @@ with tab2:
                         
                         if sisa_utuh != awal_utuh or sisa_dus != awal_dus or sisa_pcs != awal_pcs or catatan_out != "":
                             has_changes = True
-                            
                             df_lot = pd.DataFrame([d for d in data_rak_ini if str(d.get('Lot Number', '')) == l])
                             if not df_lot.empty:
                                 df_lot['Pallet Ke'] = pd.to_numeric(df_lot['Pallet Ke'])
@@ -421,12 +408,10 @@ with tab2:
                                                 if sisa_dus > 0: kp.append(f"Pecahan: {sisa_dus} qty")
                                                 if sisa_pcs > 0: kp.append(f"Eceran: {sisa_pcs} pcs")
                                                 d['Keterangan'] = " | ".join(kp)
-                                            else:
-                                                d['Keterangan'] = ""
+                                            else: d['Keterangan'] = ""
                                         else:
                                             if 'Pecahan' in str(d.get('Keterangan', '')) or 'Eceran' in str(d.get('Keterangan', '')): 
                                                 d['Keterangan'] = ""
-                                                
                                     updated_rak_ini.append(d)
                                 data_rak_ini = updated_rak_ini
                                 
@@ -441,11 +426,12 @@ with tab2:
                         for i, d in enumerate(data_rak_ini, 1): d['Pallet Ke'] = float(i)
                         
                         doc_ref_out.set({'data': data_rak_lain + data_rak_ini})
-                        st.session_state.update({'undo_data': all_out_data, 'action_kolom': k_pilih, 'action_msg': f"Outbound Massal di {k_pilih}-{b_pilih}", 'action_status': 'DONE'})
                         
-                        # TRIGGER TOAST BUBBLE
-                        st.session_state['toast_msg'] = "Penyesuaian Outbound Massal berhasil & Re-indexed."
-                        st.session_state['toast_icon'] = "🚜"
+                        st.session_state.update({
+                            'undo_dict': {k_pilih: all_out_data},
+                            'action_msg': f"Penyesuaian Outbound Massal di Rak {k_pilih}-{b_pilih}",
+                            'action_status': 'DONE'
+                        })
                         st.rerun()
                     else: st.info("Tidak ada perubahan angka pada tabel. Outbound dibatalkan.")
             else: st.info("Rak Kosong.")
@@ -505,12 +491,9 @@ with tab3:
                 
                 batch.commit()
                 st.session_state['last_reindex'] = (datetime.utcnow() + timedelta(hours=7)).strftime("%d-%m-%Y %H:%M:%S")
-                
-                # BUBBLE & BALLOONS!
                 st.balloons()
-                st.session_state['toast_msg'] = f"Re-Indexing Selesai! {total_koreksi} Kolom diperbarui."
-                st.session_state['toast_icon'] = "✨"
-                time.sleep(1) # Jeda sebentar agar balon terlihat sblm rerun
+                st.success(f"✅ Re-Indexing Selesai! {total_koreksi} Kolom diperbarui.")
+                time.sleep(2)
                 st.rerun()
             except Exception as e: st.error(f"Gagal Re-Indexing: {e}")
 
@@ -615,7 +598,7 @@ with tab5:
     st.info("Fitur Upload Master/Sinkronisasi awal sistem. (Masih dalam tahap pengembangan).")
 
 # ----------------------------------------------------------
-# TAB 6: PENJADWALAN KIRIM
+# TAB 6: PENJADWALAN KIRIM (BOOKING)
 # ----------------------------------------------------------
 with tab6:
     st.header("📅 Penjadwalan Pengiriman (Booking Pallet)")
@@ -659,7 +642,6 @@ with tab6:
                     qty_tersedia = len(df_belum_book)
                     
                     st.markdown(f"**📦 Tersedia untuk di-Booking: `{qty_tersedia}` Slot Fisik**")
-                    
                     kolom_tersedia = [c for c in ['Pallet Ke', 'Part Number', 'Lot Number', 'Catatan'] if c in df_lot.columns]
                     st.dataframe(df_lot[kolom_tersedia], hide_index=True, height=150)
                     
@@ -682,11 +664,11 @@ with tab6:
                                         new_all_book_data.append(d)
                                         
                                     doc_ref_book.set({'data': new_all_book_data})
-                                    st.session_state.update({'undo_data': all_book_data, 'action_kolom': k_pilih, 'action_msg': f"Booking {book_qty} Pallet Lot '{pilih_lot}' untuk '{book_do}'", 'action_status': 'DONE'})
-                                    
-                                    # TRIGGER TOAST BUBBLE
-                                    st.session_state['toast_msg'] = f"Berhasil! {book_qty} pallet dikunci untuk pengiriman."
-                                    st.session_state['toast_icon'] = "🔒"
+                                    st.session_state.update({
+                                        'undo_dict': {k_pilih: all_book_data}, 
+                                        'action_msg': f"Booking {book_qty} Pallet Lot '{pilih_lot}' untuk '{book_do}'", 
+                                        'action_status': 'DONE'
+                                    })
                                     st.rerun()
                     else: st.warning("⚠️ Semua pallet pada Lot ini sudah ter-booking.")
             else: st.info("Rak Kosong.")
@@ -735,7 +717,6 @@ with tab7:
             mapping_lot_relokasi[label_dropdown] = (nama_produk, lot_asli)
             
         st.divider()
-        
         pilihan_label_relokasi = st.selectbox("Pilih Produk & Lot yang akan dipindah:", tersedia_lot_relokasi)
         nama_pilih, lot_pilih = mapping_lot_relokasi[pilihan_label_relokasi]
         
@@ -753,6 +734,15 @@ with tab7:
                     st.error("Rak asal dan tujuan tidak boleh sama!")
                 else:
                     with st.spinner("Memindahkan fisik dan re-indexing..."):
+                        # Tangkap state rak tujuan SEBELUM diubah untuk fitur UNDO
+                        doc_tuj = db.collection(NAMA_DATABASE).document(f"Kolom_{r_tuj_k}").get()
+                        data_tuj = doc_tuj.to_dict().get('data', []) if doc_tuj.exists else []
+                        
+                        # Setel dictionary Undo (1 rak jika sama, 2 rak jika pindah kolom)
+                        undo_dict_setup = {r_asal_k: st.session_state['relok_doc_asal']}
+                        if r_asal_k != r_tuj_k: 
+                            undo_dict_setup[r_tuj_k] = copy.deepcopy(data_tuj)
+                        
                         df_lot_target = df_lot_target_all.sort_values('Pallet Ke', ascending=False)
                         pallets_dipindah = df_lot_target['Pallet Ke'].head(qty_pindah).tolist()
                         
@@ -764,8 +754,6 @@ with tab7:
                         for i, d in enumerate(baris_asal_sisa, 1): d['Pallet Ke'] = float(i)
                         final_data_asal = lain_asal + baris_asal_sisa
                         
-                        doc_tuj = db.collection(NAMA_DATABASE).document(f"Kolom_{r_tuj_k}").get()
-                        data_tuj = doc_tuj.to_dict().get('data', []) if doc_tuj.exists else []
                         for d in data_pindah: d['Baris'] = float(r_tuj_b)
                         
                         if is_masuk_depan:
@@ -790,7 +778,9 @@ with tab7:
                         catat_log_mutasi("RELOKASI", f"{r_asal_k} ke {r_tuj_k}", f"{r_asal_b} ke {r_tuj_b}", str(data_pindah[0].get('Nama Produk', 'Pindah Rak')), str(data_pindah[0].get('Part Number', '-')), lot_pilih, qty_pindah, 0, 0)
                         del st.session_state['relok_data_asal']
                         
-                        # TRIGGER TOAST BUBBLE
-                        st.session_state['toast_msg'] = f"Berhasil memindahkan {qty_pindah} slot ke {r_tuj_k}-{r_tuj_b}"
-                        st.session_state['toast_icon'] = "🚚"
+                        st.session_state.update({
+                            'undo_dict': undo_dict_setup,
+                            'action_msg': f"Pindah {qty_pindah} Slot '{nama_pilih}' dari {r_asal_k}-{r_asal_b} ke {r_tuj_k}-{r_tuj_b}",
+                            'action_status': 'DONE'
+                        })
                         st.rerun()
