@@ -86,7 +86,6 @@ if 'undo_dict' not in st.session_state:
     st.session_state.update({'undo_dict': {}, 'action_msg': "", 'action_status': None})
 
 if st.session_state['action_status'] == 'DONE':
-    # Desain notifikasi 1-Baris Tipis
     notif_c1, notif_c2 = st.columns([4, 1])
     notif_c1.success(f"✅ **Sukses:** {st.session_state['action_msg']}")
     if notif_c2.button("🔙 UNDO AKSI INI", type="primary", use_container_width=True):
@@ -104,7 +103,6 @@ if st.session_state['action_status'] == 'DONE':
             st.rerun()
 
 elif st.session_state['action_status'] == 'DONE_NO_UNDO':
-    # Notifikasi tanpa tombol undo (untuk fitur restore CSV)
     st.success(f"✅ **Sukses:** {st.session_state['action_msg']}")
     if st.button("Tutup Pesan Ini"):
         st.session_state['action_status'] = None
@@ -136,8 +134,10 @@ with tab1:
     col_in1, col_in2 = st.columns([1, 2])
     with col_in1:
         st.markdown("**1. Pilih Lokasi Rak Tujuan**")
-        in_kolom = st.selectbox("Lokasi Kolom", ["A", "B", "C", "D", "E", "F", "G"], key="in_kolom")
+        in_kolom_label = st.selectbox("Lokasi Kolom", ["A", "B", "C", "D", "E", "F", "G", "S (Staging)"], key="in_kolom")
+        in_kolom = in_kolom_label.split(" ")[0] # Ekstrak A-G atau S
         in_baris = st.number_input("Nomor Baris (Inbound)", min_value=1, max_value=28, value=1)
+        
         if st.button("🔍 Cek Status Rak", use_container_width=True):
             st.session_state.update({'in_lokasi_dicari': True, 'in_k_pilih': in_kolom, 'in_b_pilih': in_baris})
             
@@ -150,7 +150,10 @@ with tab1:
             
             baris_data_preview = [d for d in all_data_raw if float(d.get('Baris', 0) or 0) == float(b_pilih) and str(d.get('Part Number', '')).strip() != '']
             is_all_box_existing = all(str(d.get('Part Number', '')).strip().upper().endswith(('D', 'G')) for d in baris_data_preview) if baris_data_preview else False
-            max_slot_display = 32 if (is_all_box_existing and b_pilih <= 16) else (46 if is_all_box_existing else (31 if b_pilih <= 16 else 44))
+            
+            # Kapasitas tak terbatas (999) untuk area Staging
+            max_slot_display = 999 if k_pilih == 'S' else (32 if (is_all_box_existing and b_pilih <= 16) else (46 if is_all_box_existing else (31 if b_pilih <= 16 else 44)))
+            
             current_qty = len(baris_data_preview)
             sisa_ruang = max_slot_display - current_qty
             
@@ -213,7 +216,8 @@ with tab1:
                                 ket = str(d.get('Keterangan', ''))
                                 if 'Pecahan' in ket or 'Eceran' in ket: existing_fraction_row = d
                                     
-                        max_slot_actual = 32 if (is_all_box_actual and b_pilih <= 16) else (46 if is_all_box_actual else (31 if b_pilih <= 16 else 44))
+                        # Pengecualian Batas Slot untuk Staging Area
+                        max_slot_actual = 999 if k_pilih == 'S' else (32 if (is_all_box_actual and b_pilih <= 16) else (46 if is_all_box_actual else (31 if b_pilih <= 16 else 44)))
                         
                         slot_tambahan_in = 0
                         if (in_pecahan > 0 or in_eceran > 0) and not existing_fraction_row: slot_tambahan_in = 1
@@ -282,7 +286,7 @@ with tab1:
                         st.rerun()
 
 # ----------------------------------------------------------
-# TAB 2: OUTBOUND MULTI-LOT (Refaktor Layout Atas-Bawah)
+# TAB 2: OUTBOUND MULTI-LOT
 # ----------------------------------------------------------
 with tab2:
     st.header("Penyesuaian Sisa Stok (Outbound Multi-Lot)")
@@ -293,10 +297,13 @@ with tab2:
 
     st.markdown("**1. Pilih Lokasi Rak**")
     c1, c2, c3 = st.columns([1, 1, 2])
-    with c1: out_kolom = st.selectbox("Lokasi Kolom", ["A", "B", "C", "D", "E", "F", "G"], key="out_kolom_2")
-    with c2: out_baris = st.number_input("Nomor Baris", min_value=1, max_value=28, value=1, key="out_baris_2")
+    with c1: 
+        out_kolom_label = st.selectbox("Lokasi Kolom", ["A", "B", "C", "D", "E", "F", "G", "S (Staging)"], key="out_kolom_2")
+        out_kolom = out_kolom_label.split(" ")[0]
+    with c2: 
+        out_baris = st.number_input("Nomor Baris", min_value=1, max_value=28, value=1, key="out_baris_2")
     with c3:
-        st.write("") # Spacer agar tombol sejajar dengan input
+        st.write("") 
         st.write("")
         if st.button("🔍 Cari Data Rak", use_container_width=True): 
             st.session_state.update({'out_lokasi_dicari': True, 'out_k_pilih': out_kolom, 'out_b_pilih': out_baris})
@@ -358,7 +365,6 @@ with tab2:
                 'Catatan Outbound': st.column_config.TextColumn("Catatan", max_chars=100)
             }
             
-            # Editor diletakkan di bawah (Full Width)
             edited_df = st.data_editor(df_rekap, column_config=config_kolom, hide_index=True, use_container_width=True, num_rows="fixed")
             
             if st.button("🚜 Simpan Penyesuaian Massal (OUTBOUND)", type="primary", use_container_width=True):
@@ -476,7 +482,8 @@ with tab3:
                         if not valid_group.empty:
                             is_all_box = bool(valid_group['Part Number'].astype(str).str.upper().str.endswith(('D', 'G')).all())
                             
-                        max_slot_actual = int(32 if baris <= 16 else 46) if is_all_box else int(31 if baris <= 16 else 44)
+                        # Pengecualian Batas Slot untuk Staging (S)
+                        max_slot_actual = 999 if kolom_id == "Kolom_S" else (int(32 if baris <= 16 else 46) if is_all_box else int(31 if baris <= 16 else 44))
                         
                         for i, (idx, row) in enumerate(group.iterrows(), start=1):
                             row_dict = row.to_dict()
@@ -612,8 +619,8 @@ with tab5:
                         st.error("❌ Format CSV tidak valid! Kolom wajib tidak ditemukan.")
                     else:
                         batch = db.batch()
-                        # Timpa Kolom A sampai G agar bersih
-                        for kol in ["A", "B", "C", "D", "E", "F", "G"]:
+                        # Sertakan Kolom S agar Staging Area ikut di-reset dan di-restore
+                        for kol in ["A", "B", "C", "D", "E", "F", "G", "S"]:
                             df_kol = df_sync[df_sync['Kolom'] == kol]
                             new_data = []
                             if not df_kol.empty:
@@ -654,7 +661,8 @@ with tab6:
     col_b1, col_b2 = st.columns([1, 2])
     with col_b1:
         st.markdown("**1. Pilih Lokasi Rak**")
-        book_kolom = st.selectbox("Lokasi Kolom", ["A", "B", "C", "D", "E", "F", "G"], key="book_kolom_3")
+        book_kolom_label = st.selectbox("Lokasi Kolom", ["A", "B", "C", "D", "E", "F", "G", "S (Staging)"], key="book_kolom_3")
+        book_kolom = book_kolom_label.split(" ")[0]
         book_baris = st.number_input("Nomor Baris (Booking)", min_value=1, max_value=28, value=1, key="book_baris_3")
         if st.button("🔍 Cari Data Rak (Booking)", use_container_width=True): st.session_state.update({'book_lokasi_dicari': True, 'book_k_pilih': book_kolom, 'book_b_pilih': book_baris})
             
@@ -730,11 +738,13 @@ with tab7:
     col_r1, col_r2 = st.columns(2)
     with col_r1:
         st.markdown("**Rak ASAL (Sumber)**")
-        r_asal_k = st.selectbox("Kolom Asal", ["A", "B", "C", "D", "E", "F", "G"], key="r_ak")
+        r_asal_k_label = st.selectbox("Kolom Asal", ["A", "B", "C", "D", "E", "F", "G", "S (Staging)"], key="r_ak")
+        r_asal_k = r_asal_k_label.split(" ")[0]
         r_asal_b = st.number_input("Baris Asal", min_value=1, max_value=28, value=1, key="r_ab")
     with col_r2:
         st.markdown("**Rak TUJUAN (Destinasi)**")
-        r_tuj_k = st.selectbox("Kolom Tujuan", ["A", "B", "C", "D", "E", "F", "G"], key="r_tk")
+        r_tuj_k_label = st.selectbox("Kolom Tujuan", ["A", "B", "C", "D", "E", "F", "G", "S (Staging)"], key="r_tk")
+        r_tuj_k = r_tuj_k_label.split(" ")[0]
         r_tuj_b = st.number_input("Baris Tujuan", min_value=1, max_value=28, value=1, key="r_tb")
 
     if st.button("🔍 Cek Rak Asal", type="primary"):
