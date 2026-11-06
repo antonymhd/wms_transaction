@@ -321,7 +321,7 @@ with tab2:
             df_out['Pallet Ke'] = pd.to_numeric(df_out['Pallet Ke'], errors='coerce')
             
             # MEMBUAT GROUP KEY TERMASUK CATATAN ASAL AGAR TIDAK BERCAMPUR
-            df_out['Catatan_Clean'] = df_out['Catatan'].fillna("")
+            df_out['Catatan_Clean'] = df_out['Catatan'].fillna("").astype(str).replace('nan', '')
             df_out['Group_Key'] = df_out['Lot Number'].astype(str) + "_" + df_out['Nama Produk'].astype(str) + "_" + df_out['Catatan_Clean'].astype(str)
             
             rekap_lot = []
@@ -360,7 +360,7 @@ with tab2:
             st.markdown(f"**2. Edit Sisa Fisik Rak {k_pilih}-{b_pilih} (Tampilan Lebar)**")
             
             config_kolom = {
-                'Group_Key': None, # Disembunyikan karena ini hanya key internal
+                'Group_Key': None, 
                 'Produk': st.column_config.TextColumn("Produk", disabled=True),
                 'Part Number': st.column_config.TextColumn("Part", disabled=True),
                 'Lot Number': st.column_config.TextColumn("Lot", disabled=True),
@@ -384,7 +384,8 @@ with tab2:
                 data_rak_lain = [d for d in all_out_data if float(d.get('Baris', 0) or 0) != float(b_pilih)]
                 
                 def match_g_key(d, target_key):
-                    return (str(d.get('Lot Number','')) + "_" + str(d.get('Nama Produk','')) + "_" + str(d.get('Catatan',''))) == target_key
+                    c = str(d.get('Catatan', '')).replace('nan', '')
+                    return (str(d.get('Lot Number','')) + "_" + str(d.get('Nama Produk','')) + "_" + c) == target_key
 
                 for index, row in edited_df.iterrows():
                     g_key = str(row['Group_Key'])
@@ -422,8 +423,7 @@ with tab2:
                                 if match_g_key(d, g_key):
                                     if p_val in pallets_to_remove: continue 
                                     
-                                    # Tambahkan catatan baru tanpa menimpa Catatan Asal Staging
-                                    c_lama = str(d.get('Catatan', ''))
+                                    c_lama = str(d.get('Catatan', '')).replace('nan', '')
                                     if catatan_out != "" and catatan_out not in c_lama:
                                         d['Catatan'] = (c_lama + " | " + catatan_out).strip(' |')
                                         
@@ -636,7 +636,6 @@ with tab5:
                         st.error("❌ Format CSV tidak valid! Kolom wajib tidak ditemukan.")
                     else:
                         batch = db.batch()
-                        # Pastikan kolom Staging (S) ikut direstore
                         for kol in ["A", "B", "C", "D", "E", "F", "G", "S"]:
                             df_kol = df_sync[df_sync['Kolom'] == kol]
                             new_data = []
@@ -700,10 +699,11 @@ with tab6:
                     tersedia_lot = []
                     mapping_lot = {}
                     
-                    # GROUPING DENGAN MEMPERHITUNGKAN CATATAN AGAR STAGING AREA AMAN
+                    df_book['Catatan'] = df_book['Catatan'].fillna("").astype(str).replace('nan', '')
+                    
                     for _, row in df_book.drop_duplicates(subset=['Lot Number', 'Nama Produk', 'Catatan']).iterrows():
                         l = str(row['Lot Number'])
-                        c = str(row.get('Catatan', ''))
+                        c = str(row['Catatan'])
                         lb = f"{str(row['Nama Produk'])} (Lot: {l})"
                         if c: lb += f" - {c}"
                         tersedia_lot.append(lb)
@@ -735,7 +735,7 @@ with tab6:
                                         b_val = float(d.get('Baris', 0) or 0)
                                         p_val = pd.to_numeric(d.get('Pallet Ke', 0))
                                         if b_val == float(b_pilih) and p_val in pallets_to_book:
-                                            catatan_lama = str(d.get('Catatan', ''))
+                                            catatan_lama = str(d.get('Catatan', '')).replace('nan', '')
                                             d['Catatan'] = (f"[BOOKED: {book_do.strip()}] " + catatan_lama).strip()
                                         new_all_book_data.append(d)
                                         
@@ -948,7 +948,6 @@ with tab7:
                     if error_msg: 
                         st.error(error_msg)
                     elif has_changes:
-                        # Re-index Asal agar slot palet merapat kembali
                         baris_asal_sisa = sorted([d for d in data_rak_asal if float(d.get('Baris',0) or 0)==float(ab)], key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
                         lain_asal = [d for d in data_rak_asal if float(d.get('Baris',0) or 0)!=float(ab)]
                         for i, d in enumerate(baris_asal_sisa, 1): d['Pallet Ke'] = float(i)
@@ -963,14 +962,10 @@ with tab7:
                             'undo_dict': undo_dict_setup,
                             'action_msg': f"Berhasil memindahkan item dari Rak {ak}-{ab} ke {tk}-{tb}",
                             'action_status': 'DONE',
-                            'relok_dicari': False # Reset tampilan
+                            'relok_dicari': False
                         })
                         st.rerun()
                     else: st.info("Tidak ada jumlah yang dipindah.")
         else:
             st.warning("Rak Asal Kosong!")
             st.session_state['relok_dicari'] = False
-                            'action_msg': f"Pindah {qty_pindah} Slot '{nama_pilih}' dari {r_asal_k}-{r_asal_b} ke {r_tuj_k}-{r_tuj_b}",
-                            'action_status': 'DONE'
-                        })
-                        st.rerun()
