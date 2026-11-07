@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import firebase_admin
 from firebase_admin import credentials, firestore
-import time
 import io
 import copy
 import re
@@ -37,7 +36,7 @@ if not st.session_state['logged_in']:
 st.sidebar.button("🚪 Logout", on_click=lambda: st.session_state.update({'logged_in': False}))
 
 # ==========================================================
-# 2. INIT DATABASE (FIREBASE)
+# 2. INISIALISASI DATABASE (FIREBASE)
 # ==========================================================
 NAMA_DATABASE = 'uji_coba_rak'
 DB_LOG_MUTASI = 'log_mutasi_rak'
@@ -51,10 +50,11 @@ st.title("📝 WMS Entry Form (Inbound, Outbound & Relokasi)")
 st.caption(f"Alat khusus PPIC. Terhubung ke database: {NAMA_DATABASE}")
 
 # ==========================================================
-# 3. HELPER FUNCTIONS
+# 3. FUNGSI BANTUAN (HELPER FUNCTIONS)
 # ==========================================================
 @st.cache_data(ttl=3600)
 def load_master_produk():
+    """Memuat Master Data Produk untuk Auto-fill Part Number"""
     try:
         try: df = pd.read_csv("Master_Produk.csv", sep=";", encoding='utf-8-sig')
         except: df = pd.read_csv("Master_Produk.csv", sep=",", encoding='utf-8-sig')
@@ -67,6 +67,7 @@ def load_master_produk():
         return pd.DataFrame()
 
 def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh, pecahan, eceran, keterangan=""):
+    """Mencatat setiap pergerakan stok ke dalam tabel log riwayat mutasi"""
     waktu_sekarang = (datetime.utcnow() + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S")
     no_lot_final = no_lot if str(no_lot).strip() != "" else "-"
     log_data = {
@@ -85,16 +86,12 @@ def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh,
 if 'undo_dict' not in st.session_state:
     st.session_state.update({'undo_dict': {}, 'action_msg': "", 'action_status': None})
 
-# Bantuan notifikasi pop-up Native (muncul sebentar di kanan bawah secara otomatis tanpa mengganggu layar)
 if st.session_state['action_status'] in ['DONE', 'DONE_NO_UNDO']:
     st.toast(f"Berhasil: {st.session_state['action_msg']}", icon="✅")
 
-# Menampilkan Banner Statis yang aman bagi performa
 if st.session_state['action_status'] == 'DONE':
     with st.container(border=True):
         st.success(f"✅ **Sukses:** {st.session_state['action_msg']}")
-        
-        # Kolom sejajar untuk tombol Undo & Tutup
         c1, c2, c3 = st.columns([2, 1, 1])
         with c1:
             st.caption("Jika terjadi kesalahan input, Anda bisa membatalkan aksi terakhir ini.")
@@ -147,13 +144,13 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
 with tab1:
     st.header("Input Barang Masuk")
     
-    # Inisialisasi state untuk form reset
+    # Inisialisasi state lokasi & dynamic reset key untuk mencegah error StreamlitWidgetAlreadyInstantiated
     if 'in_lokasi_dicari' not in st.session_state:
         st.session_state.update({'in_lokasi_dicari': False, 'in_k_pilih': "A", 'in_b_pilih': 1})
-    if 'in_lot_input' not in st.session_state: st.session_state['in_lot_input'] = ""
-    if 'in_qty_input' not in st.session_state: st.session_state['in_qty_input'] = 1
-    if 'in_pecahan_input' not in st.session_state: st.session_state['in_pecahan_input'] = 0
-    if 'in_eceran_input' not in st.session_state: st.session_state['in_eceran_input'] = 0
+    if 'form_reset_counter' not in st.session_state: 
+        st.session_state['form_reset_counter'] = 0
+        
+    reset_key = st.session_state['form_reset_counter']
 
     col_in1, col_in2 = st.columns([1, 2])
     with col_in1:
@@ -176,7 +173,6 @@ with tab1:
             is_all_box_existing = all(str(d.get('Part Number', '')).strip().upper().endswith(('D', 'G')) for d in baris_data_preview) if baris_data_preview else False
             
             max_slot_display = 999 if k_pilih == 'S' else (32 if (is_all_box_existing and b_pilih <= 16) else (46 if is_all_box_existing else (31 if b_pilih <= 16 else 44)))
-            
             current_qty = len(baris_data_preview)
             sisa_ruang = max_slot_display - current_qty
             
@@ -206,12 +202,13 @@ with tab1:
                 in_produk = st.text_input("Nama Produk (Ketik Manual)")
                 in_part = st.text_input("Part Number (Ketik Manual)")
                 
-            in_lot = st.text_input("No. Lot Produksi / Mesin Shift", placeholder="WAJIB DIISI", key="in_lot_input")
+            # Inputan dengan Kunci Dinamis
+            in_lot = st.text_input("No. Lot Produksi / Mesin Shift", placeholder="WAJIB DIISI", key=f"in_lot_input_{reset_key}")
             
             col_qty1, col_qty2, col_qty3 = st.columns(3)
-            with col_qty1: in_qty = st.number_input("Pallet Masuk UTUH", min_value=0, step=1, key="in_qty_input")
-            with col_qty2: in_pecahan = st.number_input("Sisa Pecahan (Dus/Sak)", min_value=0, step=1, key="in_pecahan_input")
-            with col_qty3: in_eceran = st.number_input("Eceran (Pcs)", min_value=0, step=1, key="in_eceran_input")
+            with col_qty1: in_qty = st.number_input("Pallet Masuk UTUH", min_value=0, step=1, value=1, key=f"in_qty_input_{reset_key}")
+            with col_qty2: in_pecahan = st.number_input("Sisa Pecahan (Dus/Sak)", min_value=0, step=1, value=0, key=f"in_pecahan_input_{reset_key}")
+            with col_qty3: in_eceran = st.number_input("Eceran (Pcs)", min_value=0, step=1, value=0, key=f"in_eceran_input_{reset_key}")
             
             in_dari_depan = st.checkbox("📥 Masukkan dari DEPAN Rak (Push-back)")
                 
@@ -220,6 +217,7 @@ with tab1:
                 in_produk_clean = in_produk.strip() if in_produk else ""
                 in_lot_final = in_lot.strip()
 
+                # Validasi Form
                 if not in_lot_final or in_lot_final == "-":
                     st.error("⚠️ No. Lot bersifat WAJIB DIISI!")
                 elif not in_produk_clean or not in_part_clean:
@@ -299,20 +297,17 @@ with tab1:
                                 })
                                 
                         all_data.extend(new_records)
+                        doc_ref_in.set({'data': all_data})
+                        catat_log_mutasi("INBOUND", k_pilih, b_pilih, in_produk_clean, in_part_clean, in_lot_final, in_qty, in_pecahan, in_eceran)
                         
                         st.session_state.update({
                             'undo_dict': {k_pilih: all_data_raw}, 
                             'action_msg': f"Inbound {total_inbound_slots} Slot '{in_produk_clean}' ke Rak {k_pilih}-{b_pilih} {'(Push-back)' if in_dari_depan else ''}", 
                             'action_status': 'DONE'
                         })
-                        doc_ref_in.set({'data': all_data})
-                        catat_log_mutasi("INBOUND", k_pilih, b_pilih, in_produk_clean, in_part_clean, in_lot_final, in_qty, in_pecahan, in_eceran)
                         
-                        # Reset nilai form sebelum Rerun
-                        st.session_state['in_lot_input'] = ""
-                        st.session_state['in_qty_input'] = 1
-                        st.session_state['in_pecahan_input'] = 0
-                        st.session_state['in_eceran_input'] = 0
+                        # Increment Kunci Dinamis untuk Reset Form Aman
+                        st.session_state['form_reset_counter'] += 1
                         st.rerun()
 
 # ----------------------------------------------------------
