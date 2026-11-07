@@ -80,65 +80,56 @@ def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh,
     except Exception as e: st.toast(f"⚠️ Peringatan: Gagal mencatat log mutasi ({e})", icon="⚠️")
 
 # ==========================================================
-# 4. NOTIFIKASI MELAYANG (FLOATING BOTTOM BOX) & UNDO
+# 4. NOTIFIKASI & FITUR UNDO (NATIVE STREAMLIT)
 # ==========================================================
 if 'undo_dict' not in st.session_state:
     st.session_state.update({'undo_dict': {}, 'action_msg': "", 'action_status': None})
 
-css_floating_box = """
-<style>
-div[data-testid="stVerticalBlock"]:has(#floating-notif-anchor) {
-    position: fixed;
-    bottom: 25px;
-    left: 50%;
-    transform: translateX(-50%);
-    background-color: #ffffff;
-    padding: 1rem 1.5rem;
-    border-radius: 12px;
-    box-shadow: 0px 8px 30px rgba(0,0,0,0.3);
-    z-index: 99999;
-    width: 90%;
-    max-width: 800px;
-    border-left: 6px solid {border_color};
-}
-</style>
-<div id="floating-notif-anchor"></div>
-"""
+# Bantuan notifikasi pop-up Native (muncul sebentar di kanan bawah secara otomatis tanpa mengganggu layar)
+if st.session_state['action_status'] in ['DONE', 'DONE_NO_UNDO']:
+    st.toast(f"Berhasil: {st.session_state['action_msg']}", icon="✅")
 
+# Menampilkan Banner Statis yang aman bagi performa
 if st.session_state['action_status'] == 'DONE':
-    with st.container():
-        st.markdown(css_floating_box.replace("{border_color}", "#10b981"), unsafe_allow_html=True)
-        notif_c1, notif_c2 = st.columns([4, 1])
-        notif_c1.success(f"✅ **Sukses:** {st.session_state['action_msg']}")
+    with st.container(border=True):
+        st.success(f"✅ **Sukses:** {st.session_state['action_msg']}")
         
-        if notif_c2.button("🔙 UNDO AKSI INI", type="primary", use_container_width=True):
-            with st.spinner("Memulihkan data..."):
-                batch_undo = db.batch()
-                kolom_terdampak = []
-                for kol, dat in st.session_state['undo_dict'].items():
-                    doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{kol}")
-                    batch_undo.set(doc_ref, {'data': dat})
-                    kolom_terdampak.append(kol)
-                batch_undo.commit()
-                
-                st.session_state['action_status'] = 'UNDONE'
-                catat_log_mutasi("PEMBATALAN (UNDO)", ",".join(kolom_terdampak), "ALL", "Koreksi Sistem", "-", "-", 0, 0, 0, f"Membatalkan: {st.session_state['action_msg']}")
+        # Kolom sejajar untuk tombol Undo & Tutup
+        c1, c2, c3 = st.columns([2, 1, 1])
+        with c1:
+            st.caption("Jika terjadi kesalahan input, Anda bisa membatalkan aksi terakhir ini.")
+        
+        with c2:
+            if st.button("🔙 UNDO AKSI INI", type="primary", use_container_width=True):
+                with st.spinner("Memulihkan data..."):
+                    batch_undo = db.batch()
+                    kolom_terdampak = []
+                    for kol, dat in st.session_state['undo_dict'].items():
+                        doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{kol}")
+                        batch_undo.set(doc_ref, {'data': dat})
+                        kolom_terdampak.append(kol)
+                    batch_undo.commit()
+                    
+                    st.session_state['action_status'] = 'UNDONE'
+                    catat_log_mutasi("PEMBATALAN (UNDO)", ",".join(kolom_terdampak), "ALL", "Koreksi Sistem", "-", "-", 0, 0, 0, f"Membatalkan: {st.session_state['action_msg']}")
+                    st.rerun()
+                    
+        with c3:
+            if st.button("Tutup & Lanjut Input", use_container_width=True):
+                st.session_state['action_status'] = None
                 st.rerun()
 
 elif st.session_state['action_status'] == 'DONE_NO_UNDO':
-    with st.container():
-        st.markdown(css_floating_box.replace("{border_color}", "#3b82f6"), unsafe_allow_html=True)
+    with st.container(border=True):
         st.success(f"✅ **Sukses:** {st.session_state['action_msg']}")
         if st.button("Tutup Pesan Ini"):
             st.session_state['action_status'] = None
             st.rerun()
 
 elif st.session_state['action_status'] == 'UNDONE':
-    with st.container():
-        st.markdown(css_floating_box.replace("{border_color}", "#f59e0b"), unsafe_allow_html=True)
-        notif_c1, notif_c2 = st.columns([4, 1])
-        notif_c1.warning("⏪ **Berhasil dibatalkan.** Data telah kembali seperti semula.")
-        if notif_c2.button("Tutup Pesan", use_container_width=True):
+    with st.container(border=True):
+        st.warning("⏪ **Berhasil dibatalkan.** Data telah kembali seperti semula.")
+        if st.button("Tutup Pesan", use_container_width=True):
             st.session_state['action_status'] = None
             st.rerun()
 
