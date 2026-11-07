@@ -80,40 +80,67 @@ def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh,
     except Exception as e: st.toast(f"⚠️ Peringatan: Gagal mencatat log mutasi ({e})", icon="⚠️")
 
 # ==========================================================
-# 4. NOTIFIKASI 1-LINER & FITUR UNDO
+# 4. NOTIFIKASI MELAYANG (FLOATING BOTTOM BOX) & UNDO
 # ==========================================================
 if 'undo_dict' not in st.session_state:
     st.session_state.update({'undo_dict': {}, 'action_msg': "", 'action_status': None})
 
+css_floating_box = """
+<style>
+div[data-testid="stVerticalBlock"]:has(#floating-notif-anchor) {
+    position: fixed;
+    bottom: 25px;
+    left: 50%;
+    transform: translateX(-50%);
+    background-color: #ffffff;
+    padding: 1rem 1.5rem;
+    border-radius: 12px;
+    box-shadow: 0px 8px 30px rgba(0,0,0,0.3);
+    z-index: 99999;
+    width: 90%;
+    max-width: 800px;
+    border-left: 6px solid {border_color};
+}
+</style>
+<div id="floating-notif-anchor"></div>
+"""
+
 if st.session_state['action_status'] == 'DONE':
-    notif_c1, notif_c2 = st.columns([4, 1])
-    notif_c1.success(f"✅ **Sukses:** {st.session_state['action_msg']}")
-    if notif_c2.button("🔙 UNDO AKSI INI", type="primary", use_container_width=True):
-        with st.spinner("Memulihkan data..."):
-            batch_undo = db.batch()
-            kolom_terdampak = []
-            for kol, dat in st.session_state['undo_dict'].items():
-                doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{kol}")
-                batch_undo.set(doc_ref, {'data': dat})
-                kolom_terdampak.append(kol)
-            batch_undo.commit()
-            
-            st.session_state['action_status'] = 'UNDONE'
-            catat_log_mutasi("PEMBATALAN (UNDO)", ",".join(kolom_terdampak), "ALL", "Koreksi Sistem", "-", "-", 0, 0, 0, f"Membatalkan: {st.session_state['action_msg']}")
-            st.rerun()
+    with st.container():
+        st.markdown(css_floating_box.replace("{border_color}", "#10b981"), unsafe_allow_html=True)
+        notif_c1, notif_c2 = st.columns([4, 1])
+        notif_c1.success(f"✅ **Sukses:** {st.session_state['action_msg']}")
+        
+        if notif_c2.button("🔙 UNDO AKSI INI", type="primary", use_container_width=True):
+            with st.spinner("Memulihkan data..."):
+                batch_undo = db.batch()
+                kolom_terdampak = []
+                for kol, dat in st.session_state['undo_dict'].items():
+                    doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{kol}")
+                    batch_undo.set(doc_ref, {'data': dat})
+                    kolom_terdampak.append(kol)
+                batch_undo.commit()
+                
+                st.session_state['action_status'] = 'UNDONE'
+                catat_log_mutasi("PEMBATALAN (UNDO)", ",".join(kolom_terdampak), "ALL", "Koreksi Sistem", "-", "-", 0, 0, 0, f"Membatalkan: {st.session_state['action_msg']}")
+                st.rerun()
 
 elif st.session_state['action_status'] == 'DONE_NO_UNDO':
-    st.success(f"✅ **Sukses:** {st.session_state['action_msg']}")
-    if st.button("Tutup Pesan Ini"):
-        st.session_state['action_status'] = None
-        st.rerun()
+    with st.container():
+        st.markdown(css_floating_box.replace("{border_color}", "#3b82f6"), unsafe_allow_html=True)
+        st.success(f"✅ **Sukses:** {st.session_state['action_msg']}")
+        if st.button("Tutup Pesan Ini"):
+            st.session_state['action_status'] = None
+            st.rerun()
 
 elif st.session_state['action_status'] == 'UNDONE':
-    notif_c1, notif_c2 = st.columns([4, 1])
-    notif_c1.warning("⏪ **Berhasil dibatalkan.** Data telah kembali seperti semula.")
-    if notif_c2.button("Tutup Pesan", use_container_width=True):
-        st.session_state['action_status'] = None
-        st.rerun()
+    with st.container():
+        st.markdown(css_floating_box.replace("{border_color}", "#f59e0b"), unsafe_allow_html=True)
+        notif_c1, notif_c2 = st.columns([4, 1])
+        notif_c1.warning("⏪ **Berhasil dibatalkan.** Data telah kembali seperti semula.")
+        if notif_c2.button("Tutup Pesan", use_container_width=True):
+            st.session_state['action_status'] = None
+            st.rerun()
 
 # ==========================================================
 # 5. TABS MENU UTAMA
@@ -128,8 +155,14 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
 # ----------------------------------------------------------
 with tab1:
     st.header("Input Barang Masuk")
+    
+    # Inisialisasi state untuk form reset
     if 'in_lokasi_dicari' not in st.session_state:
         st.session_state.update({'in_lokasi_dicari': False, 'in_k_pilih': "A", 'in_b_pilih': 1})
+    if 'in_lot_input' not in st.session_state: st.session_state['in_lot_input'] = ""
+    if 'in_qty_input' not in st.session_state: st.session_state['in_qty_input'] = 1
+    if 'in_pecahan_input' not in st.session_state: st.session_state['in_pecahan_input'] = 0
+    if 'in_eceran_input' not in st.session_state: st.session_state['in_eceran_input'] = 0
 
     col_in1, col_in2 = st.columns([1, 2])
     with col_in1:
@@ -151,7 +184,6 @@ with tab1:
             baris_data_preview = [d for d in all_data_raw if float(d.get('Baris', 0) or 0) == float(b_pilih) and str(d.get('Part Number', '')).strip() != '']
             is_all_box_existing = all(str(d.get('Part Number', '')).strip().upper().endswith(('D', 'G')) for d in baris_data_preview) if baris_data_preview else False
             
-            # Kapasitas tak terbatas (999) untuk area Staging
             max_slot_display = 999 if k_pilih == 'S' else (32 if (is_all_box_existing and b_pilih <= 16) else (46 if is_all_box_existing else (31 if b_pilih <= 16 else 44)))
             
             current_qty = len(baris_data_preview)
@@ -183,21 +215,23 @@ with tab1:
                 in_produk = st.text_input("Nama Produk (Ketik Manual)")
                 in_part = st.text_input("Part Number (Ketik Manual)")
                 
-            in_lot = st.text_input("No. Lot Produksi / Mesin Shift", placeholder="Kosongkan jika tidak ada")
+            in_lot = st.text_input("No. Lot Produksi / Mesin Shift", placeholder="WAJIB DIISI", key="in_lot_input")
             
             col_qty1, col_qty2, col_qty3 = st.columns(3)
-            with col_qty1: in_qty = st.number_input("Pallet Masuk UTUH", min_value=0, step=1, value=1)
-            with col_qty2: in_pecahan = st.number_input("Sisa Pecahan (Dus/Sak)", min_value=0, step=1, value=0)
-            with col_qty3: in_eceran = st.number_input("Eceran (Pcs)", min_value=0, step=1, value=0)
+            with col_qty1: in_qty = st.number_input("Pallet Masuk UTUH", min_value=0, step=1, key="in_qty_input")
+            with col_qty2: in_pecahan = st.number_input("Sisa Pecahan (Dus/Sak)", min_value=0, step=1, key="in_pecahan_input")
+            with col_qty3: in_eceran = st.number_input("Eceran (Pcs)", min_value=0, step=1, key="in_eceran_input")
             
             in_dari_depan = st.checkbox("📥 Masukkan dari DEPAN Rak (Push-back)")
                 
             if st.button("🚀 Simpan Inbound", type="primary", use_container_width=True):
                 in_part_clean = in_part.strip().upper() if in_part else ""
                 in_produk_clean = in_produk.strip() if in_produk else ""
-                in_lot_final = in_lot.strip() if in_lot and in_lot.strip() != "" else "-"
+                in_lot_final = in_lot.strip()
 
-                if not in_produk_clean or not in_part_clean:
+                if not in_lot_final or in_lot_final == "-":
+                    st.error("⚠️ No. Lot bersifat WAJIB DIISI!")
+                elif not in_produk_clean or not in_part_clean:
                     st.error("⚠️ Nama Produk dan Part Number wajib diisi!")
                 elif in_qty == 0 and in_pecahan == 0 and in_eceran == 0:
                     st.error("⚠️ Masukkan minimal 1 Qty!")
@@ -282,6 +316,12 @@ with tab1:
                         })
                         doc_ref_in.set({'data': all_data})
                         catat_log_mutasi("INBOUND", k_pilih, b_pilih, in_produk_clean, in_part_clean, in_lot_final, in_qty, in_pecahan, in_eceran)
+                        
+                        # Reset nilai form sebelum Rerun
+                        st.session_state['in_lot_input'] = ""
+                        st.session_state['in_qty_input'] = 1
+                        st.session_state['in_pecahan_input'] = 0
+                        st.session_state['in_eceran_input'] = 0
                         st.rerun()
 
 # ----------------------------------------------------------
@@ -320,7 +360,6 @@ with tab2:
             df_out = pd.DataFrame(baris_out_data)
             df_out['Pallet Ke'] = pd.to_numeric(df_out['Pallet Ke'], errors='coerce')
             
-            # MEMBUAT GROUP KEY TERMASUK CATATAN ASAL AGAR TIDAK BERCAMPUR
             df_out['Catatan_Clean'] = df_out['Catatan'].fillna("").astype(str).replace('nan', '')
             df_out['Group_Key'] = df_out['Lot Number'].astype(str) + "_" + df_out['Nama Produk'].astype(str) + "_" + df_out['Catatan_Clean'].astype(str)
             
@@ -499,7 +538,6 @@ with tab3:
                         if not valid_group.empty:
                             is_all_box = bool(valid_group['Part Number'].astype(str).str.upper().str.endswith(('D', 'G')).all())
                             
-                        # Bebaskan kapasitas jika ini Kolom S (Staging)
                         max_slot_actual = 999 if kolom_id == "Kolom_S" else (int(32 if baris <= 16 else 46) if is_all_box else int(31 if baris <= 16 else 44))
                         
                         for i, (idx, row) in enumerate(group.iterrows(), start=1):
@@ -783,11 +821,9 @@ with tab7:
             df_asal = pd.DataFrame(baris_asal_data)
             df_asal['Pallet Ke'] = pd.to_numeric(df_asal['Pallet Ke'], errors='coerce')
             
-            # PEMBERSIHAN BUG "nan" 
             df_asal['Catatan'] = df_asal['Catatan'].fillna("").astype(str).replace('nan', '')
             df_asal['Keterangan'] = df_asal['Keterangan'].fillna("").astype(str).replace('nan', '')
             
-            # GROUPING
             df_asal['Group_Key'] = df_asal['Lot Number'].astype(str) + "_" + df_asal['Nama Produk'].astype(str) + "_" + df_asal['Catatan'].astype(str)
             
             rekap_relok = []
@@ -824,7 +860,6 @@ with tab7:
             st.divider()
             st.markdown(f"**2. Tentukan Jumlah yang Dipindah dari {ak}-{ab} ke {tk}-{tb}**")
             
-            # KONFIGURASI TABEL EDITOR
             config_kolom = {
                 'Group_Key': None, 'Part Number': None,
                 'Produk': st.column_config.TextColumn("Produk", disabled=True),
