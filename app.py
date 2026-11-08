@@ -33,7 +33,17 @@ if not st.session_state['logged_in']:
                 st.error("Kata sandi salah!")
     st.stop()
 
-st.sidebar.button("🚪 Logout", on_click=lambda: st.session_state.update({'logged_in': False}))
+# --- SIDEBAR NAVIGASI & KONTROL ---
+st.sidebar.markdown("### ⚙️ Kontrol Sistem")
+
+# Tombol untuk me-refresh cache Master Data CSV dari GitHub kapan saja
+if st.sidebar.button("🔄 Reload Master Data CSV", use_container_width=True):
+    st.cache_data.clear()
+    st.toast("Master Data berhasil diperbarui dari GitHub!", icon="✅")
+    st.rerun()
+
+st.sidebar.divider()
+st.sidebar.button("🚪 Logout", on_click=lambda: st.session_state.update({'logged_in': False}), use_container_width=True)
 
 # ==========================================================
 # 2. INISIALISASI DATABASE (FIREBASE)
@@ -52,7 +62,7 @@ st.caption(f"Alat khusus PPIC. Terhubung ke database: {NAMA_DATABASE}")
 # ==========================================================
 # 3. FUNGSI BANTUAN (HELPER FUNCTIONS)
 # ==========================================================
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=300) # TTL dipersingkat ke 5 menit agar auto-sync lebih cepat
 def load_master_produk():
     """Memuat Master Data Produk untuk Auto-fill Part Number"""
     try:
@@ -144,7 +154,6 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
 with tab1:
     st.header("Input Barang Masuk")
     
-    # Inisialisasi state lokasi & dynamic reset key untuk mencegah error StreamlitWidgetAlreadyInstantiated
     if 'in_lokasi_dicari' not in st.session_state:
         st.session_state.update({'in_lokasi_dicari': False, 'in_k_pilih': "A", 'in_b_pilih': 1})
     if 'form_reset_counter' not in st.session_state: 
@@ -202,7 +211,6 @@ with tab1:
                 in_produk = st.text_input("Nama Produk (Ketik Manual)")
                 in_part = st.text_input("Part Number (Ketik Manual)")
                 
-            # Inputan dengan Kunci Dinamis
             in_lot = st.text_input("No. Lot Produksi / Mesin Shift", placeholder="WAJIB DIISI", key=f"in_lot_input_{reset_key}")
             
             col_qty1, col_qty2, col_qty3 = st.columns(3)
@@ -217,7 +225,6 @@ with tab1:
                 in_produk_clean = in_produk.strip() if in_produk else ""
                 in_lot_final = in_lot.strip()
 
-                # Validasi Form
                 if not in_lot_final or in_lot_final == "-":
                     st.error("⚠️ No. Lot bersifat WAJIB DIISI!")
                 elif not in_produk_clean or not in_part_clean:
@@ -306,7 +313,6 @@ with tab1:
                             'action_status': 'DONE'
                         })
                         
-                        # Increment Kunci Dinamis untuk Reset Form Aman
                         st.session_state['form_reset_counter'] += 1
                         st.rerun()
 
