@@ -8,7 +8,7 @@ from firebase_admin import credentials, firestore
 # ==========================================================
 # 1. KONFIGURASI TAMPILAN MOBILE-FIRST (REMOTE)
 # ==========================================================
-st.set_page_config(page_title="WMS Outbound - Remote", layout="centered", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Lift Truck - Outbound", layout="centered", initial_sidebar_state="collapsed")
 
 # Injeksi CSS UI "Remote Outbound"
 st.markdown("""
