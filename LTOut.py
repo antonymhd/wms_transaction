@@ -31,11 +31,7 @@ st.markdown("""
             padding: 15px;
             transition: all 0.2s ease-in-out;
         }
-        
-        .stButton>button:active {
-            background-color: #444;
-            border-color: #fff;
-        }
+        .stButton>button:active { background-color: #444; border-color: #fff; }
         
         button[kind="primary"] {
             background-color: #1E88E5 !important;
@@ -44,19 +40,23 @@ st.markdown("""
             text-align: center !important;
         }
         
+        /* Tombol Undo Merah Custom */
+        .btn-undo > button {
+            background-color: #D32F2F !important;
+            border-color: #D32F2F !important;
+            text-align: center !important;
+        }
+        
         .progress-container {
             font-size: 14px;
-            margin-bottom: 20px;
+            margin-bottom: 15px;
             padding-bottom: 10px;
             border-bottom: 1px solid #333;
             text-align: center;
         }
         .step-active { color: #42A5F5; font-weight: bold; }
         .step-inactive { color: #666; }
-        
-        div[data-testid="stMetricValue"] {
-            font-size: 24px !important;
-        }
+        div[data-testid="stMetricValue"] { font-size: 24px !important; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -71,8 +71,7 @@ if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-def get_waktu_jkt():
-    return datetime.utcnow() + timedelta(hours=7)
+def get_waktu_jkt(): return datetime.utcnow() + timedelta(hours=7)
 
 def parse_keterangan(ket_str):
     ket_str = str(ket_str).lower()
@@ -85,61 +84,42 @@ def parse_keterangan(ket_str):
 
 def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh, pecahan, eceran, keterangan=""):
     waktu_sekarang = get_waktu_jkt().strftime("%Y-%m-%d %H:%M:%S")
-    no_lot_final = no_lot if str(no_lot).strip() != "" else "-"
-    
     log_data = {
-        "Waktu Transaksi": waktu_sekarang, 
-        "Jenis Transaksi": jenis, 
-        "Lokasi Rak": f"{kolom}-{baris}",
-        "Nama Produk": produk, 
-        "Part Number": part_num, 
-        "No Lot": no_lot_final,
-        "Mutasi Pallet": float(pallet_utuh), 
-        "Mutasi Pecahan (Dus/Sak)": float(pecahan),
-        "Mutasi Eceran (Pcs)": float(eceran), 
-        "Keterangan": keterangan,
+        "Waktu Transaksi": waktu_sekarang, "Jenis Transaksi": jenis, "Lokasi Rak": f"{kolom}-{baris}",
+        "Nama Produk": produk, "Part Number": part_num, "No Lot": no_lot if str(no_lot).strip() != "" else "-",
+        "Mutasi Pallet": float(pallet_utuh), "Mutasi Pecahan (Dus/Sak)": float(pecahan),
+        "Mutasi Eceran (Pcs)": float(eceran), "Keterangan": keterangan,
         "Timestamp_System": firestore.SERVER_TIMESTAMP
     }
     try: db.collection(DB_LOG_MUTASI).add(log_data)
     except Exception: pass 
 
 # ==========================================================
-# 3. OPTIMASI 1: CACHING FIREBASE READS (HEMAT KUOTA)
+# 3. FIREBASE READ CACHE & TRANSACTION WRITE
 # ==========================================================
-@st.cache_data(ttl=300) # Data di-cache selama 5 menit (300 detik)
+@st.cache_data(ttl=300)
 def get_all_racking_data():
-    """Menarik semua data rak dari Firebase, hanya dijalankan maks 1x tiap 5 menit"""
     docs = db.collection(NAMA_DATABASE).stream()
     semua_data = []
     for doc in docs:
         doc_data = doc.to_dict()
-        if 'data' in doc_data:
-            semua_data.extend(doc_data['data'])
+        if 'data' in doc_data: semua_data.extend(doc_data['data'])
     return semua_data
 
-# ==========================================================
-# 4. OPTIMASI 2: FIREBASE TRANSACTION (ANTI-TABRAKAN)
-# ==========================================================
 @firestore.transactional
 def proses_outbound_transaction(transaction, doc_ref, b_pilih, lot_pilih, qty_pallet):
-    """
-    Fungsi ini dijalankan di dalam server Firebase secara terisolasi.
-    Jika ada perubahan data sedetik sebelum dieksekusi, transaksi akan diulang otomatis atau dibatalkan.
-    """
     snapshot = doc_ref.get(transaction=transaction)
-    
-    if not snapshot.exists:
-        raise ValueError("Data Kolom tidak ditemukan di database.")
+    if not snapshot.exists: raise ValueError("Data Kolom tidak ditemukan di database.")
         
     all_col_data = snapshot.to_dict().get('data', [])
+    data_lama_sebelum_update = all_col_data.copy()
+    
     rak_ini = [d for d in all_col_data if float(d.get('Baris', 0) or 0) == float(b_pilih)]
     rak_lain = [d for d in all_col_data if float(d.get('Baris', 0) or 0) != float(b_pilih)]
     
-    # Hitung stok riil di database SAAT INI
     df_lot = pd.DataFrame([d for d in rak_ini if str(d.get('Lot Number', '')) == lot_pilih])
-    
     if df_lot.empty or len(df_lot) < qty_pallet:
-        raise ValueError("Stok tidak mencukupi! Kemungkinan pallet baru saja diambil oleh operator lain.")
+        raise ValueError("Stok tidak mencukupi! Kemungkinan pallet baru saja diambil operator lain.")
         
     df_lot['Pallet Ke'] = pd.to_numeric(df_lot['Pallet Ke'])
     df_lot = df_lot.sort_values('Pallet Ke', ascending=False)
@@ -149,20 +129,18 @@ def proses_outbound_transaction(transaction, doc_ref, b_pilih, lot_pilih, qty_pa
     updated_rak_ini = []
     for d in rak_ini:
         p_val = pd.to_numeric(d.get('Pallet Ke', 0))
-        if p_val in pallets_to_remove and str(d.get('Lot Number', '')) == lot_pilih:
-            continue
+        if p_val in pallets_to_remove and str(d.get('Lot Number', '')) == lot_pilih: continue
         updated_rak_ini.append(d)
     
     updated_rak_ini = sorted(updated_rak_ini, key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
-    for i, d in enumerate(updated_rak_ini, 1):
-        d['Pallet Ke'] = float(i)
+    for i, d in enumerate(updated_rak_ini, 1): d['Pallet Ke'] = float(i)
     
     final_data = rak_lain + updated_rak_ini
-    transaction.update(doc_ref, {'data': final_data}) # Eksekusi Write terkunci
-    return True
+    transaction.update(doc_ref, {'data': final_data}) 
+    return data_lama_sebelum_update 
 
 # ==========================================================
-# 5. FUNGSI MASTER PRODUK & STATE MANAGEMENT
+# 4. MASTER PRODUK & STATE MANAGEMENT
 # ==========================================================
 def ekstrak_gramasi(nama_produk):
     match = re.search(r'(\d+[.,]\d+)\s*(?:gr|GR)', str(nama_produk), re.IGNORECASE)
@@ -186,25 +164,27 @@ def load_master_data():
         df['Kategori'] = df['Nama Barang'].apply(set_kategori)
         df['Gramasi'] = df['Nama Barang'].apply(ekstrak_gramasi)
         return df
-    except Exception as e:
-        return pd.DataFrame(columns=['Nama Barang', 'Kategori', 'Gramasi'])
+    except Exception: return pd.DataFrame(columns=['Nama Barang', 'Kategori', 'Gramasi'])
 
 df_master = load_master_data()
 
-keys_state = ['slide', 'kategori', 'gramasi', 'item', 'pilih_kolom', 'pilih_baris', 'pilih_lot', 'pilih_part', 'max_pallet', 'max_dus', 'operator']
+# INISIALISASI SEMUA STATE
+keys_state = ['slide', 'kategori', 'gramasi', 'item', 'pilih_kolom', 'pilih_baris', 'pilih_lot', 'pilih_part', 'max_pallet', 'max_dus', 'operator', 'action_msg', 'action_status', 'undo_dict']
 for key in keys_state:
     if key not in st.session_state:
         if key == 'operator': st.session_state[key] = "Operator 1 (Default)"
         elif key == 'slide': st.session_state[key] = 1
+        elif key == 'undo_dict': st.session_state[key] = {}
+        elif key == 'action_msg': st.session_state[key] = ""
         else: st.session_state[key] = None
 
-def pindah_slide(tujuan):
-    st.session_state.slide = tujuan
+def pindah_slide(tujuan): st.session_state.slide = tujuan
 
+# HEADER DATABASE STATUS
 st.markdown(f"""
-    <div style="background-color: #1a1a1a; border: 1px solid #333; padding: 12px; border-radius: 8px; margin-bottom: 15px;">
+    <div style="background-color: #1a1a1a; border: 1px solid #333; padding: 12px; border-radius: 8px; margin-bottom: 10px;">
         <div style="font-size: 13px; color: #aaa; margin-bottom: 6px;">
-            📡 Database: <strong style="color: #4CAF50;">{NAMA_DATABASE}</strong>
+            📡 DB: <strong style="color: #4CAF50;">{NAMA_DATABASE}</strong>
         </div>
         <div style="font-size: 13px; color: #aaa;">
             👤 Aktif: <strong style="color: #fff;">{st.session_state.operator}</strong>
@@ -212,6 +192,43 @@ st.markdown(f"""
     </div>
 """, unsafe_allow_html=True)
 
+# ==========================================================
+# 5. NOTIFIKASI & SISTEM UNDO (BATAL) - POSISI DI ATAS
+# ==========================================================
+if st.session_state.action_status == 'DONE':
+    with st.container(border=True):
+        st.success(f"✅ **SUKSES:** {st.session_state.action_msg}")
+        c_undo1, c_undo2 = st.columns(2)
+        with c_undo1:
+            st.markdown('<div class="btn-undo">', unsafe_allow_html=True)
+            if st.button("⏪ UNDO (BATAL)", use_container_width=True):
+                with st.spinner("Memulihkan stok..."):
+                    batch_undo = db.batch()
+                    kol_terdampak = []
+                    for kol, dat in st.session_state.undo_dict.items():
+                        doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{kol}")
+                        batch_undo.set(doc_ref, {'data': dat})
+                        kol_terdampak.append(kol)
+                    batch_undo.commit()
+                    
+                    get_all_racking_data.clear()
+                    st.session_state.action_status = 'UNDONE'
+                    catat_log_mutasi("PEMBATALAN (UNDO)", ",".join(kol_terdampak), "ALL", "Koreksi Sistem", "-", "-", 0, 0, 0, f"Dibatalkan oleh: {st.session_state.operator}")
+                    st.rerun()
+            st.markdown('</div>', unsafe_allow_html=True)
+        with c_undo2:
+            if st.button("TUTUP / LANJUT", use_container_width=True):
+                st.session_state.action_status = None
+                st.rerun()
+                
+elif st.session_state.action_status == 'UNDONE':
+    with st.container(border=True):
+        st.warning("⏪ **Aksi dibatalkan.** Stok telah kembali seperti semula.")
+        if st.button("TUTUP PESAN", use_container_width=True):
+            st.session_state.action_status = None
+            st.rerun()
+
+# RENDER PROGRESS BAR
 def render_progress():
     steps = ["Kategori", "Gramasi", "Item", "Lokasi", "Selesai"]
     current = st.session_state.slide
@@ -261,7 +278,7 @@ elif st.session_state.slide == 3:
         if st.button(f"📦 {item}", use_container_width=True): st.session_state.item = item; pindah_slide(4); st.rerun()
 
 # ==========================================================
-# SLIDE 4: PENCARIAN STOK (MENGGUNAKAN CACHE)
+# SLIDE 4: PENCARIAN STOK (CACHE)
 # ==========================================================
 elif st.session_state.slide == 4:
     if st.button("🔙 GANTI ITEM"): pindah_slide(3); st.rerun()
@@ -269,7 +286,6 @@ elif st.session_state.slide == 4:
     st.info(f"{st.session_state.item}")
     
     with st.spinner("🔍 Mencari lokasi stok di gudang..."):
-        # MENGGUNAKAN FUNGSI CACHE (Tidak selalu tembak ke Firebase)
         semua_data = get_all_racking_data()
         
         if not semua_data:
@@ -315,12 +331,9 @@ elif st.session_state.slide == 4:
                     btn_label += f"{fifo_label}{catatan_label}"
                     
                     if st.button(btn_label, use_container_width=True, key=f"btn_loc_{idx}"):
-                        st.session_state.pilih_kolom = row['Kolom']
-                        st.session_state.pilih_baris = row['Baris']
-                        st.session_state.pilih_lot = row['Lot Number']
-                        st.session_state.pilih_part = row['Part']
-                        st.session_state.max_pallet = row['Pallet']
-                        st.session_state.max_dus = row['Dus']
+                        st.session_state.pilih_kolom = row['Kolom']; st.session_state.pilih_baris = row['Baris']
+                        st.session_state.pilih_lot = row['Lot Number']; st.session_state.pilih_part = row['Part']
+                        st.session_state.max_pallet = row['Pallet']; st.session_state.max_dus = row['Dus']
                         pindah_slide(5); st.rerun()
 
 # ==========================================================
@@ -348,37 +361,38 @@ elif st.session_state.slide == 5:
         st.warning("⚠️ Masukkan minimal 1 Qty untuk dikeluarkan.")
     else:
         if st.button("🚀 KELUARKAN BARANG", type="primary", use_container_width=True):
-            with st.spinner("Memproses transaksi terisolasi (Anti-Tabrakan)..."):
+            with st.spinner("Memproses transaksi terisolasi..."):
                 
                 k_pilih = st.session_state.pilih_kolom
                 b_pilih = st.session_state.pilih_baris
                 lot_pilih = st.session_state.pilih_lot
                 
                 doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{k_pilih}")
-                transaction = db.transaction() # Membuka jalur transaksi Firebase
+                transaction = db.transaction() 
                 
                 try:
-                    # Menjalankan eksekusi Outbound ke dalam Transaction
-                    proses_outbound_transaction(transaction, doc_ref, b_pilih, lot_pilih, qty_pallet)
+                    data_sebelum_update = proses_outbound_transaction(transaction, doc_ref, b_pilih, lot_pilih, qty_pallet)
                     
-                    # Log Mutasi dijalankan di luar transaksi setelah sukses
                     catat_log_mutasi("OUTBOUND (Remote)", k_pilih, b_pilih, st.session_state.item, st.session_state.pilih_part, lot_pilih, qty_pallet, qty_dus, 0, f"Dieksekusi oleh: {st.session_state.operator}")
                     
-                    # PENTING: Bersihkan Cache setelah stok berubah agar pencarian berikutnya Akurat!
                     get_all_racking_data.clear() 
                     
-                    st.balloons()
-                    st.success(f"✅ Berhasil! {qty_pallet} Pallet dan {qty_dus} Dus telah dikeluarkan.")
+                    # SETUP NOTIFIKASI & BACKUP UNDO
+                    st.session_state.undo_dict = {k_pilih: data_sebelum_update}
+                    st.session_state.action_msg = f"{qty_pallet} Pallet dikeluarkan dari Rak {k_pilih}-{b_pilih}"
+                    st.session_state.action_status = 'DONE'
                     
-                    for k in keys_state:
-                        if k != 'operator': st.session_state[k] = 1 if k == 'slide' else None
+                    # PANGGIL POP-UP STREAMLIT NATIVE SEBAGAI CADANGAN
+                    st.toast(st.session_state.action_msg, icon="✅")
                     
-                    import time
-                    time.sleep(2.5)
+                    # KEMBALI KE SLIDE 1
+                    for k in ['kategori', 'gramasi', 'item', 'pilih_kolom', 'pilih_baris', 'pilih_lot', 'pilih_part', 'max_pallet', 'max_dus']:
+                        st.session_state[k] = None
+                    pindah_slide(1)
+                    
                     st.rerun()
                     
                 except ValueError as err:
-                    # Error akan muncul di sini jika qty di database < qty yang diminta operator
                     st.error(f"❌ Transaksi Dibatalkan: {err}")
                 except Exception as err:
                     st.error(f"❌ Kesalahan Sistem WMS: {err}")
