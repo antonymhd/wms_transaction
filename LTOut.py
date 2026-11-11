@@ -151,7 +151,7 @@ keys_state = ['slide', 'kategori', 'gramasi', 'item', 'pilih_kolom', 'pilih_bari
 for key in keys_state:
     if key not in st.session_state:
         # Placeholder operator sementara sebelum fitur login/pilih operator dibuat
-        if key == 'operator': st.session_state[key] = "Operator Shift 1 (Default)"
+        if key == 'operator': st.session_state[key] = "Operator 1 (Default)"
         elif key == 'slide': st.session_state[key] = 1
         else: st.session_state[key] = None
 
