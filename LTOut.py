@@ -8,16 +8,14 @@ from firebase_admin import credentials, firestore
 # ==========================================================
 # 1. KONFIGURASI TAMPILAN MOBILE-FIRST (REMOTE)
 # ==========================================================
-st.set_page_config(page_title="Lift Truck - Outbound", layout="centered", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="WMS Outbound - Remote", layout="centered", initial_sidebar_state="collapsed")
 
-# Injeksi CSS UI "Remote Outbound"
 st.markdown("""
     <style>
         #MainMenu {visibility: hidden;}
         header {visibility: hidden;}
         footer {visibility: hidden;}
         
-        /* Tombol Utama (Navigasi Slide & Pilihan) */
         .stButton>button {
             min-height: 75px; 
             height: auto;
@@ -39,7 +37,6 @@ st.markdown("""
             border-color: #fff;
         }
         
-        /* Tombol Eksekusi Akhir (Primary) */
         button[kind="primary"] {
             background-color: #1E88E5 !important;
             border-color: #1E88E5 !important;
@@ -47,7 +44,6 @@ st.markdown("""
             text-align: center !important;
         }
         
-        /* Styling Progress Bar */
         .progress-container {
             font-size: 14px;
             margin-bottom: 20px;
@@ -58,7 +54,6 @@ st.markdown("""
         .step-active { color: #42A5F5; font-weight: bold; }
         .step-inactive { color: #666; }
         
-        /* Margin st.metric Lokasi */
         div[data-testid="stMetricValue"] {
             font-size: 24px !important;
         }
@@ -92,7 +87,6 @@ def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh,
     waktu_sekarang = get_waktu_jkt().strftime("%Y-%m-%d %H:%M:%S")
     no_lot_final = no_lot if str(no_lot).strip() != "" else "-"
     
-    # Kelak saat fitur operator aktif, kita bisa memasukkan st.session_state.operator ke dalam log ini
     log_data = {
         "Waktu Transaksi": waktu_sekarang, 
         "Jenis Transaksi": jenis, 
@@ -106,19 +100,73 @@ def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh,
         "Keterangan": keterangan,
         "Timestamp_System": firestore.SERVER_TIMESTAMP
     }
-    try: 
-        db.collection(DB_LOG_MUTASI).add(log_data)
-    except Exception as e: 
-        pass 
+    try: db.collection(DB_LOG_MUTASI).add(log_data)
+    except Exception: pass 
 
 # ==========================================================
-# 3. FUNGSI EKSTRAKSI & LOAD MASTER DATA
+# 3. OPTIMASI 1: CACHING FIREBASE READS (HEMAT KUOTA)
+# ==========================================================
+@st.cache_data(ttl=300) # Data di-cache selama 5 menit (300 detik)
+def get_all_racking_data():
+    """Menarik semua data rak dari Firebase, hanya dijalankan maks 1x tiap 5 menit"""
+    docs = db.collection(NAMA_DATABASE).stream()
+    semua_data = []
+    for doc in docs:
+        doc_data = doc.to_dict()
+        if 'data' in doc_data:
+            semua_data.extend(doc_data['data'])
+    return semua_data
+
+# ==========================================================
+# 4. OPTIMASI 2: FIREBASE TRANSACTION (ANTI-TABRAKAN)
+# ==========================================================
+@firestore.transactional
+def proses_outbound_transaction(transaction, doc_ref, b_pilih, lot_pilih, qty_pallet):
+    """
+    Fungsi ini dijalankan di dalam server Firebase secara terisolasi.
+    Jika ada perubahan data sedetik sebelum dieksekusi, transaksi akan diulang otomatis atau dibatalkan.
+    """
+    snapshot = doc_ref.get(transaction=transaction)
+    
+    if not snapshot.exists:
+        raise ValueError("Data Kolom tidak ditemukan di database.")
+        
+    all_col_data = snapshot.to_dict().get('data', [])
+    rak_ini = [d for d in all_col_data if float(d.get('Baris', 0) or 0) == float(b_pilih)]
+    rak_lain = [d for d in all_col_data if float(d.get('Baris', 0) or 0) != float(b_pilih)]
+    
+    # Hitung stok riil di database SAAT INI
+    df_lot = pd.DataFrame([d for d in rak_ini if str(d.get('Lot Number', '')) == lot_pilih])
+    
+    if df_lot.empty or len(df_lot) < qty_pallet:
+        raise ValueError("Stok tidak mencukupi! Kemungkinan pallet baru saja diambil oleh operator lain.")
+        
+    df_lot['Pallet Ke'] = pd.to_numeric(df_lot['Pallet Ke'])
+    df_lot = df_lot.sort_values('Pallet Ke', ascending=False)
+    
+    pallets_to_remove = df_lot['Pallet Ke'].head(qty_pallet).tolist() if qty_pallet > 0 else []
+    
+    updated_rak_ini = []
+    for d in rak_ini:
+        p_val = pd.to_numeric(d.get('Pallet Ke', 0))
+        if p_val in pallets_to_remove and str(d.get('Lot Number', '')) == lot_pilih:
+            continue
+        updated_rak_ini.append(d)
+    
+    updated_rak_ini = sorted(updated_rak_ini, key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
+    for i, d in enumerate(updated_rak_ini, 1):
+        d['Pallet Ke'] = float(i)
+    
+    final_data = rak_lain + updated_rak_ini
+    transaction.update(doc_ref, {'data': final_data}) # Eksekusi Write terkunci
+    return True
+
+# ==========================================================
+# 5. FUNGSI MASTER PRODUK & STATE MANAGEMENT
 # ==========================================================
 def ekstrak_gramasi(nama_produk):
     match = re.search(r'(\d+[.,]\d+)\s*(?:gr|GR)', str(nama_produk), re.IGNORECASE)
-    if match:
-        angka = match.group(1).replace(',', '.')
-        return f"{float(angka):.2f} gr"
+    if match: return f"{float(match.group(1).replace(',', '.')):.2f} gr"
     return "Lainnya"
 
 def set_kategori(nama):
@@ -139,18 +187,13 @@ def load_master_data():
         df['Gramasi'] = df['Nama Barang'].apply(ekstrak_gramasi)
         return df
     except Exception as e:
-        st.error(f"Gagal memuat Master_Produk.csv: {e}")
         return pd.DataFrame(columns=['Nama Barang', 'Kategori', 'Gramasi'])
 
 df_master = load_master_data()
 
-# ==========================================================
-# 4. STATE MANAGEMENT & HEADER STATUS
-# ==========================================================
 keys_state = ['slide', 'kategori', 'gramasi', 'item', 'pilih_kolom', 'pilih_baris', 'pilih_lot', 'pilih_part', 'max_pallet', 'max_dus', 'operator']
 for key in keys_state:
     if key not in st.session_state:
-        # Placeholder operator sementara sebelum fitur login/pilih operator dibuat
         if key == 'operator': st.session_state[key] = "Operator 1 (Default)"
         elif key == 'slide': st.session_state[key] = 1
         else: st.session_state[key] = None
@@ -158,28 +201,24 @@ for key in keys_state:
 def pindah_slide(tujuan):
     st.session_state.slide = tujuan
 
-# Menampilkan Header Status di Atas
 st.markdown(f"""
     <div style="background-color: #1a1a1a; border: 1px solid #333; padding: 12px; border-radius: 8px; margin-bottom: 15px;">
         <div style="font-size: 13px; color: #aaa; margin-bottom: 6px;">
-            📡 Terhubung ke database: <strong style="color: #4CAF50;">{NAMA_DATABASE}</strong>
+            📡 Database: <strong style="color: #4CAF50;">{NAMA_DATABASE}</strong>
         </div>
         <div style="font-size: 13px; color: #aaa;">
-            👤 Operator aktif: <strong style="color: #fff;">{st.session_state.operator}</strong>
+            👤 Aktif: <strong style="color: #fff;">{st.session_state.operator}</strong>
         </div>
     </div>
 """, unsafe_allow_html=True)
 
-# Render Tracker Visual
 def render_progress():
     steps = ["Kategori", "Gramasi", "Item", "Lokasi", "Selesai"]
     current = st.session_state.slide
     html = "<div class='progress-container'>"
     for i, s in enumerate(steps, 1):
-        if i == current:
-            html += f"<span class='step-active'>[{i}] {s}</span>"
-        else:
-            html += f"<span class='step-inactive'>[{i}]</span>"
+        if i == current: html += f"<span class='step-active'>[{i}] {s}</span>"
+        else: html += f"<span class='step-inactive'>[{i}]</span>"
         if i < len(steps): html += " ➔ "
     html += "</div>"
     st.markdown(html, unsafe_allow_html=True)
@@ -187,94 +226,57 @@ def render_progress():
 render_progress()
 
 # ==========================================================
-# 5. SLIDE 1: JENIS PRODUK (KATEGORI)
+# UI SLIDE 1-3: NAVIGASI PRODUK
 # ==========================================================
 if st.session_state.slide == 1:
     st.markdown("### 🎛️ Remote Outbound")
-    st.caption("PILIH KATEGORI PRODUK:")
-    
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("🧪 PREFORM", use_container_width=True):
-            st.session_state.kategori = "PREFORM"; pindah_slide(2); st.rerun()
-        if st.button("🎨 CUP COLOR", use_container_width=True):
-            st.session_state.kategori = "CUP COLOR"; pindah_slide(2); st.rerun()
-        if st.button("🧢 CAP (TUTUP)", use_container_width=True):
-            st.session_state.kategori = "CAP"; pindah_slide(2); st.rerun()
-            
+        if st.button("🧪 PREFORM", use_container_width=True): st.session_state.kategori = "PREFORM"; pindah_slide(2); st.rerun()
+        if st.button("🎨 CUP COLOR", use_container_width=True): st.session_state.kategori = "CUP COLOR"; pindah_slide(2); st.rerun()
+        if st.button("🧢 CAP (TUTUP)", use_container_width=True): st.session_state.kategori = "CAP"; pindah_slide(2); st.rerun()
     with col2:
-        if st.button("🥤 CUP NATURAL", use_container_width=True):
-            st.session_state.kategori = "CUP NATURAL"; pindah_slide(2); st.rerun()
-        if st.button("🖨️ CUP PRINTING", use_container_width=True):
-            st.session_state.kategori = "CUP PRINTING"; pindah_slide(2); st.rerun()
+        if st.button("🥤 CUP NATURAL", use_container_width=True): st.session_state.kategori = "CUP NATURAL"; pindah_slide(2); st.rerun()
+        if st.button("🖨️ CUP PRINTING", use_container_width=True): st.session_state.kategori = "CUP PRINTING"; pindah_slide(2); st.rerun()
 
-# ==========================================================
-# SLIDE 2: PILIH GRAMASI
-# ==========================================================
 elif st.session_state.slide == 2:
-    if st.button("🔙 KEMBALI KATEGORI"):
-        pindah_slide(1); st.rerun()
-        
+    if st.button("🔙 KEMBALI KATEGORI"): pindah_slide(1); st.rerun()
     st.markdown(f"### VARIAN GRAMASI **{st.session_state.kategori}**:")
-    
     df_kat = df_master[df_master['Kategori'] == st.session_state.kategori]
     list_gramasi = sorted(df_kat['Gramasi'].unique())
-    
-    if not list_gramasi: st.info("Data gramasi kosong untuk kategori ini.")
-    
     for i in range(0, len(list_gramasi), 2):
         cols = st.columns(2)
         with cols[0]:
-            if st.button(f"⚖️ {list_gramasi[i]}", key=f"g_{i}", use_container_width=True):
-                st.session_state.gramasi = list_gramasi[i]; pindah_slide(3); st.rerun()
+            if st.button(f"⚖️ {list_gramasi[i]}", key=f"g_{i}", use_container_width=True): st.session_state.gramasi = list_gramasi[i]; pindah_slide(3); st.rerun()
         if i + 1 < len(list_gramasi):
             with cols[1]:
-                if st.button(f"⚖️ {list_gramasi[i+1]}", key=f"g_{i+1}", use_container_width=True):
-                    st.session_state.gramasi = list_gramasi[i+1]; pindah_slide(3); st.rerun()
+                if st.button(f"⚖️ {list_gramasi[i+1]}", key=f"g_{i+1}", use_container_width=True): st.session_state.gramasi = list_gramasi[i+1]; pindah_slide(3); st.rerun()
 
-# ==========================================================
-# SLIDE 3: PILIH ITEM SPESIFIK
-# ==========================================================
 elif st.session_state.slide == 3:
-    if st.button("🔙 GANTI GRAMASI"):
-        pindah_slide(2); st.rerun()
-        
+    if st.button("🔙 GANTI GRAMASI"): pindah_slide(2); st.rerun()
     st.markdown(f"### PILIH ITEM:")
-    st.caption(f"{st.session_state.kategori} ({st.session_state.gramasi})")
-    
-    df_item = df_master[(df_master['Kategori'] == st.session_state.kategori) & 
-                        (df_master['Gramasi'] == st.session_state.gramasi)]
+    df_item = df_master[(df_master['Kategori'] == st.session_state.kategori) & (df_master['Gramasi'] == st.session_state.gramasi)]
     list_item = df_item['Nama Barang'].tolist()
-    
     for item in list_item:
-        if st.button(f"📦 {item}", use_container_width=True):
-            st.session_state.item = item; pindah_slide(4); st.rerun()
+        if st.button(f"📦 {item}", use_container_width=True): st.session_state.item = item; pindah_slide(4); st.rerun()
 
 # ==========================================================
-# SLIDE 4: PILIH LOKASI & LOT (LIVE FIREBASE QUERY)
+# SLIDE 4: PENCARIAN STOK (MENGGUNAKAN CACHE)
 # ==========================================================
 elif st.session_state.slide == 4:
-    if st.button("🔙 GANTI ITEM"):
-        pindah_slide(3); st.rerun()
-        
+    if st.button("🔙 GANTI ITEM"): pindah_slide(3); st.rerun()
     st.markdown("### PILIH LOKASI & LOT BARANG")
     st.info(f"{st.session_state.item}")
     
     with st.spinner("🔍 Mencari lokasi stok di gudang..."):
-        docs = db.collection(NAMA_DATABASE).stream()
-        semua_data = []
-        for doc in docs:
-            doc_data = doc.to_dict()
-            if 'data' in doc_data:
-                semua_data.extend(doc_data['data'])
-                
+        # MENGGUNAKAN FUNGSI CACHE (Tidak selalu tembak ke Firebase)
+        semua_data = get_all_racking_data()
+        
         if not semua_data:
             st.warning("Database gudang kosong.")
         else:
             df_all = pd.DataFrame(semua_data)
-            
-            df_target = df_all[(df_all['Nama Produk'] == st.session_state.item) & 
-                             (df_all['Part Number'].astype(str).str.strip() != "")]
+            df_target = df_all[(df_all['Nama Produk'] == st.session_state.item) & (df_all['Part Number'].astype(str).str.strip() != "")]
             
             if df_target.empty:
                 st.error("❌ Stok untuk item ini tidak ditemukan di seluruh rak!")
@@ -295,8 +297,7 @@ elif st.session_state.slide == 4:
                     
                     jml_dus = 0
                     for _, r in pecahan_rows.iterrows():
-                        p, e = parse_keterangan(r['Keterangan']) 
-                        jml_dus += p
+                        p, e = parse_keterangan(r['Keterangan']); jml_dus += p
                         
                     rekap_lokasi.append({
                         'Kolom': kol, 'Baris': bar, 'Lot Number': lot, 
@@ -320,19 +321,16 @@ elif st.session_state.slide == 4:
                         st.session_state.pilih_part = row['Part']
                         st.session_state.max_pallet = row['Pallet']
                         st.session_state.max_dus = row['Dus']
-                        pindah_slide(5)
-                        st.rerun()
+                        pindah_slide(5); st.rerun()
 
 # ==========================================================
-# SLIDE 5: INPUT QTY & FIREBASE WRITE (EKSEKUSI)
+# SLIDE 5: EKSEKUSI FIREBASE TRANSACTION
 # ==========================================================
 elif st.session_state.slide == 5:
     col_back, _ = st.columns([1, 2])
-    if col_back.button("🔙 GANTI LOKASI"):
-        pindah_slide(4); st.rerun()
+    if col_back.button("🔙 GANTI LOKASI"): pindah_slide(4); st.rerun()
         
     st.markdown("### KONFIRMASI PENGELUARAN")
-    
     with st.container(border=True):
         st.markdown(f"**Item:** {st.session_state.item}")
         st.markdown(f"**Rak:** {st.session_state.pilih_kolom}-{st.session_state.pilih_baris} | **Lot:** {st.session_state.pilih_lot}")
@@ -342,60 +340,45 @@ elif st.session_state.slide == 5:
     st.markdown("**JUMLAH YANG AKAN DIAMBIL:**")
     
     col_q1, col_q2 = st.columns(2)
-    with col_q1:
-        qty_pallet = st.number_input("PALLET UTUH", min_value=0, max_value=st.session_state.max_pallet, step=1, value=1 if st.session_state.max_pallet > 0 else 0)
-    with col_q2:
-        qty_dus = st.number_input("DUS PECAHAN", min_value=0, max_value=st.session_state.max_dus, step=1, value=0)
+    with col_q1: qty_pallet = st.number_input("PALLET UTUH", min_value=0, max_value=st.session_state.max_pallet, step=1, value=1 if st.session_state.max_pallet > 0 else 0)
+    with col_q2: qty_dus = st.number_input("DUS PECAHAN", min_value=0, max_value=st.session_state.max_dus, step=1, value=0)
     
     st.write("")
     if qty_pallet == 0 and qty_dus == 0:
         st.warning("⚠️ Masukkan minimal 1 Qty untuk dikeluarkan.")
     else:
         if st.button("🚀 KELUARKAN BARANG", type="primary", use_container_width=True):
-            with st.spinner("Memproses Outbound ke Database..."):
+            with st.spinner("Memproses transaksi terisolasi (Anti-Tabrakan)..."):
+                
                 k_pilih = st.session_state.pilih_kolom
                 b_pilih = st.session_state.pilih_baris
                 lot_pilih = st.session_state.pilih_lot
                 
                 doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{k_pilih}")
-                all_col_data = doc_ref.get().to_dict().get('data', [])
+                transaction = db.transaction() # Membuka jalur transaksi Firebase
                 
-                rak_ini = [d for d in all_col_data if float(d.get('Baris', 0) or 0) == float(b_pilih)]
-                rak_lain = [d for d in all_col_data if float(d.get('Baris', 0) or 0) != float(b_pilih)]
-                
-                df_lot = pd.DataFrame([d for d in rak_ini if str(d.get('Lot Number', '')) == lot_pilih])
-                
-                if not df_lot.empty:
-                    df_lot['Pallet Ke'] = pd.to_numeric(df_lot['Pallet Ke'])
-                    df_lot = df_lot.sort_values('Pallet Ke', ascending=False)
+                try:
+                    # Menjalankan eksekusi Outbound ke dalam Transaction
+                    proses_outbound_transaction(transaction, doc_ref, b_pilih, lot_pilih, qty_pallet)
                     
-                    pallets_to_remove = df_lot['Pallet Ke'].head(qty_pallet).tolist() if qty_pallet > 0 else []
-                    
-                    updated_rak_ini = []
-                    for d in rak_ini:
-                        p_val = pd.to_numeric(d.get('Pallet Ke', 0))
-                        
-                        if p_val in pallets_to_remove and str(d.get('Lot Number', '')) == lot_pilih:
-                            continue
-                            
-                        updated_rak_ini.append(d)
-                    
-                    updated_rak_ini = sorted(updated_rak_ini, key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
-                    for i, d in enumerate(updated_rak_ini, 1):
-                        d['Pallet Ke'] = float(i)
-                    
-                    final_data = rak_lain + updated_rak_ini
-                    doc_ref.set({'data': final_data})
-                    
+                    # Log Mutasi dijalankan di luar transaksi setelah sukses
                     catat_log_mutasi("OUTBOUND (Remote)", k_pilih, b_pilih, st.session_state.item, st.session_state.pilih_part, lot_pilih, qty_pallet, qty_dus, 0, f"Dieksekusi oleh: {st.session_state.operator}")
-                
-                st.balloons()
-                st.success(f"✅ Berhasil! {qty_pallet} Pallet dan {qty_dus} Dus telah dikeluarkan dari Rak {k_pilih}-{b_pilih}.")
-                
-                for k in keys_state:
-                    if k != 'operator':
-                        st.session_state[k] = 1 if k == 'slide' else None
-                
-                import time
-                time.sleep(2)
-                st.rerun()
+                    
+                    # PENTING: Bersihkan Cache setelah stok berubah agar pencarian berikutnya Akurat!
+                    get_all_racking_data.clear() 
+                    
+                    st.balloons()
+                    st.success(f"✅ Berhasil! {qty_pallet} Pallet dan {qty_dus} Dus telah dikeluarkan.")
+                    
+                    for k in keys_state:
+                        if k != 'operator': st.session_state[k] = 1 if k == 'slide' else None
+                    
+                    import time
+                    time.sleep(2.5)
+                    st.rerun()
+                    
+                except ValueError as err:
+                    # Error akan muncul di sini jika qty di database < qty yang diminta operator
+                    st.error(f"❌ Transaksi Dibatalkan: {err}")
+                except Exception as err:
+                    st.error(f"❌ Kesalahan Sistem WMS: {err}")
