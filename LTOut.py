@@ -337,7 +337,7 @@ elif st.session_state.slide == 4:
                         pindah_slide(5); st.rerun()
 
 # ==========================================================
-# SLIDE 5: EKSEKUSI FIREBASE TRANSACTION
+# SLIDE 5: EKSEKUSI FIREBASE TRANSACTION & CATATAN
 # ==========================================================
 elif st.session_state.slide == 5:
     col_back, _ = st.columns([1, 2])
@@ -357,6 +357,10 @@ elif st.session_state.slide == 5:
     with col_q2: qty_dus = st.number_input("DUS PECAHAN", min_value=0, max_value=st.session_state.max_dus, step=1, value=0)
     
     st.write("")
+    # TAMBAHAN: Input Catatan Operator (Untuk siapa / Kendala fisik aktual)
+    catatan_operator = st.text_input("📝 CATATAN / KENDALA (Opsional)", placeholder="Cth: Untuk Line 2 / Fisik kurang 1 pallet")
+    
+    st.write("")
     if qty_pallet == 0 and qty_dus == 0:
         st.warning("⚠️ Masukkan minimal 1 Qty untuk dikeluarkan.")
     else:
@@ -371,18 +375,26 @@ elif st.session_state.slide == 5:
                 transaction = db.transaction() 
                 
                 try:
+                    # Jalankan transaksi pengambilan barang
                     data_sebelum_update = proses_outbound_transaction(transaction, doc_ref, b_pilih, lot_pilih, qty_pallet)
                     
-                    catat_log_mutasi("OUTBOUND (Remote)", k_pilih, b_pilih, st.session_state.item, st.session_state.pilih_part, lot_pilih, qty_pallet, qty_dus, 0, f"Dieksekusi oleh: {st.session_state.operator}")
+                    # Format teks keterangan log mutasi (Menggabungkan info operator & catatan khusus)
+                    teks_keterangan = f"Dieksekusi oleh: {st.session_state.operator}"
+                    if catatan_operator.strip():
+                        teks_keterangan += f" | Catatan: {catatan_operator.strip()}"
+                    
+                    # Catat log mutasi ke Firebase
+                    catat_log_mutasi("OUTBOUND (Remote)", k_pilih, b_pilih, st.session_state.item, st.session_state.pilih_part, lot_pilih, qty_pallet, qty_dus, 0, teks_keterangan)
                     
                     get_all_racking_data.clear() 
                     
                     # SETUP NOTIFIKASI & BACKUP UNDO
                     st.session_state.undo_dict = {k_pilih: data_sebelum_update}
-                    st.session_state.action_msg = f"{qty_pallet} Pallet dikeluarkan dari Rak {k_pilih}-{b_pilih}"
+                    st.session_state.action_msg = f"{qty_pallet} Pallet dikeluarkan dari Rak {k_pilih}-{b_pilih}."
+                    if catatan_operator.strip():
+                        st.session_state.action_msg += f" (Catatan: {catatan_operator.strip()})"
                     st.session_state.action_status = 'DONE'
                     
-                    # PANGGIL POP-UP STREAMLIT NATIVE SEBAGAI CADANGAN
                     st.toast(st.session_state.action_msg, icon="✅")
                     
                     # KEMBALI KE SLIDE 1
