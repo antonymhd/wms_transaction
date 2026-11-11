@@ -27,7 +27,7 @@ st.markdown("""
             border: 1px solid #444;
             background-color: #222;
             color: #fff;
-            white-space: pre-wrap; /* Penting untuk baris baru di tombol lokasi */
+            white-space: pre-wrap; 
             word-wrap: break-word;
             text-align: left; 
             padding: 15px;
@@ -77,24 +77,22 @@ if not firebase_admin._apps:
 db = firestore.client()
 
 def get_waktu_jkt():
-    """Mendapatkan waktu WIB (UTC+7)"""
     return datetime.utcnow() + timedelta(hours=7)
 
 def parse_keterangan(ket_str):
-    """Membaca jumlah Pecahan dan Eceran dari teks Keterangan"""
     ket_str = str(ket_str).lower()
     pecahan, eceran = 0, 0
     m_pec = re.search(r'pecahan:\s*(\d+)', ket_str)
     if m_pec: pecahan = int(m_pec.group(1))
-    
     m_ec = re.search(r'eceran:\s*(\d+)', ket_str)
     if m_ec: eceran = int(m_ec.group(1))
     return pecahan, eceran
 
 def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh, pecahan, eceran, keterangan=""):
-    """Mencatat riwayat mutasi outbound ke Firebase"""
     waktu_sekarang = get_waktu_jkt().strftime("%Y-%m-%d %H:%M:%S")
     no_lot_final = no_lot if str(no_lot).strip() != "" else "-"
+    
+    # Kelak saat fitur operator aktif, kita bisa memasukkan st.session_state.operator ke dalam log ini
     log_data = {
         "Waktu Transaksi": waktu_sekarang, 
         "Jenis Transaksi": jenis, 
@@ -111,7 +109,7 @@ def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh,
     try: 
         db.collection(DB_LOG_MUTASI).add(log_data)
     except Exception as e: 
-        pass # Silently fail agar tidak merusak UX Operator
+        pass 
 
 # ==========================================================
 # 3. FUNGSI EKSTRAKSI & LOAD MASTER DATA
@@ -147,16 +145,32 @@ def load_master_data():
 df_master = load_master_data()
 
 # ==========================================================
-# 4. STATE MANAGEMENT & PROGRESS BAR
+# 4. STATE MANAGEMENT & HEADER STATUS
 # ==========================================================
-keys_state = ['slide', 'kategori', 'gramasi', 'item', 'pilih_kolom', 'pilih_baris', 'pilih_lot', 'pilih_part', 'max_pallet', 'max_dus']
+keys_state = ['slide', 'kategori', 'gramasi', 'item', 'pilih_kolom', 'pilih_baris', 'pilih_lot', 'pilih_part', 'max_pallet', 'max_dus', 'operator']
 for key in keys_state:
     if key not in st.session_state:
-        st.session_state[key] = 1 if key == 'slide' else None
+        # Placeholder operator sementara sebelum fitur login/pilih operator dibuat
+        if key == 'operator': st.session_state[key] = "Operator Shift 1 (Default)"
+        elif key == 'slide': st.session_state[key] = 1
+        else: st.session_state[key] = None
 
 def pindah_slide(tujuan):
     st.session_state.slide = tujuan
 
+# Menampilkan Header Status di Atas
+st.markdown(f"""
+    <div style="background-color: #1a1a1a; border: 1px solid #333; padding: 12px; border-radius: 8px; margin-bottom: 15px;">
+        <div style="font-size: 13px; color: #aaa; margin-bottom: 6px;">
+            📡 Terhubung ke database: <strong style="color: #4CAF50;">{NAMA_DATABASE}</strong>
+        </div>
+        <div style="font-size: 13px; color: #aaa;">
+            👤 Operator aktif: <strong style="color: #fff;">{st.session_state.operator}</strong>
+        </div>
+    </div>
+""", unsafe_allow_html=True)
+
+# Render Tracker Visual
 def render_progress():
     steps = ["Kategori", "Gramasi", "Item", "Lokasi", "Selesai"]
     current = st.session_state.slide
@@ -170,7 +184,6 @@ def render_progress():
     html += "</div>"
     st.markdown(html, unsafe_allow_html=True)
 
-# Render Tracker Visual
 render_progress()
 
 # ==========================================================
@@ -248,7 +261,6 @@ elif st.session_state.slide == 4:
     st.info(f"{st.session_state.item}")
     
     with st.spinner("🔍 Mencari lokasi stok di gudang..."):
-        # Tarik data dari Firestore
         docs = db.collection(NAMA_DATABASE).stream()
         semua_data = []
         for doc in docs:
@@ -261,14 +273,12 @@ elif st.session_state.slide == 4:
         else:
             df_all = pd.DataFrame(semua_data)
             
-            # Filter Item dan pastikan Part Number terisi
             df_target = df_all[(df_all['Nama Produk'] == st.session_state.item) & 
                              (df_all['Part Number'].astype(str).str.strip() != "")]
             
             if df_target.empty:
                 st.error("❌ Stok untuk item ini tidak ditemukan di seluruh rak!")
             else:
-                # Grouping Kolom, Baris, dan Lot Number
                 df_target['Catatan'] = df_target['Catatan'].fillna("").astype(str).replace('nan', '')
                 df_target['Group_Key'] = df_target['Kolom'].astype(str) + "_" + df_target['Baris'].astype(str) + "_" + df_target['Lot Number'].astype(str)
                 
@@ -280,7 +290,6 @@ elif st.session_state.slide == 4:
                     catatan = str(df_group.iloc[0]['Catatan'])
                     part_num = str(df_group.iloc[0]['Part Number'])
                     
-                    # Hitung Utuh vs Pecahan
                     jml_utuh = df_group[~df_group['Keterangan'].astype(str).str.contains('Pecahan|Eceran', case=False, na=False)].shape[0]
                     pecahan_rows = df_group[df_group['Keterangan'].astype(str).str.contains('Pecahan|Eceran', case=False, na=False)]
                     
@@ -294,10 +303,8 @@ elif st.session_state.slide == 4:
                         'Pallet': jml_utuh, 'Dus': jml_dus, 'Catatan': catatan, 'Part': part_num
                     })
                 
-                # Sorting FIFO (Lot terkecil/tertua di atas)
                 df_rekap = pd.DataFrame(rekap_lokasi).sort_values('Lot Number', ascending=True).reset_index(drop=True)
                 
-                # Render Tombol Lokasi
                 for idx, row in df_rekap.iterrows():
                     fifo_label = "🌟 URUTAN 1 (PALING TUA - DIREKOMENDASIKAN)" if idx == 0 else f"⭐ URUTAN {idx + 1}"
                     catatan_label = f"\n🔖 Catatan: {row['Catatan']}" if row['Catatan'] else ""
@@ -350,54 +357,44 @@ elif st.session_state.slide == 5:
                 b_pilih = st.session_state.pilih_baris
                 lot_pilih = st.session_state.pilih_lot
                 
-                # Ambil dokumen khusus Kolom yang dipilih
                 doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{k_pilih}")
                 all_col_data = doc_ref.get().to_dict().get('data', [])
                 
                 rak_ini = [d for d in all_col_data if float(d.get('Baris', 0) or 0) == float(b_pilih)]
                 rak_lain = [d for d in all_col_data if float(d.get('Baris', 0) or 0) != float(b_pilih)]
                 
-                # Filter Lot Target
                 df_lot = pd.DataFrame([d for d in rak_ini if str(d.get('Lot Number', '')) == lot_pilih])
                 
                 if not df_lot.empty:
-                    # Urutkan Pallet Descending (Ambil Pallet terluar/terbesar indexnya)
                     df_lot['Pallet Ke'] = pd.to_numeric(df_lot['Pallet Ke'])
                     df_lot = df_lot.sort_values('Pallet Ke', ascending=False)
                     
-                    # Identifikasi Pallet yang akan dihapus dari Array
                     pallets_to_remove = df_lot['Pallet Ke'].head(qty_pallet).tolist() if qty_pallet > 0 else []
                     
                     updated_rak_ini = []
                     for d in rak_ini:
                         p_val = pd.to_numeric(d.get('Pallet Ke', 0))
                         
-                        # Buang array object jika ID Pallet & Lot cocok dengan yang ditarik
                         if p_val in pallets_to_remove and str(d.get('Lot Number', '')) == lot_pilih:
                             continue
-                        
-                        # Note: Pengurangan Dus (Update Keterangan) dapat dikembangkan lebih lanjut di blok ini
                             
                         updated_rak_ini.append(d)
                     
-                    # Re-index Pallet agar urutan di baris tersebut kembali padat (1, 2, 3...)
                     updated_rak_ini = sorted(updated_rak_ini, key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
                     for i, d in enumerate(updated_rak_ini, 1):
                         d['Pallet Ke'] = float(i)
                     
-                    # Eksekusi Write ke Firebase (Timpa 1 Dokumen Kolom)
                     final_data = rak_lain + updated_rak_ini
                     doc_ref.set({'data': final_data})
                     
-                    # Catat Log Mutasi Firebase
-                    catat_log_mutasi("OUTBOUND (Remote)", k_pilih, b_pilih, st.session_state.item, st.session_state.pilih_part, lot_pilih, qty_pallet, qty_dus, 0, "Via Aplikasi Remote")
+                    catat_log_mutasi("OUTBOUND (Remote)", k_pilih, b_pilih, st.session_state.item, st.session_state.pilih_part, lot_pilih, qty_pallet, qty_dus, 0, f"Dieksekusi oleh: {st.session_state.operator}")
                 
                 st.balloons()
                 st.success(f"✅ Berhasil! {qty_pallet} Pallet dan {qty_dus} Dus telah dikeluarkan dari Rak {k_pilih}-{b_pilih}.")
                 
-                # Reset State ke awal
                 for k in keys_state:
-                    st.session_state[k] = 1 if k == 'slide' else None
+                    if k != 'operator':
+                        st.session_state[k] = 1 if k == 'slide' else None
                 
                 import time
                 time.sleep(2)
