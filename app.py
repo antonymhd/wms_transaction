@@ -312,7 +312,9 @@ with tab1:
                         st.session_state.update({
                             'undo_dict': {k_pilih: all_data_raw}, 
                             'action_msg': f"Inbound {total_inbound_slots} Slot '{in_produk_clean}' ke Rak {k_pilih}-{b_pilih} {'(Push-back)' if in_dari_depan else ''}", 
-                            'action_status': 'DONE'
+                            'action_status': 'DONE',
+                            'kor_dicari': False,
+                            'relok_dicari': False
                         })
                         
                         st.session_state['form_reset_counter'] += 1
@@ -402,7 +404,8 @@ with tab2:
                 'Catatan Tambahan': st.column_config.TextColumn("Catatan Tambahan", max_chars=100)
             }
             
-            edited_df = st.data_editor(df_rekap, column_config=config_kolom, hide_index=True, use_container_width=True, num_rows="fixed")
+            # --- FIX: Ditambahkan KEY agar tidak bentrok rendering di background ---
+            edited_df = st.data_editor(df_rekap, column_config=config_kolom, hide_index=True, use_container_width=True, num_rows="fixed", key=f"editor_out_{k_pilih}_{b_pilih}")
             
             if st.button("🚜 Simpan Penyesuaian Massal (OUTBOUND)", type="primary", use_container_width=True):
                 has_changes = False
@@ -481,10 +484,13 @@ with tab2:
                     
                     doc_ref_out.set({'data': data_rak_lain + data_rak_ini})
                     
+                    # --- FIX: Reset State Pencarian Tab Lain Agar Tidak Ghost Rendering ---
                     st.session_state.update({
                         'undo_dict': {k_pilih: all_out_data},
                         'action_msg': f"Penyesuaian Outbound Massal di Rak {k_pilih}-{b_pilih}",
-                        'action_status': 'DONE'
+                        'action_status': 'DONE',
+                        'kor_dicari': False,
+                        'relok_dicari': False
                     })
                     st.rerun()
                 else: st.info("Tidak ada perubahan angka pada tabel. Outbound dibatalkan.")
@@ -845,7 +851,8 @@ with tab7:
                 'PINDAH PCS': st.column_config.NumberColumn("🧩 PINDAH PCS", min_value=0)
             }
             
-            edited_relok = st.data_editor(df_rekap_relok, column_config=config_kolom, hide_index=True, use_container_width=True)
+            # --- FIX: Ditambahkan KEY agar tidak bentrok rendering di background ---
+            edited_relok = st.data_editor(df_rekap_relok, column_config=config_kolom, hide_index=True, use_container_width=True, key=f"editor_relok_{ak}_{ab}_{tk}_{tb}")
             
             if st.button("🚀 Eksekusi Pindah Rak", type="primary", use_container_width=True):
                 if ak == tk and ab == tb:
@@ -981,11 +988,13 @@ with tab7:
                             
                         batch.commit()
                         
+                        # --- FIX: Reset State Pencarian Tab Lain Agar Tidak Ghost Rendering ---
                         st.session_state.update({
                             'undo_dict': undo_dict_setup,
                             'action_msg': f"Berhasil memindahkan item dari Rak {ak}-{ab} ke {tk}-{tb}",
                             'action_status': 'DONE',
-                            'relok_dicari': False
+                            'relok_dicari': False,
+                            'kor_dicari': False
                         })
                         st.rerun()
                     else: st.info("Tidak ada jumlah yang dipindah.")
@@ -1028,6 +1037,12 @@ with tab8:
         if baris_kor_data:
             df_kor = pd.DataFrame(baris_kor_data)
             df_kor['Pallet Ke'] = pd.to_numeric(df_kor['Pallet Ke'], errors='coerce')
+            
+            # --- FIX: Bersihkan tipe data Null/NaN ke Empty String untuk mencegah error serialisasi PyArrow ---
+            for col in ['Part Number', 'Lot Number', 'Nama Produk', 'Keterangan', 'Catatan']:
+                if col in df_kor.columns:
+                    df_kor[col] = df_kor[col].fillna("").astype(str).replace('nan', '')
+                    
             df_kor = df_kor.sort_values('Pallet Ke', ascending=True)
             
             st.markdown(f"**Data Baris {kk}-{kb}**")
@@ -1042,8 +1057,15 @@ with tab8:
                 'Catatan': st.column_config.TextColumn("Catatan / Booking Tag")
             }
             
-            # Gunakan num_rows="fixed" agar user tidak bisa tambah/hapus row di sini (menghindari kekacauan index).
-            edited_kor_df = st.data_editor(df_kor, column_config=config_kor, hide_index=True, use_container_width=True, num_rows="fixed")
+            # --- FIX: Ditambahkan KEY agar aman dari Concurrency Crash ---
+            edited_kor_df = st.data_editor(
+                df_kor, 
+                column_config=config_kor, 
+                hide_index=True, 
+                use_container_width=True, 
+                num_rows="fixed", 
+                key=f"editor_kor_{kk}_{kb}"
+            )
             
             if st.button("💾 Simpan Perubahan Koreksi", type="primary"):
                 has_changed = not edited_kor_df.equals(df_kor)
@@ -1052,7 +1074,7 @@ with tab8:
                     with st.spinner("Menyimpan koreksi..."):
                         new_baris_data = edited_kor_df.to_dict('records')
                         
-                        # Pastikan tipe data bersih sebelum di-push ke Firebase
+                        # Pastikan tipe data bersih kembali sebelum di-push ke Firebase
                         for d in new_baris_data:
                             d['Kolom'] = kk
                             d['Baris'] = float(kb)
