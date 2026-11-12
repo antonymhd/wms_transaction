@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import re
+import requests
 from datetime import datetime, timedelta
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -31,7 +32,7 @@ st.markdown("""
         }
         
         button[kind="primary"] {
-            background-color: #10B981 !important; /* Hijau untuk Inbound */
+            background-color: #10B981 !important;
             border-color: #059669 !important;
             color: white !important;
             font-size: 18px !important;
@@ -69,7 +70,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================================
-# 2. INISIALISASI FIREBASE & HELPER
+# 2. INISIALISASI FIREBASE, TELEGRAM & HELPER
 # ==========================================================
 NAMA_DATABASE = 'uji_coba_rak'
 DB_LOG_MUTASI = 'log_mutasi_rak'
@@ -80,6 +81,23 @@ if not firebase_admin._apps:
 db = firestore.client()
 
 def get_waktu_jkt(): return datetime.utcnow() + timedelta(hours=7)
+
+def kirim_notif_telegram(pesan_html):
+    try:
+        token = st.secrets["telegram"]["bot_token"]
+        chat_id = st.secrets["telegram"]["chat_id"]
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": pesan_html,
+            "parse_mode": "HTML"
+        }
+        requests.post(url, json=payload, timeout=3)
+    except Exception:
+        pass
+
+def escape_html(text):
+    return str(text).replace("&", "&").replace("<", "<").replace(">", ">")
 
 def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh, pecahan, eceran, keterangan=""):
     waktu_sekarang = get_waktu_jkt().strftime("%Y-%m-%d %H:%M:%S")
@@ -120,7 +138,6 @@ def proses_inbound_transaction(transaction, doc_ref, k_pilih, b_pilih, lot_pilih
         max_pallet = int(max([float(d.get('Pallet Ke', 0)) for d in rak_ini]))
         
     pallets_baru = []
-    # 1. Tambah Pallet Utuh
     for i in range(qty_pallet):
         pallets_baru.append({
             'Kolom': k_pilih, 'Baris': float(b_pilih),
@@ -129,7 +146,6 @@ def proses_inbound_transaction(transaction, doc_ref, k_pilih, b_pilih, lot_pilih
             'Pallet Ke': float(max_pallet + 1 + i)
         })
         
-    # 2. Tambah Pallet Pecahan
     if qty_pecahan > 0:
         pallets_baru.append({
             'Kolom': k_pilih, 'Baris': float(b_pilih),
@@ -200,11 +216,11 @@ def pindah_slide(tujuan): st.session_state.slide = tujuan
 # HEADER STATUS 
 st.markdown(f"""
     <div class="db-info-box">
-        <div style="font-size: 13px; opacity: 0.8; margin-bottom: 4px;">
-            📡 Database WMS: <strong style="color: #10B981;">{NAMA_DATABASE} (INBOUND)</strong>
+        <div style="font-size: 14px; font-weight: bold; color: #10B981; margin-bottom: 4px;">
+            🧭 Inbound - Rack Navigator
         </div>
-        <div style="font-size: 13px; opacity: 0.8;">
-            👤 Operator Bertugas: <strong>{st.session_state.operator}</strong>
+        <div style="font-size: 12px; opacity: 0.8;">
+            📡 DB: <strong>{NAMA_DATABASE}</strong>  |  👤 <strong>{st.session_state.operator}</strong>
         </div>
     </div>
 """, unsafe_allow_html=True)
@@ -231,6 +247,16 @@ if st.session_state.action_status == 'DONE':
                     get_all_racking_data.clear()
                     st.session_state.action_status = 'UNDONE'
                     catat_log_mutasi("PEMBATALAN (UNDO INBOUND)", ",".join(kol_terdampak), "ALL", "Koreksi Sistem", "-", "-", 0, 0, 0, f"Dibatalkan oleh: {st.session_state.operator}")
+                    
+                    # Kirim Notif Undo ke Telegram
+                    pesan_undo = (
+                        f"⏪ <b>UNDO INBOUND - RACK NAVIGATOR</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"📍 <b>Kolom Dipulihkan:</b> {', '.join(kol_terdampak)}\n"
+                        f"👤 <b>Operator:</b> {escape_html(st.session_state.operator)}\n"
+                        f"🕒 <b>Waktu:</b> {get_waktu_jkt().strftime('%H:%M:%S WIB')}"
+                    )
+                    kirim_notif_telegram(pesan_undo)
                     st.rerun()
             st.markdown('</div>', unsafe_allow_html=True)
         with c_undo2:
@@ -265,7 +291,7 @@ render_progress()
 # SLIDE 1 & 2: KATEGORI & GRAMASI
 # ==========================================================
 if st.session_state.slide == 1:
-    st.markdown("### Penerimaan Baru (Inbound)")
+    st.markdown("### Pilih Kategori Produk")
     col1, col2 = st.columns(2)
     with col1:
         if st.button("PREFORM", use_container_width=True): st.session_state.kategori = "PREFORM"; pindah_slide(2); st.rerun()
@@ -383,7 +409,6 @@ elif st.session_state.slide == 5:
             k, b = loc.split('-')
             b = int(b)
             
-            # Asumsi kapasitas Nictainer (A) sama dengan Dus (D/G) pada kalkulasi ini
             max_sac = 31 if b <= 16 else 44
             max_dus = 32 if b <= 16 else 46
             
@@ -472,6 +497,20 @@ elif st.session_state.slide == 6:
                 
                 catat_log_mutasi("INBOUND (Remote)", k_pilih, b_pilih, st.session_state.item, st.session_state.pilih_part, st.session_state.in_lot, st.session_state.in_qty_p, st.session_state.in_qty_c, 0, teks_keterangan)
                 
+                # Kirim Notifikasi Telegram
+                pecahan_tele = f", {st.session_state.in_qty_c} {st.session_state.in_tipe_c}" if st.session_state.in_qty_c > 0 else ""
+                pesan_tele = (
+                    f"📥 <b>INBOUND - RACK NAVIGATOR</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"📦 <b>Item:</b> {escape_html(st.session_state.item)}\n"
+                    f"📍 <b>Rak:</b> {k_pilih}-{b_pilih} | <b>Lot:</b> <code>{escape_html(st.session_state.in_lot)}</code>\n"
+                    f"📊 <b>Qty:</b> {st.session_state.in_qty_p} Pallet{pecahan_tele}\n"
+                    f"👤 <b>Operator:</b> {escape_html(st.session_state.operator)}\n"
+                )
+                if catatan_operator.strip():
+                    pesan_tele += f"📝 <b>Catatan:</b> <i>{escape_html(catatan_operator.strip())}</i>\n"
+                kirim_notif_telegram(pesan_tele)
+                
                 get_all_racking_data.clear() 
                 
                 st.session_state.undo_dict = {k_pilih: data_sebelum_update}
@@ -486,4 +525,4 @@ elif st.session_state.slide == 6:
                 st.rerun()
                 
             except Exception as err:
-                st.error(f"❌ Kesalahan Sistem WMS: {err}")
+                st.error(f"❌ Kesalahan Sistem: {err}")
