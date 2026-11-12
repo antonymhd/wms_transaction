@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import re
+import requests
 from datetime import datetime, timedelta
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -10,18 +11,16 @@ from firebase_admin import credentials, firestore
 # ==========================================================
 st.set_page_config(page_title="Outbound - Rack Navigator", layout="centered", initial_sidebar_state="collapsed")
 
-# Menghapus hardcode background-color agar Streamlit mengikuti Tema Sistem (Gelap/Terang)
 st.markdown("""
     <style>
         #MainMenu {visibility: hidden;}
         header {visibility: hidden;}
         footer {visibility: hidden;}
         
-        /* Tombol Utama (Adaptif terhadap Tema Streamlit) */
         .stButton>button {
             min-height: 75px; 
             height: auto;
-            font-size: 17px; /* Sedikit diperbesar */
+            font-size: 17px;
             font-weight: 600;
             border-radius: 12px;
             white-space: pre-wrap; 
@@ -32,7 +31,6 @@ st.markdown("""
             transition: all 0.15s ease-in-out;
         }
         
-        /* Tombol Eksekusi Akhir */
         button[kind="primary"] {
             background-color: #2563EB !important;
             border-color: #3B82F6 !important;
@@ -41,7 +39,6 @@ st.markdown("""
             text-align: center !important;
         }
         
-        /* Tombol Undo */
         .btn-undo > button {
             background-color: #DC2626 !important;
             border-color: #EF4444 !important;
@@ -49,7 +46,6 @@ st.markdown("""
             text-align: center !important;
         }
         
-        /* Progress Bar */
         .progress-container {
             font-size: 13px;
             font-weight: 500;
@@ -61,7 +57,6 @@ st.markdown("""
         .step-active { color: #2563EB; font-weight: bold; background: rgba(37, 99, 235, 0.1); padding: 4px 8px; border-radius: 6px; }
         .step-inactive { color: var(--text-color); opacity: 0.6; }
         
-        /* Info Box Header */
         .db-info-box {
             background-color: var(--secondary-background-color);
             border: 1px solid var(--border-color);
@@ -70,7 +65,6 @@ st.markdown("""
             margin-bottom: 15px;
         }
         
-        /* Memperbesar Font Gramasi */
         .btn-gramasi > button {
             font-size: 20px !important;
             text-align: center !important;
@@ -79,7 +73,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================================
-# 2. INISIALISASI FIREBASE & HELPER
+# 2. INISIALISASI FIREBASE, TELEGRAM & HELPER
 # ==========================================================
 NAMA_DATABASE = 'uji_coba_rak'
 DB_LOG_MUTASI = 'log_mutasi_rak'
@@ -91,6 +85,24 @@ db = firestore.client()
 
 def get_waktu_jkt(): return datetime.utcnow() + timedelta(hours=7)
 
+def kirim_notif_telegram(pesan_html):
+    """Mengirim notifikasi ke Telegram menggunakan format HTML agar aman dari karakter simbol"""
+    try:
+        token = st.secrets["telegram"]["bot_token"]
+        chat_id = st.secrets["telegram"]["chat_id"]
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": pesan_html,
+            "parse_mode": "HTML"
+        }
+        requests.post(url, json=payload, timeout=3)
+    except Exception:
+        pass
+
+def escape_html(text):
+    return str(text).replace("&", "&").replace("<", "<").replace(">", ">")
+
 def parse_keterangan(ket_str):
     ket_str = str(ket_str).lower()
     pecahan, eceran = 0, 0
@@ -99,6 +111,15 @@ def parse_keterangan(ket_str):
     m_ec = re.search(r'eceran:\s*(\d+)', ket_str)
     if m_ec: eceran = int(m_ec.group(1))
     return pecahan, eceran
+
+def parse_fifo_key(lot_str):
+    """Mengekstrak 6 digit terakhir (ddmmyy) dari No Lot menjadi yymmdd untuk akurasi sorting FIFO"""
+    s = str(lot_str).strip()
+    match = re.search(r'(\d{2})(\d{2})(\d{2})$', s)
+    if match:
+        dd, mm, yy = match.groups()
+        return f"{yy}{mm}{dd}_{s}"
+    return f"999999_{s}"
 
 def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh, pecahan, eceran, keterangan=""):
     waktu_sekarang = get_waktu_jkt().strftime("%Y-%m-%d %H:%M:%S")
@@ -113,7 +134,7 @@ def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh,
     except Exception: pass 
 
 # ==========================================================
-# 3. FIREBASE TRANSACTIONS
+# 3. FIREBASE TRANSACTIONS & CACHE
 # ==========================================================
 @st.cache_data(ttl=300)
 def get_all_racking_data():
@@ -158,7 +179,7 @@ def proses_outbound_transaction(transaction, doc_ref, b_pilih, lot_pilih, qty_pa
     return data_lama_sebelum_update 
 
 # ==========================================================
-# 4. MASTER PRODUK & PARSING STRING WARNA
+# 4. MASTER PRODUK & PARSING STRING
 # ==========================================================
 def ekstrak_gramasi(nama_produk):
     match = re.search(r'(\d+[.,]\d+)\s*(?:gr|GR)', str(nama_produk), re.IGNORECASE)
@@ -175,7 +196,6 @@ def set_kategori(nama):
     else: return 'LAINNYA'
 
 def format_nama_warna_bold(nama_barang):
-    """Mendeteksi warna (teks setelah koma terakhir) dan mencetaknya tebal"""
     parts = str(nama_barang).rsplit(',', 1)
     if len(parts) == 2:
         return f"{parts[0]}, **{parts[1].strip()}**"
@@ -184,16 +204,11 @@ def format_nama_warna_bold(nama_barang):
 @st.cache_data(ttl=3600)
 def load_master_data():
     try:
-        # PENTING: Pastikan kolom 'Part Number' ditarik jika ada di Master_Produk.csv
         df = pd.read_csv("Master_Produk.csv", sep=";", dtype=str)
         df = df.dropna(subset=['Nama Barang'])
         df['Kategori'] = df['Nama Barang'].apply(set_kategori)
         df['Gramasi'] = df['Nama Barang'].apply(ekstrak_gramasi)
-        
-        # Buat kolom dummy jika Part Number tidak ada agar skrip tidak error
-        if 'Part Number' not in df.columns:
-            df['Part Number'] = ""
-            
+        if 'Part Number' not in df.columns: df['Part Number'] = ""
         return df
     except Exception: return pd.DataFrame(columns=['Nama Barang', 'Kategori', 'Gramasi', 'Part Number'])
 
@@ -213,11 +228,11 @@ def pindah_slide(tujuan): st.session_state.slide = tujuan
 # HEADER STATUS 
 st.markdown(f"""
     <div class="db-info-box">
-        <div style="font-size: 13px; opacity: 0.8; margin-bottom: 4px;">
-            📡 Database WMS: <strong style="color: #3B82F6;">{NAMA_DATABASE}</strong>
+        <div style="font-size: 14px; font-weight: bold; color: #2563EB; margin-bottom: 4px;">
+            🧭 Outbound - Rack Navigator
         </div>
-        <div style="font-size: 13px; opacity: 0.8;">
-            👤 Operator Bertugas: <strong>{st.session_state.operator}</strong>
+        <div style="font-size: 12px; opacity: 0.8;">
+            📡 DB: <strong>{NAMA_DATABASE}</strong>  |  👤 <strong>{st.session_state.operator}</strong>
         </div>
     </div>
 """, unsafe_allow_html=True)
@@ -244,6 +259,16 @@ if st.session_state.action_status == 'DONE':
                     get_all_racking_data.clear()
                     st.session_state.action_status = 'UNDONE'
                     catat_log_mutasi("PEMBATALAN (UNDO)", ",".join(kol_terdampak), "ALL", "Koreksi Sistem", "-", "-", 0, 0, 0, f"Dibatalkan oleh: {st.session_state.operator}")
+                    
+                    # Kirim Notif Undo ke Telegram
+                    pesan_undo = (
+                        f"⏪ <b>UNDO OUTBOUND - RACK NAVIGATOR</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"📍 <b>Kolom Dipulihkan:</b> {', '.join(kol_terdampak)}\n"
+                        f"👤 <b>Operator:</b> {escape_html(st.session_state.operator)}\n"
+                        f"🕒 <b>Waktu:</b> {get_waktu_jkt().strftime('%H:%M:%S WIB')}"
+                    )
+                    kirim_notif_telegram(pesan_undo)
                     st.rerun()
             st.markdown('</div>', unsafe_allow_html=True)
         with c_undo2:
@@ -305,7 +330,7 @@ elif st.session_state.slide == 2:
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ==========================================================
-# SLIDE 3: ITEM SPESIFIK (DETEKSI PACKAGING & BOLD WARNA)
+# SLIDE 3: ITEM SPESIFIK
 # ==========================================================
 elif st.session_state.slide == 3:
     if st.button("🔙 KEMBALI"): pindah_slide(2); st.rerun()
@@ -318,20 +343,14 @@ elif st.session_state.slide == 3:
         nama_brg = row['Nama Barang']
         part_num = str(row['Part Number']).strip().upper()
         
-        # Identifikasi tipe kemasan berdasarkan Part Number
-        # Mengubah akhiran D/G menjadi Dus, C menjadi Sac
         tipe_kemasan = ""
         if part_num:
             akhiran = part_num[-1]
-            if akhiran in ['D', 'G']:
-                tipe_kemasan = "[📦 DUS] "
-            elif akhiran == 'C':
-                tipe_kemasan = "[👝 SAC] "
+            if akhiran in ['D', 'G']: tipe_kemasan = "[📦 DUS] "
+            elif akhiran == 'C': tipe_kemasan = "[👝 SAC] "
+            elif akhiran == 'A': tipe_kemasan = "[🗃️ NICTAINER] "
                 
-        # Format nama barang agar warnanya tercetak tebal
         nama_terformat = format_nama_warna_bold(nama_brg)
-        
-        # Label final tombol
         btn_label = f"{tipe_kemasan}{nama_terformat}"
         
         if st.button(btn_label, use_container_width=True, key=f"btn_item_{idx}"): 
@@ -340,7 +359,7 @@ elif st.session_state.slide == 3:
             st.rerun()
 
 # ==========================================================
-# SLIDE 4: PENCARIAN LOKASI STOK (FIFO)
+# SLIDE 4: PENCARIAN LOKASI STOK (FIFO AKURAT TANGGAL)
 # ==========================================================
 elif st.session_state.slide == 4:
     if st.button("🔙 KEMBALI"): pindah_slide(3); st.rerun()
@@ -379,17 +398,18 @@ elif st.session_state.slide == 4:
                         
                     rekap_lokasi.append({
                         'Kolom': kol, 'Baris': bar, 'Lot Number': lot, 
+                        'FIFO_Key': parse_fifo_key(lot),
                         'Pallet': jml_utuh, 'Dus': jml_dus, 'Catatan': catatan, 'Part': part_num
                     })
                 
-                df_rekap = pd.DataFrame(rekap_lokasi).sort_values('Lot Number', ascending=True).reset_index(drop=True)
+                df_rekap = pd.DataFrame(rekap_lokasi).sort_values('FIFO_Key', ascending=True).reset_index(drop=True)
                 
                 for idx, row in df_rekap.iterrows():
                     fifo_label = "🌟 REKOMENDASI UTAMA" if idx == 0 else f"⭐ URUTAN {idx + 1}"
                     catatan_label = f"\n🔖 Catatan: {row['Catatan']}" if row['Catatan'] else ""
                     
                     btn_label = f"📍 RAK {row['Kolom']}-{row['Baris']}  |  🏷️ Lot: {row['Lot Number']}\n"
-                    btn_label += f"Stok: {row['Pallet']} Pallet, {row['Dus']} Dus\n"
+                    btn_label += f"Stok: {row['Pallet']} Pallet, {row['Dus']} Pecahan\n"
                     btn_label += f"{fifo_label}{catatan_label}"
                     
                     if st.button(btn_label, use_container_width=True, key=f"btn_loc_{idx}"):
@@ -408,16 +428,16 @@ elif st.session_state.slide == 5:
     with st.container(border=True):
         st.markdown(format_nama_warna_bold(st.session_state.item))
         st.markdown(f"**Tujuan:** Rak {st.session_state.pilih_kolom}-{st.session_state.pilih_baris} (Lot {st.session_state.pilih_lot})")
-        st.caption(f"Maksimal Tersedia: {st.session_state.max_pallet} Pallet, {st.session_state.max_dus} Dus")
+        st.caption(f"Maksimal Tersedia: {st.session_state.max_pallet} Pallet, {st.session_state.max_dus} Pecahan")
         
     st.write("")
     
     col_q1, col_q2 = st.columns(2)
     with col_q1: qty_pallet = st.number_input("PALLET UTUH", min_value=0, max_value=st.session_state.max_pallet, step=1, value=1 if st.session_state.max_pallet > 0 else 0)
-    with col_q2: qty_dus = st.number_input("DUS/SAC", min_value=0, max_value=st.session_state.max_dus, step=1, value=0)
+    with col_q2: qty_dus = st.number_input("PECAHAN (DUS/SAC)", min_value=0, max_value=st.session_state.max_dus, step=1, value=0)
     
     st.write("")
-    catatan_operator = st.text_input("📝 CATATAN (Opsional)", placeholder="Cth: Untuk HDI Bogor, atau Stok tidak aktual kurang 1 palet/dus")
+    catatan_operator = st.text_input("📝 CATATAN (Opsional)", placeholder="Cth: Untuk Line 2 / Stok kurang 1")
     
     st.write("")
     if qty_pallet == 0 and qty_dus == 0:
@@ -442,6 +462,19 @@ elif st.session_state.slide == 5:
                     
                     catat_log_mutasi("OUTBOUND (Remote)", k_pilih, b_pilih, st.session_state.item, st.session_state.pilih_part, lot_pilih, qty_pallet, qty_dus, 0, teks_keterangan)
                     
+                    # Kirim Notifikasi Telegram
+                    pesan_tele = (
+                        f"📤 <b>OUTBOUND - RACK NAVIGATOR</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"📦 <b>Item:</b> {escape_html(st.session_state.item)}\n"
+                        f"📍 <b>Rak:</b> {k_pilih}-{b_pilih} | <b>Lot:</b> <code>{escape_html(lot_pilih)}</code>\n"
+                        f"📊 <b>Qty:</b> {qty_pallet} Pallet, {qty_dus} Pecahan\n"
+                        f"👤 <b>Operator:</b> {escape_html(st.session_state.operator)}\n"
+                    )
+                    if catatan_operator.strip():
+                        pesan_tele += f"📝 <b>Catatan:</b> <i>{escape_html(catatan_operator.strip())}</i>\n"
+                    kirim_notif_telegram(pesan_tele)
+                    
                     get_all_racking_data.clear() 
                     
                     st.session_state.undo_dict = {k_pilih: data_sebelum_update}
@@ -461,4 +494,4 @@ elif st.session_state.slide == 5:
                 except ValueError as err:
                     st.error(f"❌ Transaksi Dibatalkan: {err}")
                 except Exception as err:
-                    st.error(f"❌ Kesalahan Sistem WMS: {err}")
+                    st.error(f"❌ Kesalahan Sistem: {err}")
