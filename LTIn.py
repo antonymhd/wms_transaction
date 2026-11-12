@@ -8,7 +8,7 @@ from firebase_admin import credentials, firestore
 # ==========================================================
 # 1. KONFIGURASI TAMPILAN & CSS ADAPTIF (INBOUND)
 # ==========================================================
-st.set_page_config(page_title="WMS Inbound - Remote", layout="centered", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Inbound - Rack Navigator", layout="centered", initial_sidebar_state="collapsed")
 
 st.markdown("""
     <style>
