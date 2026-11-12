@@ -332,7 +332,7 @@ elif st.session_state.slide == 4:
     st.info(format_nama_warna_bold(st.session_state.item))
     
     with st.container(border=True):
-        in_lot = st.text_input("Nomor Lot", value=st.session_state.in_lot if st.session_state.in_lot else "", placeholder="Cth: 3D3121126")
+        in_lot = st.text_input("Nomor Lot", value=st.session_state.in_lot if st.session_state.in_lot else "", placeholder="Wajib Diisi")
         
         c_q1, c_q2 = st.columns(2)
         with c_q1:
