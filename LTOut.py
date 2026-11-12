@@ -6,57 +6,99 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 
 # ==========================================================
-# 1. KONFIGURASI TAMPILAN MOBILE-FIRST (REMOTE)
+# 1. KONFIGURASI TAMPILAN MOBILE-FIRST & TEMA WARNA INDUSTRIAL
 # ==========================================================
 st.set_page_config(page_title="WMS Outbound - Remote", layout="centered", initial_sidebar_state="collapsed")
 
 st.markdown("""
     <style>
+        /* Sembunyikan elemen bawaan Streamlit yang tidak perlu di HP */
         #MainMenu {visibility: hidden;}
         header {visibility: hidden;}
         footer {visibility: hidden;}
         
+        /* Tema Dasar: Industrial Dark Clean (Nyaman di mata & tidak silau) */
+        .stApp {
+            background-color: #121824;
+            color: #F3F4F6;
+        }
+        
+        /* Styling Tombol Utama (Remote Control Style) */
         .stButton>button {
             min-height: 75px; 
             height: auto;
             font-size: 16px; 
             font-weight: 600;
-            border-radius: 10px;
-            border: 1px solid #444;
-            background-color: #222;
-            color: #fff;
+            border-radius: 12px;
+            border: 1px solid #2A3649;
+            background-color: #1E293B;
+            color: #F8FAFC;
             white-space: pre-wrap; 
             word-wrap: break-word;
             text-align: left; 
-            padding: 15px;
-            transition: all 0.2s ease-in-out;
+            padding: 16px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            transition: all 0.15s ease-in-out;
         }
-        .stButton>button:active { background-color: #444; border-color: #fff; }
         
+        .stButton>button:hover {
+            border-color: #3B82F6;
+            background-color: #334155;
+        }
+        
+        .stButton>button:active {
+            background-color: #2563EB;
+            border-color: #60A5FA;
+        }
+        
+        /* Tombol Eksekusi Akhir (Primary) - Biru Industri Menonjol */
         button[kind="primary"] {
-            background-color: #1E88E5 !important;
-            border-color: #1E88E5 !important;
-            font-size: 18px;
+            background-color: #2563EB !important;
+            border-color: #3B82F6 !important;
+            font-size: 18px !important;
             text-align: center !important;
+            box-shadow: 0 4px 12px rgba(37, 99, 235, 0.4) !important;
         }
         
-        /* Tombol Undo Merah Custom */
+        /* Tombol Undo Merah Khas Kesalahan */
         .btn-undo > button {
-            background-color: #D32F2F !important;
-            border-color: #D32F2F !important;
+            background-color: #DC2626 !important;
+            border-color: #EF4444 !important;
             text-align: center !important;
         }
         
+        /* Progress Bar / Step Indikator di Atas */
         .progress-container {
-            font-size: 14px;
+            font-size: 13px;
+            font-weight: 500;
             margin-bottom: 15px;
             padding-bottom: 10px;
-            border-bottom: 1px solid #333;
+            border-bottom: 1px solid #1E293B;
             text-align: center;
+            letter-spacing: 0.5px;
         }
-        .step-active { color: #42A5F5; font-weight: bold; }
-        .step-inactive { color: #666; }
-        div[data-testid="stMetricValue"] { font-size: 24px !important; }
+        .step-active { color: #60A5FA; font-weight: bold; background: rgba(59, 130, 246, 0.15); padding: 4px 8px; border-radius: 6px; }
+        .step-inactive { color: #64748B; }
+        
+        /* Kotak Info Database & Operator */
+        .db-info-box {
+            background-color: #1A2234;
+            border: 1px solid #2E3A59;
+            padding: 12px 16px;
+            border-radius: 10px;
+            margin-bottom: 15px;
+            box-shadow: inset 0 2px 4px rgba(0,0,0,0.2);
+        }
+        
+        div[data-testid="stMetricValue"] { font-size: 24px !important; color: #60A5FA !important; }
+        
+        /* Merapikan input teks agar kontras */
+        .stTextInput input {
+            background-color: #1E293B !important;
+            color: #F8FAFC !important;
+            border: 1px solid #334155 !important;
+            border-radius: 8px !important;
+        }
     </style>
 """, unsafe_allow_html=True)
 
@@ -168,7 +210,6 @@ def load_master_data():
 
 df_master = load_master_data()
 
-# INISIALISASI SEMUA STATE
 keys_state = ['slide', 'kategori', 'gramasi', 'item', 'pilih_kolom', 'pilih_baris', 'pilih_lot', 'pilih_part', 'max_pallet', 'max_dus', 'operator', 'action_msg', 'action_status', 'undo_dict']
 for key in keys_state:
     if key not in st.session_state:
@@ -180,29 +221,29 @@ for key in keys_state:
 
 def pindah_slide(tujuan): st.session_state.slide = tujuan
 
-# HEADER DATABASE STATUS
+# HEADER STATUS BERSIH & ELEGAN
 st.markdown(f"""
-    <div style="background-color: #1a1a1a; border: 1px solid #333; padding: 12px; border-radius: 8px; margin-bottom: 10px;">
-        <div style="font-size: 13px; color: #aaa; margin-bottom: 6px;">
-            📡 DB: <strong style="color: #4CAF50;">{NAMA_DATABASE}</strong>
+    <div class="db-info-box">
+        <div style="font-size: 13px; color: #94A3B8; margin-bottom: 4px;">
+            📡 Database WMS: <strong style="color: #38BDF8;">{NAMA_DATABASE}</strong>
         </div>
-        <div style="font-size: 13px; color: #aaa;">
-            👤 Aktif: <strong style="color: #fff;">{st.session_state.operator}</strong>
+        <div style="font-size: 13px; color: #94A3B8;">
+            👤 Operator Bertugas: <strong style="color: #F8FAFC;">{st.session_state.operator}</strong>
         </div>
     </div>
 """, unsafe_allow_html=True)
 
 # ==========================================================
-# 5. NOTIFIKASI & SISTEM UNDO (BATAL) - POSISI DI ATAS
+# 5. NOTIFIKASI & SISTEM UNDO
 # ==========================================================
 if st.session_state.action_status == 'DONE':
     with st.container(border=True):
-        st.success(f"✅ **SUKSES:** {st.session_state.action_msg}")
+        st.success(f"✅ **BERHASIL KELUAR:** {st.session_state.action_msg}")
         c_undo1, c_undo2 = st.columns(2)
         with c_undo1:
             st.markdown('<div class="btn-undo">', unsafe_allow_html=True)
-            if st.button("⏪ UNDO (BATAL)", use_container_width=True):
-                with st.spinner("Memulihkan stok..."):
+            if st.button("⏪ BATALKAN (UNDO)", use_container_width=True):
+                with st.spinner("Memulihkan posisi stok..."):
                     batch_undo = db.batch()
                     kol_terdampak = []
                     for kol, dat in st.session_state.undo_dict.items():
@@ -223,69 +264,70 @@ if st.session_state.action_status == 'DONE':
                 
 elif st.session_state.action_status == 'UNDONE':
     with st.container(border=True):
-        st.warning("⏪ **Aksi dibatalkan.** Stok telah kembali seperti semula.")
+        st.warning("⏪ **Transaksi dibatalkan.** Stok kembali ke posisi semula.")
         if st.button("TUTUP PESAN", use_container_width=True):
             st.session_state.action_status = None
             st.rerun()
 
-# RENDER PROGRESS BAR
+# PROGRESS BAR VISUAL
 def render_progress():
     steps = ["Kategori", "Gramasi", "Item", "Lokasi", "Selesai"]
     current = st.session_state.slide
     html = "<div class='progress-container'>"
     for i, s in enumerate(steps, 1):
-        if i == current: html += f"<span class='step-active'>[{i}] {s}</span>"
-        else: html += f"<span class='step-inactive'>[{i}]</span>"
-        if i < len(steps): html += " ➔ "
+        if i == current: html += f"<span class='step-active'>{s}</span>"
+        else: html += f"<span class='step-inactive'>{s}</span>"
+        if i < len(steps): html += " <span style='color: #475569;'>➔</span> "
     html += "</div>"
     st.markdown(html, unsafe_allow_html=True)
 
 render_progress()
 
 # ==========================================================
-# UI SLIDE 1-3: NAVIGASI PRODUK
+# SLIDE 1-3: NAVIGASI PRODUK
 # ==========================================================
 if st.session_state.slide == 1:
-    st.markdown("### 🎛️ Remote Outbound")
+    st.markdown("### 🎛️ Remote Outbound - Pilih Kategori")
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("🧪 PREFORM", use_container_width=True): st.session_state.kategori = "PREFORM"; pindah_slide(2); st.rerun()
-        if st.button("🎨 CUP COLOR", use_container_width=True): st.session_state.kategori = "CUP COLOR"; pindah_slide(2); st.rerun()
-        if st.button("🧢 CAP (TUTUP)", use_container_width=True): st.session_state.kategori = "CAP"; pindah_slide(2); st.rerun()
+        if st.button("🧪  PREFORM", use_container_width=True): st.session_state.kategori = "PREFORM"; pindah_slide(2); st.rerun()
+        if st.button("🎨  CUP COLOR", use_container_width=True): st.session_state.kategori = "CUP COLOR"; pindah_slide(2); st.rerun()
+        if st.button("🧢  CAP (TUTUP)", use_container_width=True): st.session_state.kategori = "CAP"; pindah_slide(2); st.rerun()
     with col2:
-        if st.button("🥤 CUP NATURAL", use_container_width=True): st.session_state.kategori = "CUP NATURAL"; pindah_slide(2); st.rerun()
-        if st.button("🖨️ CUP PRINTING", use_container_width=True): st.session_state.kategori = "CUP PRINTING"; pindah_slide(2); st.rerun()
+        if st.button("🥤  CUP NATURAL", use_container_width=True): st.session_state.kategori = "CUP NATURAL"; pindah_slide(2); st.rerun()
+        if st.button("🖨️  CUP PRINTING", use_container_width=True): st.session_state.kategori = "CUP PRINTING"; pindah_slide(2); st.rerun()
 
 elif st.session_state.slide == 2:
-    if st.button("🔙 KEMBALI KATEGORI"): pindah_slide(1); st.rerun()
-    st.markdown(f"### VARIAN GRAMASI **{st.session_state.kategori}**:")
+    if st.button("🔙 KEMBALI KE KATEGORI"): pindah_slide(1); st.rerun()
+    st.markdown(f"### Pilih Gramasi: **{st.session_state.kategori}**")
     df_kat = df_master[df_master['Kategori'] == st.session_state.kategori]
     list_gramasi = sorted(df_kat['Gramasi'].unique())
     for i in range(0, len(list_gramasi), 2):
         cols = st.columns(2)
         with cols[0]:
-            if st.button(f"⚖️ {list_gramasi[i]}", key=f"g_{i}", use_container_width=True): st.session_state.gramasi = list_gramasi[i]; pindah_slide(3); st.rerun()
+            if st.button(f"⚖️  {list_gramasi[i]}", key=f"g_{i}", use_container_width=True): st.session_state.gramasi = list_gramasi[i]; pindah_slide(3); st.rerun()
         if i + 1 < len(list_gramasi):
             with cols[1]:
-                if st.button(f"⚖️ {list_gramasi[i+1]}", key=f"g_{i+1}", use_container_width=True): st.session_state.gramasi = list_gramasi[i+1]; pindah_slide(3); st.rerun()
+                if st.button(f"⚖️  {list_gramasi[i+1]}", key=f"g_{i+1}", use_container_width=True): st.session_state.gramasi = list_gramasi[i+1]; pindah_slide(3); st.rerun()
 
 elif st.session_state.slide == 3:
-    if st.button("🔙 GANTI GRAMASI"): pindah_slide(2); st.rerun()
-    st.markdown(f"### PILIH ITEM:")
+    if st.button("🔙 KEMBALI KE GRAMASI"): pindah_slide(2); st.rerun()
+    st.markdown(f"### Pilih Item Spesifik:")
+    st.caption(f"Kategori: {st.session_state.kategori} | Gramasi: {st.session_state.gramasi}")
     df_item = df_master[(df_master['Kategori'] == st.session_state.kategori) & (df_master['Gramasi'] == st.session_state.gramasi)]
     list_item = df_item['Nama Barang'].tolist()
     for item in list_item:
-        if st.button(f"📦 {item}", use_container_width=True): st.session_state.item = item; pindah_slide(4); st.rerun()
+        if st.button(f"📦  {item}", use_container_width=True): st.session_state.item = item; pindah_slide(4); st.rerun()
 
 # ==========================================================
-# SLIDE 4: PENCARIAN STOK (CACHE)
+# SLIDE 4: PENCARIAN LOKASI STOK (FIFO)
 # ==========================================================
 elif st.session_state.slide == 4:
-    if st.button("🔙 GANTI ITEM"): pindah_slide(3); st.rerun()
-    st.markdown("### PILIH LOKASI & LOT BARANG")
-    st.info(f"{st.session_state.item}")
+    if st.button("🔙 KEMBALI KE ITEM"): pindah_slide(3); st.rerun()
+    st.markdown("### Lokasi Target (FIFO)")
+    st.info(f"Item: **{st.session_state.item}**")
     
-    with st.spinner("🔍 Mencari lokasi stok di gudang..."):
+    with st.spinner("🔍 Memindai data stok gudang..."):
         semua_data = get_all_racking_data()
         
         if not semua_data:
@@ -323,10 +365,10 @@ elif st.session_state.slide == 4:
                 df_rekap = pd.DataFrame(rekap_lokasi).sort_values('Lot Number', ascending=True).reset_index(drop=True)
                 
                 for idx, row in df_rekap.iterrows():
-                    fifo_label = "🌟 URUTAN 1 (PALING TUA - DIREKOMENDASIKAN)" if idx == 0 else f"⭐ URUTAN {idx + 1}"
+                    fifo_label = "🌟 REKOMENDASI UTAMA (URUTAN 1)" if idx == 0 else f"⭐ URUTAN {idx + 1}"
                     catatan_label = f"\n🔖 Catatan: {row['Catatan']}" if row['Catatan'] else ""
                     
-                    btn_label = f"📍 RAK {row['Kolom']}-{row['Baris']} | 🏷️ Lot: {row['Lot Number']}\n"
+                    btn_label = f"📍 RAK {row['Kolom']}-{row['Baris']}  |  🏷️ Lot: {row['Lot Number']}\n"
                     btn_label += f"📦 Tersedia: {row['Pallet']} Pallet, {row['Dus']} Dus\n"
                     btn_label += f"{fifo_label}{catatan_label}"
                     
@@ -337,35 +379,33 @@ elif st.session_state.slide == 4:
                         pindah_slide(5); st.rerun()
 
 # ==========================================================
-# SLIDE 5: EKSEKUSI FIREBASE TRANSACTION & CATATAN
+# SLIDE 5: KONFIRMASI & EKSEKUSI PENGELUARAN
 # ==========================================================
 elif st.session_state.slide == 5:
-    col_back, _ = st.columns([1, 2])
-    if col_back.button("🔙 GANTI LOKASI"): pindah_slide(4); st.rerun()
+    if st.button("🔙 KEMBALI KE PILIH LOKASI"): pindah_slide(4); st.rerun()
         
-    st.markdown("### KONFIRMASI PENGELUARAN")
+    st.markdown("### Konfirmasi Pengeluaran")
     with st.container(border=True):
         st.markdown(f"**Item:** {st.session_state.item}")
-        st.markdown(f"**Rak:** {st.session_state.pilih_kolom}-{st.session_state.pilih_baris} | **Lot:** {st.session_state.pilih_lot}")
-        st.caption(f"Stok Fisik: {st.session_state.max_pallet} Pallet, {st.session_state.max_dus} Dus")
+        st.markdown(f"**Rak Tujuan:** {st.session_state.pilih_kolom}-{st.session_state.pilih_baris}  |  **Lot:** {st.session_state.pilih_lot}")
+        st.caption(f"Maksimal Stok Tersedia: {st.session_state.max_pallet} Pallet, {st.session_state.max_dus} Dus")
         
     st.write("")
-    st.markdown("**JUMLAH YANG AKAN DIAMBIL:**")
+    st.markdown("**MASUKKAN JUMLAH DIAMBIL:**")
     
     col_q1, col_q2 = st.columns(2)
     with col_q1: qty_pallet = st.number_input("PALLET UTUH", min_value=0, max_value=st.session_state.max_pallet, step=1, value=1 if st.session_state.max_pallet > 0 else 0)
     with col_q2: qty_dus = st.number_input("DUS PECAHAN", min_value=0, max_value=st.session_state.max_dus, step=1, value=0)
     
     st.write("")
-    # TAMBAHAN: Input Catatan Operator (Untuk siapa / Kendala fisik aktual)
     catatan_operator = st.text_input("📝 CATATAN / KENDALA (Opsional)", placeholder="Cth: Untuk Line 2 / Fisik kurang 1 pallet")
     
     st.write("")
     if qty_pallet == 0 and qty_dus == 0:
         st.warning("⚠️ Masukkan minimal 1 Qty untuk dikeluarkan.")
     else:
-        if st.button("🚀 KELUARKAN BARANG", type="primary", use_container_width=True):
-            with st.spinner("Memproses transaksi terisolasi..."):
+        if st.button("🚀 KELUARKAN BARANG SEKARANG", type="primary", use_container_width=True):
+            with st.spinner("Mengamankan transaksi & memperbarui database..."):
                 
                 k_pilih = st.session_state.pilih_kolom
                 b_pilih = st.session_state.pilih_baris
@@ -375,20 +415,16 @@ elif st.session_state.slide == 5:
                 transaction = db.transaction() 
                 
                 try:
-                    # Jalankan transaksi pengambilan barang
                     data_sebelum_update = proses_outbound_transaction(transaction, doc_ref, b_pilih, lot_pilih, qty_pallet)
                     
-                    # Format teks keterangan log mutasi (Menggabungkan info operator & catatan khusus)
                     teks_keterangan = f"Dieksekusi oleh: {st.session_state.operator}"
                     if catatan_operator.strip():
                         teks_keterangan += f" | Catatan: {catatan_operator.strip()}"
                     
-                    # Catat log mutasi ke Firebase
                     catat_log_mutasi("OUTBOUND (Remote)", k_pilih, b_pilih, st.session_state.item, st.session_state.pilih_part, lot_pilih, qty_pallet, qty_dus, 0, teks_keterangan)
                     
                     get_all_racking_data.clear() 
                     
-                    # SETUP NOTIFIKASI & BACKUP UNDO
                     st.session_state.undo_dict = {k_pilih: data_sebelum_update}
                     st.session_state.action_msg = f"{qty_pallet} Pallet dikeluarkan dari Rak {k_pilih}-{b_pilih}."
                     if catatan_operator.strip():
@@ -397,7 +433,6 @@ elif st.session_state.slide == 5:
                     
                     st.toast(st.session_state.action_msg, icon="✅")
                     
-                    # KEMBALI KE SLIDE 1
                     for k in ['kategori', 'gramasi', 'item', 'pilih_kolom', 'pilih_baris', 'pilih_lot', 'pilih_part', 'max_pallet', 'max_dus']:
                         st.session_state[k] = None
                     pindah_slide(1)
