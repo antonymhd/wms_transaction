@@ -94,74 +94,120 @@ def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh,
     except Exception: pass 
 
 # ==========================================================
-# SLIDE 3: ITEM SPESIFIK
+# 3. FIREBASE TRANSACTIONS & CACHE
 # ==========================================================
-elif st.session_state.slide == 3:
-    if st.button("🔙 KEMBALI"): pindah_slide(2); st.rerun()
-    st.markdown(f"### Pilih Barang Masuk")
-    st.caption(f"{st.session_state.kategori} | {st.session_state.gramasi}")
+@st.cache_data(ttl=300)
+def get_all_racking_data():
+    docs = db.collection(NAMA_DATABASE).stream()
+    semua_data = []
+    for doc in docs:
+        doc_data = doc.to_dict()
+        if 'data' in doc_data: semua_data.extend(doc_data['data'])
+    return semua_data
+
+@firestore.transactional
+def proses_inbound_transaction(transaction, doc_ref, k_pilih, b_pilih, lot_pilih, part_num, item_name, qty_pallet, qty_pecahan, tipe_pecahan, catatan):
+    snapshot = doc_ref.get(transaction=transaction)
     
-    df_item = df_master[(df_master['Kategori'] == st.session_state.kategori) & (df_master['Gramasi'] == st.session_state.gramasi)]
+    all_col_data = snapshot.to_dict().get('data', []) if snapshot.exists else []
+    data_lama_sebelum_update = all_col_data.copy()
     
-    for idx, row in df_item.iterrows():
-        nama_brg = row['Nama Barang']
-        part_num = str(row['Part Number']).strip().upper()
+    rak_ini = [d for d in all_col_data if float(d.get('Baris', 0) or 0) == float(b_pilih)]
+    rak_lain = [d for d in all_col_data if float(d.get('Baris', 0) or 0) != float(b_pilih)]
+    
+    max_pallet = 0
+    if rak_ini:
+        max_pallet = int(max([float(d.get('Pallet Ke', 0)) for d in rak_ini]))
         
-        tipe_kemasan = ""
-        if part_num:
-            if part_num[-1] in ['D', 'G']: tipe_kemasan = "[📦 DUS] "
-            elif part_num[-1] == 'C': tipe_kemasan = "[👝 SAK] "
-            elif part_num[-1] == 'A': tipe_kemasan = "[🗃️ NICTAINER] "
-                
-        nama_terformat = format_nama_warna_bold(nama_brg)
-        btn_label = f"{tipe_kemasan}{nama_terformat}"
+    pallets_baru = []
+    # 1. Tambah Pallet Utuh
+    for i in range(qty_pallet):
+        pallets_baru.append({
+            'Kolom': k_pilih, 'Baris': float(b_pilih),
+            'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
+            'Keterangan': 'Utuh', 'Catatan': catatan,
+            'Pallet Ke': float(max_pallet + 1 + i)
+        })
         
-        if st.button(btn_label, use_container_width=True, key=f"btn_item_{idx}"): 
-            st.session_state.item = nama_brg
-            st.session_state.pilih_part = part_num
-            pindah_slide(4)
-            st.rerun()
+    # 2. Tambah Pallet Pecahan
+    if qty_pecahan > 0:
+        pallets_baru.append({
+            'Kolom': k_pilih, 'Baris': float(b_pilih),
+            'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
+            'Keterangan': f"Pecahan: {qty_pecahan} {tipe_pecahan}", 'Catatan': catatan,
+            'Pallet Ke': float(max_pallet + 1 + qty_pallet)
+        })
+        
+    rak_ini.extend(pallets_baru)
+    
+    rak_ini = sorted(rak_ini, key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
+    for i, d in enumerate(rak_ini, 1):
+        d['Pallet Ke'] = float(i)
+        
+    final_data = rak_lain + rak_ini
+    
+    if snapshot.exists: transaction.update(doc_ref, {'data': final_data})
+    else: transaction.set(doc_ref, {'data': final_data})
+        
+    return data_lama_sebelum_update 
 
 # ==========================================================
-# SLIDE 4: INPUT DATA DATANG (LOT & QTY)
+# 4. MASTER PRODUK & FORMATTING
 # ==========================================================
-elif st.session_state.slide == 4:
-    if st.button("🔙 KEMBALI KE ITEM"): pindah_slide(3); st.rerun()
-    
-    st.markdown("### Detail Barang Masuk")
-    st.info(format_nama_warna_bold(st.session_state.item))
-    
-    # Deteksi Otomatis Satuan Pecahan berdasarkan huruf terakhir Part Number
-    part_num = str(st.session_state.pilih_part).strip().upper()
-    if part_num.endswith('C'): 
-        satuan_otomatis = "Sak"
-    elif part_num.endswith('A'): 
-        satuan_otomatis = "Nictainer"
-    else: # Default untuk D atau G
-        satuan_otomatis = "Dus"
-        
-    with st.container(border=True):
-        in_lot = st.text_input("Nomor Lot", value=st.session_state.in_lot if st.session_state.in_lot else "", placeholder="Cth: 3D3121126")
-        
-        c_q1, c_q2 = st.columns(2)
-        with c_q1:
-            in_qty_p = st.number_input("Pallet Utuh", min_value=0, value=st.session_state.in_qty_p if st.session_state.in_qty_p else 1)
-        with c_q2:
-            # Label input dinamis menyesuaikan satuan yang terdeteksi
-            in_qty_c = st.number_input(f"Qty Pecahan ({satuan_otomatis})", min_value=0, value=st.session_state.in_qty_c if st.session_state.in_qty_c else 0)
-            
-    st.write("")
-    if st.button("🔍 CARI LOKASI RAK (KONSOLIDASI)", type="primary", use_container_width=True):
-        if not in_lot.strip(): st.error("⚠️ Nomor Lot wajib diisi!")
-        elif in_qty_p == 0 and in_qty_c == 0: st.error("⚠️ Masukkan minimal 1 kuantitas!")
-        else:
-            st.session_state.in_lot = in_lot.strip()
-            st.session_state.in_qty_p = in_qty_p
-            st.session_state.in_qty_c = in_qty_c
-            # Simpan satuan yang terdeteksi ke state agar log mutasi tetap akurat
-            st.session_state.in_tipe_c = satuan_otomatis 
-            pindah_slide(5)
-            st.rerun()
+def ekstrak_gramasi(nama_produk):
+    match = re.search(r'(\d+[.,]\d+)\s*(?:gr|GR)', str(nama_produk), re.IGNORECASE)
+    if match: return f"{float(match.group(1).replace(',', '.')):.2f} gr"
+    return "Lainnya"
+
+def set_kategori(nama):
+    nama_str = str(nama).strip().upper()
+    if nama_str.startswith('PREFORM'): return 'PREFORM'
+    elif nama_str.startswith('CUP NATURAL'): return 'CUP NATURAL'
+    elif nama_str.startswith('CUP PRINTING'): return 'CUP PRINTING'
+    elif nama_str.startswith('CUP COLOR'): return 'CUP COLOR'
+    elif nama_str.startswith('CAP'): return 'CAP'
+    else: return 'LAINNYA'
+
+def format_nama_warna_bold(nama_barang):
+    parts = str(nama_barang).rsplit(',', 1)
+    if len(parts) == 2: return f"{parts[0]}, **{parts[1].strip()}**"
+    return str(nama_barang)
+
+@st.cache_data(ttl=3600)
+def load_master_data():
+    try:
+        df = pd.read_csv("Master_Produk.csv", sep=";", dtype=str)
+        df = df.dropna(subset=['Nama Barang'])
+        df['Kategori'] = df['Nama Barang'].apply(set_kategori)
+        df['Gramasi'] = df['Nama Barang'].apply(ekstrak_gramasi)
+        if 'Part Number' not in df.columns: df['Part Number'] = ""
+        return df
+    except Exception: return pd.DataFrame(columns=['Nama Barang', 'Kategori', 'Gramasi', 'Part Number'])
+
+df_master = load_master_data()
+
+keys_state = ['slide', 'kategori', 'gramasi', 'item', 'pilih_part', 'in_lot', 'in_qty_p', 'in_qty_c', 'in_tipe_c', 'pilih_kolom', 'pilih_baris', 'operator', 'action_msg', 'action_status', 'undo_dict']
+for key in keys_state:
+    if key not in st.session_state:
+        if key == 'operator': st.session_state[key] = "Operator 1 (Default)"
+        elif key == 'slide': st.session_state[key] = 1
+        elif key == 'undo_dict': st.session_state[key] = {}
+        elif key == 'action_msg': st.session_state[key] = ""
+        else: st.session_state[key] = None
+
+def pindah_slide(tujuan): st.session_state.slide = tujuan
+
+# HEADER STATUS 
+st.markdown(f"""
+    <div class="db-info-box">
+        <div style="font-size: 13px; opacity: 0.8; margin-bottom: 4px;">
+            📡 Database WMS: <strong style="color: #10B981;">{NAMA_DATABASE} (INBOUND)</strong>
+        </div>
+        <div style="font-size: 13px; opacity: 0.8;">
+            👤 Operator Bertugas: <strong>{st.session_state.operator}</strong>
+        </div>
+    </div>
+""", unsafe_allow_html=True)
 
 # ==========================================================
 # 5. NOTIFIKASI & SISTEM UNDO
@@ -202,7 +248,6 @@ elif st.session_state.action_status == 'UNDONE':
 def render_progress():
     steps = ["Kategori", "Item", "Input", "Lokasi", "Selesai"]
     current = st.session_state.slide
-    # Mapping slide to progress step (karena slide 2 & 3 digabung di progress bar)
     idx_map = {1:1, 2:1, 3:2, 4:3, 5:4, 6:5}
     curr_step = idx_map.get(current, 1)
     
@@ -210,7 +255,7 @@ def render_progress():
     for i, s in enumerate(steps, 1):
         if i == curr_step: html += f"<span class='step-active'>{s}</span>"
         else: html += f"<span class='step-inactive'>{s}</span>"
-        if i < len(steps): html += " <span style='color: #475569;'>➔</span> "
+        if i < len(steps): html += " <span style='opacity: 0.5;'>➔</span> "
     html += "</div>"
     st.markdown(html, unsafe_allow_html=True)
 
@@ -247,7 +292,7 @@ elif st.session_state.slide == 2:
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ==========================================================
-# SLIDE 3: ITEM SPESIFIK
+# SLIDE 3: ITEM SPESIFIK & KEMASAN OTOMATIS
 # ==========================================================
 elif st.session_state.slide == 3:
     if st.button("🔙 KEMBALI"): pindah_slide(2); st.rerun()
@@ -263,7 +308,8 @@ elif st.session_state.slide == 3:
         tipe_kemasan = ""
         if part_num:
             if part_num[-1] in ['D', 'G']: tipe_kemasan = "[📦 DUS] "
-            elif part_num[-1] == 'C': tipe_kemasan = "[👝 SAC] "
+            elif part_num[-1] == 'C': tipe_kemasan = "[👝 SAK] "
+            elif part_num[-1] == 'A': tipe_kemasan = "[🗃️ NICTAINER] "
                 
         nama_terformat = format_nama_warna_bold(nama_brg)
         btn_label = f"{tipe_kemasan}{nama_terformat}"
@@ -275,7 +321,7 @@ elif st.session_state.slide == 3:
             st.rerun()
 
 # ==========================================================
-# SLIDE 4: INPUT DATA DATANG (LOT & QTY)
+# SLIDE 4: INPUT DATA (TANPA DROPDOWN PECAHAN)
 # ==========================================================
 elif st.session_state.slide == 4:
     if st.button("🔙 KEMBALI KE ITEM"): pindah_slide(3); st.rerun()
@@ -283,17 +329,20 @@ elif st.session_state.slide == 4:
     st.markdown("### Detail Barang Masuk")
     st.info(format_nama_warna_bold(st.session_state.item))
     
+    part_num = str(st.session_state.pilih_part).strip().upper()
+    if part_num.endswith('C'): satuan_otomatis = "Sak"
+    elif part_num.endswith('A'): satuan_otomatis = "Nictainer"
+    else: satuan_otomatis = "Dus"
+        
     with st.container(border=True):
-        in_lot = st.text_input("Nomor Lot", value=st.session_state.in_lot if st.session_state.in_lot else "", placeholder="Wajib Diisi")
+        in_lot = st.text_input("Nomor Lot", value=st.session_state.in_lot if st.session_state.in_lot else "", placeholder="Cth: 3D3121126")
         
         c_q1, c_q2 = st.columns(2)
         with c_q1:
             in_qty_p = st.number_input("Pallet Utuh", min_value=0, value=st.session_state.in_qty_p if st.session_state.in_qty_p else 1)
         with c_q2:
-            in_qty_c = st.number_input("Qty Pecahan", min_value=0, value=st.session_state.in_qty_c if st.session_state.in_qty_c else 0)
+            in_qty_c = st.number_input(f"Qty Pecahan ({satuan_otomatis})", min_value=0, value=st.session_state.in_qty_c if st.session_state.in_qty_c else 0)
             
-        in_tipe_c = st.selectbox("Satuan Pecahan", ["Dus", "Sak"], index=0 if st.session_state.in_tipe_c == "Dus" else 1)
-        
     st.write("")
     if st.button("🔍 CARI LOKASI RAK (KONSOLIDASI)", type="primary", use_container_width=True):
         if not in_lot.strip(): st.error("⚠️ Nomor Lot wajib diisi!")
@@ -302,7 +351,7 @@ elif st.session_state.slide == 4:
             st.session_state.in_lot = in_lot.strip()
             st.session_state.in_qty_p = in_qty_p
             st.session_state.in_qty_c = in_qty_c
-            st.session_state.in_tipe_c = in_tipe_c
+            st.session_state.in_tipe_c = satuan_otomatis 
             pindah_slide(5)
             st.rerun()
 
@@ -327,7 +376,6 @@ elif st.session_state.slide == 5:
             except: continue
             if f"{k}-{b}" in slot_map: slot_map[f"{k}-{b}"].append(d)
                 
-        # Deteksi tipe kemasan barang yang mau masuk
         in_is_sac = str(st.session_state.pilih_part).strip().upper().endswith('C')
         
         valid_slots = []
@@ -335,6 +383,7 @@ elif st.session_state.slide == 5:
             k, b = loc.split('-')
             b = int(b)
             
+            # Asumsi kapasitas Nictainer (A) sama dengan Dus (D/G) pada kalkulasi ini
             max_sac = 31 if b <= 16 else 44
             max_dus = 32 if b <= 16 else 46
             
@@ -342,7 +391,6 @@ elif st.session_state.slide == 5:
             mix_item = False
             item_sejenis = 0
             
-            # Hitung isi baris saat ini
             for p in pallets:
                 if str(p.get('Nama Produk', '')) != st.session_state.item:
                     mix_item = True
@@ -353,15 +401,12 @@ elif st.session_state.slide == 5:
                 if p_part.endswith('C'): used_cap += 1.0 / max_sac
                 else: used_cap += 1.0 / max_dus
                 
-            # Filter Keras 1: Dilarang Mix Item!
             if mix_item: continue 
             
-            # Hitung beban dimensi barang yang mau masuk
             inc_cap = (st.session_state.in_qty_p / max_sac) if in_is_sac else (st.session_state.in_qty_p / max_dus)
             if st.session_state.in_qty_c > 0:
                 inc_cap += (1.0 / max_sac) if in_is_sac else (1.0 / max_dus)
                 
-            # Filter Keras 2: Rak Kepenuhan (toleransi akurasi float 0.0001)
             if used_cap + inc_cap > 1.0001: continue 
             
             status = "🟢 KONSOLIDASI (SEJENIS)" if item_sejenis > 0 else "⚪ KOSONG (BARU)"
@@ -371,12 +416,11 @@ elif st.session_state.slide == 5:
             })
             
         if not valid_slots:
-            st.error("❌ Tidak ada rak yang memiliki kapasitas cukup untuk jumlah barang ini tanpa mencampur jenis produk!")
+            st.error("❌ Tidak ada rak yang memiliki kapasitas cukup tanpa mencampur produk yang berbeda!")
         else:
-            # Sorting: Prioritaskan rak Konsolidasi yang paling penuh duluan, lalu rak kosong
             df_slots = pd.DataFrame(valid_slots)
             df_slots['Priority'] = df_slots['Status'].apply(lambda x: 1 if 'KONSOLIDASI' in x else 2)
-            df_slots = df_slots.sort_values(by=['Priority', 'UsedCap'], ascending=[True, False]).head(8) # Tampilkan top 8 saja
+            df_slots = df_slots.sort_values(by=['Priority', 'UsedCap'], ascending=[True, False]).head(8)
             
             for idx, row in df_slots.iterrows():
                 prio_label = "🌟 REKOMENDASI TERBAIK" if idx == 0 else ""
