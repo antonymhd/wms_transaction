@@ -417,7 +417,7 @@ elif st.session_state.slide == 5:
     with col_q2: qty_dus = st.number_input("DUS/SAC", min_value=0, max_value=st.session_state.max_dus, step=1, value=0)
     
     st.write("")
-    catatan_operator = st.text_input("📝 CATATAN (Opsional)", placeholder="Cth: Untuk Line 2 / Stok kurang 1")
+    catatan_operator = st.text_input("📝 CATATAN (Opsional)", placeholder="Cth: Untuk HDI Bogor, atau Stok tidak aktual kurang 1 palet/dus")
     
     st.write("")
     if qty_pallet == 0 and qty_dus == 0:
