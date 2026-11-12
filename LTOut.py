@@ -8,7 +8,7 @@ from firebase_admin import credentials, firestore
 # ==========================================================
 # 1. KONFIGURASI TAMPILAN & CSS ADAPTIF (GELAP/TERANG)
 # ==========================================================
-st.set_page_config(page_title="WMS Outbound - Remote", layout="centered", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Outbound - Rack Navigator", layout="centered", initial_sidebar_state="collapsed")
 
 # Menghapus hardcode background-color agar Streamlit mengikuti Tema Sistem (Gelap/Terang)
 st.markdown("""
