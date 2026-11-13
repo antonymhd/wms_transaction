@@ -170,10 +170,6 @@ def get_all_racking_data():
 
 @firestore.transactional
 def proses_inbound_multi_transaction(transaction, doc_refs_dict, alokasi_list, lot_pilih, part_num, item_name, tipe_pecahan, catatan):
-    """
-    Mengeksekusi penempatan inbound ke 1 atau beberapa rak sekaligus secara atomik.
-    alokasi_list: [{'Kolom': 'B', 'Baris': 18, 'qty_p': 14, 'qty_c': 0}, ...]
-    """
     snapshots = {}
     for kol, ref in doc_refs_dict.items():
         snapshots[kol] = ref.get(transaction=transaction)
@@ -512,7 +508,7 @@ elif st.session_state.slide == 4:
             st.rerun()
 
 # ==========================================================
-# SLIDE 5: PENCARIAN & ALOKASI KAPASITAS RAK (3 PRIORITAS)
+# SLIDE 5: PENCARIAN & ALOKASI KAPASITAS RAK (BUFFER SAK + SKIP)
 # ==========================================================
 elif st.session_state.slide == 5:
     if st.button("🔙 UBAH INPUT"): pindah_slide(4); st.rerun()
@@ -550,26 +546,31 @@ elif st.session_state.slide == 5:
             
             used_cap = 0.0
             distinct_items = set()
+            has_sac = False
             
             for p in pallets:
                 p_name = str(p.get('Nama Produk', '')).strip()
                 if p_name:
                     distinct_items.add(p_name)
                 p_part = str(p.get('Part Number', '')).strip().upper()
-                if p_part.endswith('C'): used_cap += 1.0 / max_sac
-                else: used_cap += 1.0 / max_dus
+                if p_part.endswith('C'):
+                    has_sac = True
+                    used_cap += 1.0 / max_sac
+                else:
+                    used_cap += 1.0 / max_dus
                 
-            # Hitung sisa slot pallet yang muat untuk item masuk
             sisa_cap = max(0.0, 1.0001 - used_cap)
             sisa_slot_pallet = int(math.floor(sisa_cap * max_target))
             
+            # BUFFER FISIK KEMASAN SAK:
+            # Karena dimensi sak tidak konsisten, sisa 1 slot teoritis di lapangan seringkali sudah mentok/penuh
+            if (in_is_sac or has_sac) and sisa_slot_pallet <= 1:
+                continue
+                
             if sisa_slot_pallet <= 0:
                 continue
                 
             # Klasifikasi 3 Tingkat Prioritas:
-            # 1: Melanjutkan slot dengan isi 100% sejenis
-            # 2: Baris kosong
-            # 3: Baris terisi 1 jenis produk berbeda (sehingga maksimal 2 jenis item di baris tsb)
             if len(distinct_items) == 1 and target_item in distinct_items:
                 prio = 1
                 status = "🟢 KONSOLIDASI (SEJENIS)"
@@ -584,11 +585,10 @@ elif st.session_state.slide == 5:
                 item_lain = list(distinct_items)[0]
                 isi_eksisting = f"1 Item lain ({item_lain[:22]}...)" if len(item_lain) > 22 else f"1 Item lain ({item_lain})"
             else:
-                # Sudah berisi >= 2 jenis item berbeda -> dilarang ditambah item baru
                 continue
                 
             kandidat_rak.append({
-                'Kolom': k, 'Baris': b, 'Priority': prio, 'Status': status,
+                'Loc': loc, 'Kolom': k, 'Baris': b, 'Priority': prio, 'Status': status,
                 'IsiEksisting': isi_eksisting, 'UsedCap': used_cap,
                 'MaxTarget': max_target, 'SisaSlot': sisa_slot_pallet
             })
@@ -597,13 +597,23 @@ elif st.session_state.slide == 5:
             st.error("❌ Seluruh rak penuh atau sudah berisi 2 jenis item berbeda!")
         else:
             df_kandidat = pd.DataFrame(kandidat_rak)
-            # Urutkan: Prioritas (1 -> 2 -> 3), lalu yang paling terisi dulu (rapat), lalu urutan Kolom & Baris
             df_kandidat = df_kandidat.sort_values(
                 by=['Priority', 'UsedCap', 'Kolom', 'Baris'],
                 ascending=[True, False, True, True]
             ).reset_index(drop=True)
             
-            # Cek apakah ada rak tunggal yang sanggup menampung SEMUA slot sekaligus
+            if in_is_sac:
+                st.caption("🛡️ *Filter aktif: Rak Sak dengan sisa ≤ 1 slot otomatis dilewati karena toleransi panjang fisik.*")
+                
+            # Fitur Lewati Rak secara manual jika di lapangan ternyata sudah penuh fisik
+            rak_skip = st.multiselect(
+                "🚫 Lewati Rak (Jika di lapangan sudah penuh / terhalang):",
+                options=df_kandidat['Loc'].tolist(),
+                placeholder="Pilih rak untuk dilewati (opsional)..."
+            )
+            if rak_skip:
+                df_kandidat = df_kandidat[~df_kandidat['Loc'].isin(rak_skip)].reset_index(drop=True)
+                
             df_single_muat = df_kandidat[df_kandidat['SisaSlot'] >= total_slot_butuh].reset_index(drop=True)
             
             if not df_single_muat.empty:
@@ -626,12 +636,11 @@ elif st.session_state.slide == 5:
                         pindah_slide(6)
                         st.rerun()
             else:
-                # MODE MULTI-RACK ALLOCATION (Contoh: 60 Palet dipecah ke beberapa rak)
-                total_kapasitas_gudang = int(df_kandidat['SisaSlot'].sum())
+                total_kapasitas_gudang = int(df_kandidat['SisaSlot'].sum()) if not df_kandidat.empty else 0
                 if total_kapasitas_gudang < total_slot_butuh:
-                    st.error(f"❌ Total sisa kapasitas seluruh gudang ({total_kapasitas_gudang} palet) tidak mencukupi untuk menampung {total_slot_butuh} palet!")
+                    st.error(f"❌ Total sisa kapasitas gudang ({total_kapasitas_gudang} palet) tidak mencukupi untuk menampung {total_slot_butuh} palet!")
                 else:
-                    st.info(f"🔀 **Alokasi Multi-Rak Otomatis:** Kebutuhan **{total_slot_butuh} slot pallet** melebihi kapasitas 1 lorong, sehingga dibagi berurutan sesuai prioritas:")
+                    st.info(f"🔀 **Alokasi Multi-Rak Otomatis:** Kebutuhan **{total_slot_butuh} slot pallet** dibagi berurutan sesuai prioritas:")
                     
                     rencana_alokasi = []
                     sisa_utuh = qty_p_in
