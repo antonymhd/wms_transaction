@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import math
 import re
 import requests
 from datetime import datetime, timedelta
@@ -156,7 +157,7 @@ def tutup_undo_firestore(operator_name, new_status="CLOSED"):
         pass
 
 # ==========================================================
-# 4. FIREBASE TRANSACTIONS & CACHE
+# 4. FIREBASE TRANSACTIONS & CACHE (SINGLE & MULTI-RACK)
 # ==========================================================
 @st.cache_data(ttl=300)
 def get_all_racking_data():
@@ -168,48 +169,66 @@ def get_all_racking_data():
     return semua_data
 
 @firestore.transactional
-def proses_inbound_transaction(transaction, doc_ref, k_pilih, b_pilih, lot_pilih, part_num, item_name, qty_pallet, qty_pecahan, tipe_pecahan, catatan):
-    snapshot = doc_ref.get(transaction=transaction)
-    
-    all_col_data = snapshot.to_dict().get('data', []) if snapshot.exists else []
-    data_lama_sebelum_update = all_col_data.copy()
-    
-    rak_ini = [d for d in all_col_data if float(d.get('Baris', 0) or 0) == float(b_pilih)]
-    rak_lain = [d for d in all_col_data if float(d.get('Baris', 0) or 0) != float(b_pilih)]
-    
-    max_pallet = 0
-    if rak_ini:
-        max_pallet = int(max([float(d.get('Pallet Ke', 0)) for d in rak_ini]))
+def proses_inbound_multi_transaction(transaction, doc_refs_dict, alokasi_list, lot_pilih, part_num, item_name, tipe_pecahan, catatan):
+    """
+    Mengeksekusi penempatan inbound ke 1 atau beberapa rak sekaligus secara atomik.
+    alokasi_list: [{'Kolom': 'B', 'Baris': 18, 'qty_p': 14, 'qty_c': 0}, ...]
+    """
+    snapshots = {}
+    for kol, ref in doc_refs_dict.items():
+        snapshots[kol] = ref.get(transaction=transaction)
         
-    pallets_baru = []
-    for i in range(qty_pallet):
-        pallets_baru.append({
-            'Kolom': k_pilih, 'Baris': float(b_pilih),
-            'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
-            'Keterangan': 'Utuh', 'Catatan': catatan,
-            'Pallet Ke': float(max_pallet + 1 + i)
-        })
-        
-    if qty_pecahan > 0:
-        pallets_baru.append({
-            'Kolom': k_pilih, 'Baris': float(b_pilih),
-            'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
-            'Keterangan': f"Pecahan: {qty_pecahan} {tipe_pecahan}", 'Catatan': catatan,
-            'Pallet Ke': float(max_pallet + 1 + qty_pallet)
-        })
-        
-    rak_ini.extend(pallets_baru)
+    backup_kolom = {}
+    data_per_kolom = {}
     
-    rak_ini = sorted(rak_ini, key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
-    for i, d in enumerate(rak_ini, 1):
-        d['Pallet Ke'] = float(i)
+    for kol, snap in snapshots.items():
+        existing = snap.to_dict().get('data', []) if snap.exists else []
+        backup_kolom[kol] = [d.copy() for d in existing]
+        data_per_kolom[kol] = [d.copy() for d in existing]
         
-    final_data = rak_lain + rak_ini
-    
-    if snapshot.exists: transaction.update(doc_ref, {'data': final_data})
-    else: transaction.set(doc_ref, {'data': final_data})
+    for item_alok in alokasi_list:
+        k_pilih = item_alok['Kolom']
+        b_pilih = float(item_alok['Baris'])
+        qty_p = int(item_alok['qty_p'])
+        qty_c = int(item_alok['qty_c'])
         
-    return data_lama_sebelum_update 
+        all_col = data_per_kolom[k_pilih]
+        rak_ini = [d for d in all_col if float(d.get('Baris', 0) or 0) == b_pilih]
+        rak_lain = [d for d in all_col if float(d.get('Baris', 0) or 0) != b_pilih]
+        
+        max_pallet = int(max([float(d.get('Pallet Ke', 0)) for d in rak_ini])) if rak_ini else 0
+        
+        pallets_baru = []
+        for i in range(qty_p):
+            pallets_baru.append({
+                'Kolom': k_pilih, 'Baris': b_pilih,
+                'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
+                'Keterangan': 'Utuh', 'Catatan': catatan,
+                'Pallet Ke': float(max_pallet + 1 + i)
+            })
+            
+        if qty_c > 0:
+            pallets_baru.append({
+                'Kolom': k_pilih, 'Baris': b_pilih,
+                'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
+                'Keterangan': f"Pecahan: {qty_c} {tipe_pecahan}", 'Catatan': catatan,
+                'Pallet Ke': float(max_pallet + 1 + qty_p)
+            })
+            
+        rak_ini.extend(pallets_baru)
+        rak_ini = sorted(rak_ini, key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
+        for idx_p, d in enumerate(rak_ini, 1):
+            d['Pallet Ke'] = float(idx_p)
+            
+        data_per_kolom[k_pilih] = rak_lain + rak_ini
+        
+    for kol, ref in doc_refs_dict.items():
+        if snapshots[kol].exists:
+            transaction.update(ref, {'data': data_per_kolom[kol]})
+        else:
+            transaction.set(ref, {'data': data_per_kolom[kol]})
+            
+    return backup_kolom
 
 # ==========================================================
 # 5. MASTER PRODUK & FORMATTING
@@ -248,7 +267,7 @@ df_master = load_master_data()
 
 keys_state = [
     'slide', 'kategori', 'gramasi', 'item', 'pilih_part', 'in_lot',
-    'in_qty_p', 'in_qty_c', 'in_tipe_c', 'pilih_kolom', 'pilih_baris',
+    'in_qty_p', 'in_qty_c', 'in_tipe_c', 'alokasi_terpilih',
     'operator', 'undo_record'
 ]
 for key in keys_state:
@@ -493,13 +512,17 @@ elif st.session_state.slide == 4:
             st.rerun()
 
 # ==========================================================
-# SLIDE 5: PENCARIAN & KALKULASI KAPASITAS RAK
+# SLIDE 5: PENCARIAN & ALOKASI KAPASITAS RAK (3 PRIORITAS)
 # ==========================================================
 elif st.session_state.slide == 5:
     if st.button("🔙 UBAH INPUT"): pindah_slide(4); st.rerun()
     st.markdown("### Rekomendasi Lokasi Rak")
     
-    with st.spinner("📐 Menghitung kapasitas dimensi..."):
+    qty_p_in = int(st.session_state.in_qty_p or 0)
+    qty_c_in = int(st.session_state.in_qty_c or 0)
+    total_slot_butuh = qty_p_in + (1 if qty_c_in > 0 else 0)
+    
+    with st.spinner("📐 Menghitung kapasitas & prioritas konsolidasi..."):
         semua_data = get_all_racking_data()
         
         KOLOM_LIST = ['A', 'B', 'C', 'D', 'E', 'F', 'G']
@@ -514,76 +537,159 @@ elif st.session_state.slide == 5:
             if f"{k}-{b}" in slot_map: slot_map[f"{k}-{b}"].append(d)
                 
         in_is_sac = str(st.session_state.pilih_part).strip().upper().endswith('C')
+        target_item = str(st.session_state.item).strip()
         
-        valid_slots = []
+        kandidat_rak = []
         for loc, pallets in slot_map.items():
             k, b = loc.split('-')
             b = int(b)
             
             max_sac = 31 if b <= 16 else 44
             max_dus = 32 if b <= 16 else 46
+            max_target = max_sac if in_is_sac else max_dus
             
             used_cap = 0.0
-            mix_item = False
-            item_sejenis = 0
+            distinct_items = set()
             
             for p in pallets:
-                if str(p.get('Nama Produk', '')) != st.session_state.item:
-                    mix_item = True
-                else:
-                    item_sejenis += 1
-                    
+                p_name = str(p.get('Nama Produk', '')).strip()
+                if p_name:
+                    distinct_items.add(p_name)
                 p_part = str(p.get('Part Number', '')).strip().upper()
                 if p_part.endswith('C'): used_cap += 1.0 / max_sac
                 else: used_cap += 1.0 / max_dus
                 
-            if mix_item: continue 
+            # Hitung sisa slot pallet yang muat untuk item masuk
+            sisa_cap = max(0.0, 1.0001 - used_cap)
+            sisa_slot_pallet = int(math.floor(sisa_cap * max_target))
             
-            inc_cap = (st.session_state.in_qty_p / max_sac) if in_is_sac else (st.session_state.in_qty_p / max_dus)
-            if st.session_state.in_qty_c > 0:
-                inc_cap += (1.0 / max_sac) if in_is_sac else (1.0 / max_dus)
+            if sisa_slot_pallet <= 0:
+                continue
                 
-            if used_cap + inc_cap > 1.0001: continue 
-            
-            status = "🟢 KONSOLIDASI (SEJENIS)" if item_sejenis > 0 else "⚪ KOSONG (BARU)"
-            
-            valid_slots.append({
-                'Kolom': k, 'Baris': b, 'Status': status, 'Sejenis': item_sejenis,
-                'UsedCap': used_cap, 'IncCap': inc_cap
+            # Klasifikasi 3 Tingkat Prioritas:
+            # 1: Melanjutkan slot dengan isi 100% sejenis
+            # 2: Baris kosong
+            # 3: Baris terisi 1 jenis produk berbeda (sehingga maksimal 2 jenis item di baris tsb)
+            if len(distinct_items) == 1 and target_item in distinct_items:
+                prio = 1
+                status = "🟢 KONSOLIDASI (SEJENIS)"
+                isi_eksisting = f"{len(pallets)} Pallet sejenis"
+            elif len(distinct_items) == 0:
+                prio = 2
+                status = "⚪ BARIS KOSONG"
+                isi_eksisting = "Kosong"
+            elif len(distinct_items) == 1 and target_item not in distinct_items:
+                prio = 3
+                status = "🟡 CAMPUR (MAX 2 ITEM)"
+                item_lain = list(distinct_items)[0]
+                isi_eksisting = f"1 Item lain ({item_lain[:22]}...)" if len(item_lain) > 22 else f"1 Item lain ({item_lain})"
+            else:
+                # Sudah berisi >= 2 jenis item berbeda -> dilarang ditambah item baru
+                continue
+                
+            kandidat_rak.append({
+                'Kolom': k, 'Baris': b, 'Priority': prio, 'Status': status,
+                'IsiEksisting': isi_eksisting, 'UsedCap': used_cap,
+                'MaxTarget': max_target, 'SisaSlot': sisa_slot_pallet
             })
             
-        if not valid_slots:
-            st.error("❌ Tidak ada rak yang memiliki kapasitas cukup tanpa mencampur produk yang berbeda!")
+        if not kandidat_rak:
+            st.error("❌ Seluruh rak penuh atau sudah berisi 2 jenis item berbeda!")
         else:
-            df_slots = pd.DataFrame(valid_slots)
-            df_slots['Priority'] = df_slots['Status'].apply(lambda x: 1 if 'KONSOLIDASI' in x else 2)
-            df_slots = df_slots.sort_values(by=['Priority', 'UsedCap'], ascending=[True, False]).head(8)
+            df_kandidat = pd.DataFrame(kandidat_rak)
+            # Urutkan: Prioritas (1 -> 2 -> 3), lalu yang paling terisi dulu (rapat), lalu urutan Kolom & Baris
+            df_kandidat = df_kandidat.sort_values(
+                by=['Priority', 'UsedCap', 'Kolom', 'Baris'],
+                ascending=[True, False, True, True]
+            ).reset_index(drop=True)
             
-            for idx, row in df_slots.iterrows():
-                prio_label = "🌟 REKOMENDASI TERBAIK" if idx == 0 else ""
-                persentase_terisi = int(row['UsedCap'] * 100)
-                estimasi_akhir = int((row['UsedCap'] + row['IncCap']) * 100)
-                
-                btn_label = f"📍 RAK {row['Kolom']}-{row['Baris']}  |  {row['Status']}\n"
-                btn_label += f"📊 Terisi: {persentase_terisi}% ➔ Estimasi Menjadi: {estimasi_akhir}%\n"
-                btn_label += f"{prio_label}"
-                
-                if st.button(btn_label, use_container_width=True, key=f"btn_loc_{idx}"):
-                    st.session_state.pilih_kolom = row['Kolom']; st.session_state.pilih_baris = row['Baris']
-                    pindah_slide(6); st.rerun()
+            # Cek apakah ada rak tunggal yang sanggup menampung SEMUA slot sekaligus
+            df_single_muat = df_kandidat[df_kandidat['SisaSlot'] >= total_slot_butuh].reset_index(drop=True)
+            
+            if not df_single_muat.empty:
+                st.caption(f"Kebutuhan ruang: **{total_slot_butuh} slot pallet** (Muat dalam 1 baris rak)")
+                for idx, row in df_single_muat.head(8).iterrows():
+                    prio_label = "🌟 REKOMENDASI TERBAIK" if idx == 0 else ""
+                    persentase_terisi = int(row['UsedCap'] * 100)
+                    est_akhir = int(min(100, (row['UsedCap'] + (total_slot_butuh / row['MaxTarget'])) * 100))
+                    
+                    btn_label = f"📍 RAK {row['Kolom']}-{row['Baris']}  |  {row['Status']}\n"
+                    btn_label += f"📊 Sisa Muat: {row['SisaSlot']} Pallet  |  Terisi: {persentase_terisi}% ➔ {est_akhir}%\n"
+                    btn_label += f"📦 Kondisi: {row['IsiEksisting']} {(' | ' + prio_label) if prio_label else ''}"
+                    
+                    if st.button(btn_label, use_container_width=True, key=f"btn_single_{idx}"):
+                        st.session_state.alokasi_terpilih = [{
+                            'Kolom': row['Kolom'], 'Baris': int(row['Baris']),
+                            'qty_p': qty_p_in, 'qty_c': qty_c_in,
+                            'Status': row['Status']
+                        }]
+                        pindah_slide(6)
+                        st.rerun()
+            else:
+                # MODE MULTI-RACK ALLOCATION (Contoh: 60 Palet dipecah ke beberapa rak)
+                total_kapasitas_gudang = int(df_kandidat['SisaSlot'].sum())
+                if total_kapasitas_gudang < total_slot_butuh:
+                    st.error(f"❌ Total sisa kapasitas seluruh gudang ({total_kapasitas_gudang} palet) tidak mencukupi untuk menampung {total_slot_butuh} palet!")
+                else:
+                    st.info(f"🔀 **Alokasi Multi-Rak Otomatis:** Kebutuhan **{total_slot_butuh} slot pallet** melebihi kapasitas 1 lorong, sehingga dibagi berurutan sesuai prioritas:")
+                    
+                    rencana_alokasi = []
+                    sisa_utuh = qty_p_in
+                    sisa_pecahan = qty_c_in
+                    
+                    for _, row in df_kandidat.iterrows():
+                        if sisa_utuh == 0 and sisa_pecahan == 0:
+                            break
+                        kap = int(row['SisaSlot'])
+                        
+                        ambil_p = min(sisa_utuh, kap)
+                        sisa_utuh -= ambil_p
+                        kap_sisa = kap - ambil_p
+                        
+                        ambil_c = 0
+                        if sisa_utuh == 0 and sisa_pecahan > 0 and kap_sisa >= 1:
+                            ambil_c = sisa_pecahan
+                            sisa_pecahan = 0
+                            
+                        if ambil_p > 0 or ambil_c > 0:
+                            rencana_alokasi.append({
+                                'Kolom': row['Kolom'],
+                                'Baris': int(row['Baris']),
+                                'qty_p': ambil_p,
+                                'qty_c': ambil_c,
+                                'Status': row['Status'],
+                                'SisaSlot': int(row['SisaSlot'])
+                            })
+                            
+                    with st.container(border=True):
+                        for i_alok, al in enumerate(rencana_alokasi, 1):
+                            teks_pec = f" + {al['qty_c']} {st.session_state.in_tipe_c}" if al['qty_c'] > 0 else ""
+                            st.markdown(f"**{i_alok}. Rak {al['Kolom']}-{al['Baris']}** ({al['Status']}) ➔ Masuk **{al['qty_p']} Pallet{teks_pec}** *(dari sisa {al['SisaSlot']} slot)*")
+                            
+                    st.write("")
+                    if st.button("✅ GUNAKAN RENCANA PENEMPATAN INI", type="primary", use_container_width=True):
+                        st.session_state.alokasi_terpilih = rencana_alokasi
+                        pindah_slide(6)
+                        st.rerun()
 
 # ==========================================================
 # SLIDE 6: KONFIRMASI & EKSEKUSI INBOUND
 # ==========================================================
 elif st.session_state.slide == 6:
-    if st.button("🔙 BATAL (GANTI RAK)"): pindah_slide(5); st.rerun()
+    if st.button("🔙 BATAL (GANTI LOKASI)"): pindah_slide(5); st.rerun()
         
+    alokasi = st.session_state.alokasi_terpilih or []
     st.markdown("### Konfirmasi Inbound")
     with st.container(border=True):
         st.markdown(format_nama_warna_bold(st.session_state.item))
-        st.markdown(f"**Rak Tujuan:** {st.session_state.pilih_kolom}-{st.session_state.pilih_baris}  |  **Lot Masuk:** `{st.session_state.in_lot}`")
+        st.markdown(f"**Lot Masuk:** `{st.session_state.in_lot}`")
         teks_pecahan = f", {st.session_state.in_qty_c} {st.session_state.in_tipe_c}" if st.session_state.in_qty_c > 0 else ""
         st.caption(f"Total Masuk: {st.session_state.in_qty_p} Pallet Utuh{teks_pecahan}")
+        st.divider()
+        st.markdown("**Rincian Rak Tujuan:**")
+        for al in alokasi:
+            p_str = f" + {al['qty_c']} {st.session_state.in_tipe_c}" if al['qty_c'] > 0 else ""
+            st.markdown(f"- 📍 **Rak {al['Kolom']}-{al['Baris']}**: {al['qty_p']} Pallet{p_str} *({al['Status']})*")
         
     st.write("")
     catatan_operator = st.text_input("📝 CATATAN (Opsional)", placeholder="Cth: Titipan sementara / DO-9821")
@@ -591,46 +697,54 @@ elif st.session_state.slide == 6:
     st.write("")
     if st.button("📥 MASUKKAN KE DATABASE SEKARANG", type="primary", use_container_width=True):
         with st.spinner("Memasukkan data ke rak secara aman..."):
-            
-            k_pilih = st.session_state.pilih_kolom
-            b_pilih = st.session_state.pilih_baris
-            
-            doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{k_pilih}")
-            transaction = db.transaction() 
+            kolom_unik = sorted(list(set(al['Kolom'] for al in alokasi)))
+            doc_refs_dict = {kol: db.collection(NAMA_DATABASE).document(f"Kolom_{kol}") for kol in kolom_unik}
+            transaction = db.transaction()
             
             try:
-                data_sebelum_update = proses_inbound_transaction(
-                    transaction, doc_ref, k_pilih, b_pilih, 
-                    st.session_state.in_lot, st.session_state.pilih_part, st.session_state.item, 
-                    st.session_state.in_qty_p, st.session_state.in_qty_c, st.session_state.in_tipe_c, catatan_operator
+                backup_kolom = proses_inbound_multi_transaction(
+                    transaction, doc_refs_dict, alokasi,
+                    st.session_state.in_lot, st.session_state.pilih_part, st.session_state.item,
+                    st.session_state.in_tipe_c, catatan_operator
                 )
                 
                 teks_keterangan = f"Dieksekusi oleh: {st.session_state.operator}"
                 if catatan_operator.strip(): teks_keterangan += f" | Catatan: {catatan_operator.strip()}"
                 
-                catat_log_mutasi("INBOUND (Remote)", k_pilih, b_pilih, st.session_state.item, st.session_state.pilih_part, st.session_state.in_lot, st.session_state.in_qty_p, st.session_state.in_qty_c, 0, teks_keterangan)
+                ringkasan_rak = []
+                for al in alokasi:
+                    catat_log_mutasi(
+                        "INBOUND (Remote)", al['Kolom'], al['Baris'],
+                        st.session_state.item, st.session_state.pilih_part, st.session_state.in_lot,
+                        al['qty_p'], al['qty_c'], 0, teks_keterangan
+                    )
+                    p_str = f"+{al['qty_c']}{st.session_state.in_tipe_c}" if al['qty_c'] > 0 else ""
+                    ringkasan_rak.append(f"{al['Kolom']}-{al['Baris']} ({al['qty_p']}P{p_str})")
                 
+                lokasi_gabungan = ", ".join(ringkasan_rak)
                 pecahan_tele = f", {st.session_state.in_qty_c} {st.session_state.in_tipe_c}" if st.session_state.in_qty_c > 0 else ""
+                
                 pesan_tele = (
                     f"📥 <b>INBOUND - RACK NAVIGATOR</b>\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
                     f"📦 <b>Item:</b> {escape_html(st.session_state.item)}\n"
-                    f"📍 <b>Rak:</b> {k_pilih}-{b_pilih} | <b>Lot:</b> <code>{escape_html(st.session_state.in_lot)}</code>\n"
-                    f"📊 <b>Qty:</b> {st.session_state.in_qty_p} Pallet{pecahan_tele}\n"
+                    f"🏷️ <b>Lot:</b> <code>{escape_html(st.session_state.in_lot)}</code>\n"
+                    f"📊 <b>Total:</b> {st.session_state.in_qty_p} Pallet{pecahan_tele}\n"
+                    f"📍 <b>Penempatan:</b> {escape_html(lokasi_gabungan)}\n"
                     f"👤 <b>Operator:</b> {escape_html(st.session_state.operator)}\n"
                 )
                 if catatan_operator.strip():
                     pesan_tele += f"📝 <b>Catatan:</b> <i>{escape_html(catatan_operator.strip())}</i>\n"
                 kirim_notif_telegram(pesan_tele)
                 
-                get_all_racking_data.clear() 
+                get_all_racking_data.clear()
                 
-                msg_sukses = f"{st.session_state.in_qty_p} Pallet{pecahan_tele} masuk ke Rak {k_pilih}-{b_pilih}."
-                simpan_undo_firestore(st.session_state.operator, {k_pilih: data_sebelum_update}, msg_sukses)
+                msg_sukses = f"{st.session_state.in_qty_p} Pallet{pecahan_tele} masuk ke {lokasi_gabungan}."
+                simpan_undo_firestore(st.session_state.operator, backup_kolom, msg_sukses)
                 
                 st.toast(msg_sukses, icon="✅")
                 
-                for k in ['kategori', 'gramasi', 'item', 'pilih_part', 'in_lot', 'in_qty_p', 'in_qty_c', 'in_tipe_c', 'pilih_kolom', 'pilih_baris']:
+                for k in ['kategori', 'gramasi', 'item', 'pilih_part', 'in_lot', 'in_qty_p', 'in_qty_c', 'in_tipe_c', 'alokasi_terpilih']:
                     st.session_state[k] = None
                 pindah_slide(1)
                 st.rerun()
