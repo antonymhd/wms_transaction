@@ -125,12 +125,6 @@ def parse_fifo_key(lot_str):
         return f"{yy}{mm}{dd}_{s}"
     return f"999999_{s}"
 
-def get_satuan_kemasan(part_num):
-    p = str(part_num).strip().upper()
-    if p.endswith('C'): return "Sak"
-    elif p.endswith('A'): return "Nictainer"
-    return "Dus"
-
 def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh, pecahan, eceran, keterangan=""):
     waktu_sekarang = get_waktu_jkt().strftime("%Y-%m-%d %H:%M:%S")
     log_data = {
@@ -144,10 +138,9 @@ def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh,
     except Exception: pass 
 
 # ==========================================================
-# 3. PERSISTENT UNDO 30 MENIT (HEMAT KUOTA READ)
+# 3. PERSISTENT UNDO 30 MENIT 
 # ==========================================================
 def simpan_undo_firestore(operator_name, undo_dict, action_msg):
-    """Menyimpan backup Undo ke Firestore agar bertahan meski browser refresh (maks 30 menit)"""
     now_str = get_waktu_jkt().strftime("%Y-%m-%d %H:%M:%S")
     payload = {
         "status": "DONE",
@@ -158,11 +151,9 @@ def simpan_undo_firestore(operator_name, undo_dict, action_msg):
     st.session_state.undo_record = payload
     try:
         db.collection(DB_UNDO_STATE).document(f"OUT_{operator_name}").set(payload)
-    except Exception:
-        pass
+    except Exception: pass
 
 def muat_undo_firestore(operator_name):
-    """Dipanggil HANYA 1x saat operator memilih nama di Slide 0"""
     try:
         doc = db.collection(DB_UNDO_STATE).document(f"OUT_{operator_name}").get()
         if doc.exists:
@@ -172,16 +163,14 @@ def muat_undo_firestore(operator_name):
                 if (get_waktu_jkt() - created_dt) <= timedelta(minutes=30):
                     st.session_state.undo_record = data
                     return
-    except Exception:
-        pass
+    except Exception: pass
     st.session_state.undo_record = None
 
 def tutup_undo_firestore(operator_name, new_status="CLOSED"):
     st.session_state.undo_record = {"status": new_status} if new_status == "UNDONE" else None
     try:
         db.collection(DB_UNDO_STATE).document(f"OUT_{operator_name}").update({"status": new_status})
-    except Exception:
-        pass
+    except Exception: pass
 
 # ==========================================================
 # 4. FIREBASE TRANSACTIONS & CACHE
@@ -197,10 +186,6 @@ def get_all_racking_data():
 
 @firestore.transactional
 def proses_outbound_initial_final(transaction, doc_ref, k_pilih, b_pilih, lot_pilih, part_num, item_name, init_pallet, init_dus, final_pallet, final_dus, satuan_kemasan, catatan_lama):
-    """
-    Memverifikasi stok awal masih sama (anti-race condition), lalu mengganti state
-    Lot tersebut di baris rak menjadi stok sisa akhir (final_pallet + final_dus).
-    """
     snapshot = doc_ref.get(transaction=transaction)
     if not snapshot.exists:
         raise ValueError("Data Kolom tidak ditemukan di database.")
@@ -211,7 +196,6 @@ def proses_outbound_initial_final(transaction, doc_ref, k_pilih, b_pilih, lot_pi
     rak_ini = [d for d in all_col_data if float(d.get('Baris', 0) or 0) == float(b_pilih)]
     rak_lain = [d for d in all_col_data if float(d.get('Baris', 0) or 0) != float(b_pilih)]
     
-    # Validasi ulang stok riil di database saat transaksi dikunci
     lot_records = [d for d in rak_ini if str(d.get('Lot Number', '')) == lot_pilih and str(d.get('Nama Produk', '')) == item_name]
     db_utuh = sum(1 for d in lot_records if 'pecahan' not in str(d.get('Keterangan', '')).lower() and 'eceran' not in str(d.get('Keterangan', '')).lower())
     db_dus = sum(parse_keterangan(d.get('Keterangan', ''))[0] for d in lot_records if 'pecahan' in str(d.get('Keterangan', '')).lower() or 'eceran' in str(d.get('Keterangan', '')).lower())
@@ -219,25 +203,21 @@ def proses_outbound_initial_final(transaction, doc_ref, k_pilih, b_pilih, lot_pi
     if db_utuh != init_pallet or db_dus != init_dus:
         raise ValueError(f"Stok di database baru saja berubah ({db_utuh} Pallet, {db_dus} {satuan_kemasan}). Silakan muat ulang lokasi.")
     
-    # Pertahankan entri lot lain di baris yang sama
     sisa_rak_ini = [d for d in rak_ini if not (str(d.get('Lot Number', '')) == lot_pilih and str(d.get('Nama Produk', '')) == item_name)]
     
-    # Bangun ulang entri sisa akhir (Final) untuk Lot ini
     records_baru = []
     for _ in range(final_pallet):
         records_baru.append({
             'Kolom': k_pilih, 'Baris': float(b_pilih),
             'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
-            'Keterangan': 'Utuh', 'Catatan': catatan_lama,
-            'Pallet Ke': 999.0
+            'Keterangan': 'Utuh', 'Catatan': catatan_lama, 'Pallet Ke': 999.0
         })
         
     if final_dus > 0:
         records_baru.append({
             'Kolom': k_pilih, 'Baris': float(b_pilih),
             'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
-            'Keterangan': f"Pecahan: {final_dus} {satuan_kemasan}", 'Catatan': catatan_lama,
-            'Pallet Ke': 999.0
+            'Keterangan': f"Pecahan: {final_dus} {satuan_kemasan}", 'Catatan': catatan_lama, 'Pallet Ke': 999.0
         })
         
     updated_rak_ini = sisa_rak_ini + records_baru
@@ -250,7 +230,7 @@ def proses_outbound_initial_final(transaction, doc_ref, k_pilih, b_pilih, lot_pi
     return data_lama_sebelum_update
 
 # ==========================================================
-# 5. MASTER PRODUK & KONVERSI UNIT
+# 5. MASTER PRODUK & KONVERSI UNIT (REVISI LOGIKA CSV)
 # ==========================================================
 def ekstrak_gramasi(nama_produk):
     match = re.search(r'(\d+[.,]\d+)\s*(?:gr|GR)', str(nama_produk), re.IGNORECASE)
@@ -268,17 +248,8 @@ def set_kategori(nama):
 
 def format_nama_warna_bold(nama_barang):
     parts = str(nama_barang).rsplit(',', 1)
-    if len(parts) == 2:
-        return f"{parts[0]}, **{parts[1].strip()}**"
+    if len(parts) == 2: return f"{parts[0]}, **{parts[1].strip()}**"
     return str(nama_barang)
-
-def parse_angka_aman(val, default=1):
-    try:
-        clean = re.sub(r'[^\d.]', '', str(val).replace(',', '.'))
-        num = int(float(clean))
-        return num if num > 0 else default
-    except Exception:
-        return default
 
 @st.cache_data(ttl=3600)
 def load_master_data():
@@ -289,15 +260,26 @@ def load_master_data():
         df['Gramasi'] = df['Nama Barang'].apply(ekstrak_gramasi)
         if 'Part Number' not in df.columns: df['Part Number'] = ""
         
-        # Deteksi otomatis kolom konversi Dus/Pallet & Pcs/Dus dari Master_Produk.csv
-        col_dus_per_pal = next((c for c in df.columns if any(k in c.lower() for k in ['dus/pal', 'sak/pal', 'isi pal', 'qty/pal', 'pallet'])), None)
-        col_pcs_per_dus = next((c for c in df.columns if any(k in c.lower() for k in ['pcs/dus', 'pcs/sak', 'pcs/pack', 'isi dus', 'qty/dus', 'pcs'])), None)
+        df.columns = df.columns.str.strip() # Bersihkan spasi di nama header
         
-        df['Conv_Dus_Per_Pallet'] = df[col_dus_per_pal].apply(lambda x: parse_angka_aman(x, 1)) if col_dus_per_pal else 1
-        df['Conv_Pcs_Per_Dus'] = df[col_pcs_per_dus].apply(lambda x: parse_angka_aman(x, 1)) if col_pcs_per_dus else 1
+        def clean_num(val):
+            try:
+                c = re.sub(r'[^\d]', '', str(val))
+                return int(c) if c else 0
+            except:
+                return 0
+        
+        # Mapping kolom secara eksplisit sesuai struktur CSV yang sebenarnya
+        df['Total_Pcs_Pallet'] = df['Isi 1 Pallet (pcs)'].apply(clean_num) if 'Isi 1 Pallet (pcs)' in df.columns else 0
+        df['Pcs_Per_Box'] = df['Box / Pallet'].apply(clean_num) if 'Box / Pallet' in df.columns else 0
+        df['Pcs_Per_Sac'] = df['Sac / Pallet'].apply(clean_num) if 'Sac / Pallet' in df.columns else 0
+        
         return df
     except Exception:
-        return pd.DataFrame(columns=['Nama Barang', 'Kategori', 'Gramasi', 'Part Number', 'Conv_Dus_Per_Pallet', 'Conv_Pcs_Per_Dus'])
+        return pd.DataFrame(columns=[
+            'Nama Barang', 'Kategori', 'Gramasi', 'Part Number', 
+            'Total_Pcs_Pallet', 'Pcs_Per_Box', 'Pcs_Per_Sac'
+        ])
 
 df_master = load_master_data()
 
@@ -311,8 +293,7 @@ for key in keys_state:
         if key == 'slide': st.session_state[key] = 0
         else: st.session_state[key] = None
 
-def pindah_slide(tujuan):
-    st.session_state.slide = tujuan
+def pindah_slide(tujuan): st.session_state.slide = tujuan
 
 # ==========================================================
 # SLIDE 0: PILIH OPERATOR BERTUGAS
@@ -337,16 +318,14 @@ if st.session_state.slide == 0:
             if st.button(f"👤 {op1}", key=f"op_{op1}", use_container_width=True):
                 st.session_state.operator = op1
                 muat_undo_firestore(op1)
-                pindah_slide(1)
-                st.rerun()
+                pindah_slide(1); st.rerun()
         if i + 1 < len(OPERATOR_OUTBOUND):
             with cols[1]:
                 op2 = OPERATOR_OUTBOUND[i+1]
                 if st.button(f"👤 {op2}", key=f"op_{op2}", use_container_width=True):
                     st.session_state.operator = op2
                     muat_undo_firestore(op2)
-                    pindah_slide(1)
-                    st.rerun()
+                    pindah_slide(1); st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
     
     st.write("")
@@ -354,17 +333,14 @@ if st.session_state.slide == 0:
         op_manual = st.text_input("Ketik Nama Operator", placeholder="Masukkan nama...")
         if st.button("MASUK DENGAN NAMA INI", type="primary", use_container_width=True):
             if op_manual.strip():
-                nama_fix = op_manual.strip().title()
-                st.session_state.operator = nama_fix
-                muat_undo_firestore(nama_fix)
-                pindah_slide(1)
-                st.rerun()
-            else:
-                st.warning("Nama operator tidak boleh kosong.")
+                st.session_state.operator = op_manual.strip().title()
+                muat_undo_firestore(st.session_state.operator)
+                pindah_slide(1); st.rerun()
+            else: st.warning("Nama operator tidak boleh kosong.")
     st.stop()
 
 # ==========================================================
-# HEADER STATUS & NOTIFIKASI UNDO (BERLAKU 30 MENIT)
+# HEADER STATUS & NOTIFIKASI UNDO
 # ==========================================================
 col_hdr1, col_hdr2 = st.columns([3, 1])
 with col_hdr1:
@@ -380,20 +356,16 @@ with col_hdr1:
     """, unsafe_allow_html=True)
 with col_hdr2:
     if st.button("🔄 Ganti\nOperator", use_container_width=True):
-        st.session_state.operator = None
-        st.session_state.undo_record = None
-        pindah_slide(0)
-        st.rerun()
+        st.session_state.operator = None; st.session_state.undo_record = None
+        pindah_slide(0); st.rerun()
 
-# Cek validitas 30 menit di memori sesi (0 Firestore Read!)
 undo_rec = st.session_state.undo_record
 if undo_rec and undo_rec.get("status") == "DONE":
     masih_berlaku = True
     if undo_rec.get("created_at"):
         created_dt = datetime.strptime(undo_rec["created_at"], "%Y-%m-%d %H:%M:%S")
         if (get_waktu_jkt() - created_dt) > timedelta(minutes=30):
-            masih_berlaku = False
-            st.session_state.undo_record = None
+            masih_berlaku = False; st.session_state.undo_record = None
             
     if masih_berlaku:
         with st.container(border=True):
@@ -428,15 +400,13 @@ if undo_rec and undo_rec.get("status") == "DONE":
                 st.markdown('</div>', unsafe_allow_html=True)
             with c_undo2:
                 if st.button("TUTUP / LANJUT", use_container_width=True):
-                    tutup_undo_firestore(st.session_state.operator, "CLOSED")
-                    st.rerun()
+                    tutup_undo_firestore(st.session_state.operator, "CLOSED"); st.rerun()
 
 elif undo_rec and undo_rec.get("status") == "UNDONE":
     with st.container(border=True):
         st.warning("⏪ **Transaksi dibatalkan.** Stok kembali ke posisi semula.")
         if st.button("TUTUP PESAN", use_container_width=True):
-            st.session_state.undo_record = None
-            st.rerun()
+            st.session_state.undo_record = None; st.rerun()
 
 def render_progress():
     steps = ["Kategori", "Gramasi", "Item", "Lokasi", "Selesai"]
@@ -510,8 +480,7 @@ elif st.session_state.slide == 3:
         
         if st.button(btn_label, use_container_width=True, key=f"btn_item_{idx}"): 
             st.session_state.item = nama_brg
-            pindah_slide(4)
-            st.rerun()
+            pindah_slide(4); st.rerun()
 
 # ==========================================================
 # SLIDE 4: PENCARIAN LOKASI STOK (FIFO AKURAT TANGGAL)
@@ -543,7 +512,9 @@ elif st.session_state.slide == 4:
                     lot = str(df_group.iloc[0]['Lot Number'])
                     catatan = str(df_group.iloc[0]['Catatan'])
                     part_num = str(df_group.iloc[0]['Part Number'])
-                    satuan = get_satuan_kemasan(part_num)
+                    
+                    akhiran_part = part_num.strip().upper()[-1:] if part_num.strip() else ""
+                    satuan_str = "Sak" if akhiran_part == 'C' else "Nictainer" if akhiran_part == 'A' else "Dus"
                     
                     jml_utuh = df_group[~df_group['Keterangan'].astype(str).str.contains('Pecahan|Eceran', case=False, na=False)].shape[0]
                     pecahan_rows = df_group[df_group['Keterangan'].astype(str).str.contains('Pecahan|Eceran', case=False, na=False)]
@@ -555,7 +526,7 @@ elif st.session_state.slide == 4:
                     rekap_lokasi.append({
                         'Kolom': kol, 'Baris': bar, 'Lot Number': lot, 
                         'FIFO_Key': parse_fifo_key(lot),
-                        'Pallet': jml_utuh, 'Dus': jml_dus, 'Satuan': satuan,
+                        'Pallet': jml_utuh, 'Dus': jml_dus, 'Satuan': satuan_str,
                         'Catatan': catatan, 'Part': part_num
                     })
                 
@@ -585,24 +556,41 @@ elif st.session_state.slide == 4:
 elif st.session_state.slide == 5:
     if st.button("🔙 BATAL"): pindah_slide(4); st.rerun()
     
-    satuan = get_satuan_kemasan(st.session_state.pilih_part)
     init_p = int(st.session_state.max_pallet or 0)
     init_d = int(st.session_state.max_dus or 0)
     
-    # Ambil rasio konversi dari Master_Produk.csv
+    # Ambil baris data produk dari Master Produk
     row_m = df_master[df_master['Nama Barang'] == st.session_state.item]
-    dus_per_pallet = int(row_m.iloc[0]['Conv_Dus_Per_Pallet']) if not row_m.empty else 1
-    pcs_per_dus = int(row_m.iloc[0]['Conv_Pcs_Per_Dus']) if not row_m.empty else 1
     
-    total_dus_init = (init_p * dus_per_pallet) + init_d
-    total_pcs_init = total_dus_init * pcs_per_dus
+    total_pcs_pallet = int(row_m.iloc[0]['Total_Pcs_Pallet']) if not row_m.empty and int(row_m.iloc[0]['Total_Pcs_Pallet']) > 0 else 1
+    pcs_per_box = int(row_m.iloc[0]['Pcs_Per_Box']) if not row_m.empty and int(row_m.iloc[0]['Pcs_Per_Box']) > 0 else 1
+    pcs_per_sac = int(row_m.iloc[0]['Pcs_Per_Sac']) if not row_m.empty and int(row_m.iloc[0]['Pcs_Per_Sac']) > 0 else 1
+    
+    # Deteksi satuan dan Pcs_per_kemasan_kecil berdasarkan akhiran Part Number
+    akhiran_target = str(st.session_state.pilih_part).strip().upper()[-1:] if str(st.session_state.pilih_part).strip() else ""
+    
+    if akhiran_target == 'C':
+        satuan = "Sak"
+        pcs_per_pecahan = pcs_per_sac
+    elif akhiran_target == 'A':
+        satuan = "Nictainer"
+        pcs_per_pecahan = pcs_per_box 
+    else:
+        satuan = "Dus"
+        pcs_per_pecahan = pcs_per_box
+        
+    # Kalkulasi berapa jumlah Dus/Sak dalam 1 Pallet
+    pecahan_per_pallet = total_pcs_pallet // pcs_per_pecahan if pcs_per_pecahan > 0 else 1
+    if pecahan_per_pallet == 0: pecahan_per_pallet = 1
+    
+    total_pcs_init = (init_p * total_pcs_pallet) + (init_d * pcs_per_pecahan)
     
     st.markdown("### Konfirmasi Pengeluaran")
     with st.container(border=True):
         st.markdown(format_nama_warna_bold(st.session_state.item))
         st.markdown(f"**Lokasi:** Rak {st.session_state.pilih_kolom}-{st.session_state.pilih_baris}  |  **Lot:** `{st.session_state.pilih_lot}`")
         st.info(f"📦 **Stok Awal (Initial):** {init_p} Pallet, {init_d} {satuan} (**{total_pcs_init:,} Pcs**)")
-        st.caption(f"Standar Packing: 1 Pallet = {dus_per_pallet} {satuan} | 1 {satuan} = {pcs_per_dus:,} Pcs")
+        st.caption(f"Standar Packing: 1 Pallet = {pecahan_per_pallet} {satuan} | 1 {satuan} = {pcs_per_pecahan:,} Pcs")
         
     st.write("")
     st.markdown("**INPUT SISA STOK AKHIR DI RAK (FINAL):**")
@@ -612,19 +600,16 @@ elif st.session_state.slide == 5:
     with col_q1:
         sisa_pallet = st.number_input("SISA PALLET UTUH", min_value=0, max_value=init_p, step=1, value=default_sisa_p)
     with col_q2:
-        # Diizinkan melebihi init_d jika ada palet utuh yang dipecah (misal 2 palet 3 dus -> sisa 1 palet 4 dus)
-        max_sisa_d = max(init_d, dus_per_pallet * 2) if dus_per_pallet > 1 else max(init_d, 100)
+        max_sisa_d = max(init_d, pecahan_per_pallet * 2) if pecahan_per_pallet > 1 else max(init_d, 100)
         sisa_dus = st.number_input(f"SISA PECAHAN ({satuan.upper()})", min_value=0, max_value=max_sisa_d, step=1, value=init_d)
         
-    total_dus_final = (sisa_pallet * dus_per_pallet) + sisa_dus
-    total_pcs_final = total_dus_final * pcs_per_dus
-    
-    selisih_dus_total = total_dus_init - total_dus_final
+    total_pcs_final = (sisa_pallet * total_pcs_pallet) + (sisa_dus * pcs_per_pecahan)
     selisih_pcs = total_pcs_init - total_pcs_final
     
-    # Konversi selisih ke format Pallet & Dus untuk log mutasi
-    keluar_pallet_eq = selisih_dus_total // dus_per_pallet if dus_per_pallet > 0 else 0
-    keluar_dus_eq = selisih_dus_total % dus_per_pallet if dus_per_pallet > 0 else selisih_dus_total
+    # Konversi total selisih Pcs kembali ke format Pallet & Pecahan untuk log mutasi Telegram
+    keluar_pallet_eq = selisih_pcs // total_pcs_pallet if total_pcs_pallet > 0 else 0
+    sisa_pcs_temp = selisih_pcs % total_pcs_pallet if total_pcs_pallet > 0 else selisih_pcs
+    keluar_dus_eq = sisa_pcs_temp // pcs_per_pecahan if pcs_per_pecahan > 0 else 0
     
     st.write("")
     if selisih_pcs > 0:
@@ -640,7 +625,6 @@ elif st.session_state.slide == 5:
     if selisih_pcs > 0:
         if st.button("🚀 KONFIRMASI PENGELUARAN", type="primary", use_container_width=True):
             with st.spinner("Memproses ke database..."):
-                
                 k_pilih = st.session_state.pilih_kolom
                 b_pilih = st.session_state.pilih_baris
                 lot_pilih = st.session_state.pilih_lot
@@ -657,8 +641,7 @@ elif st.session_state.slide == 5:
                     )
                     
                     teks_keterangan = f"Op: {st.session_state.operator} | Awal: {init_p}P {init_d}{satuan[0]} -> Sisa: {sisa_pallet}P {sisa_dus}{satuan[0]}"
-                    if catatan_operator.strip():
-                        teks_keterangan += f" | Catatan: {catatan_operator.strip()}"
+                    if catatan_operator.strip(): teks_keterangan += f" | Catatan: {catatan_operator.strip()}"
                     
                     catat_log_mutasi(
                         "OUTBOUND (Remote)", k_pilih, b_pilih, st.session_state.item,
@@ -675,8 +658,7 @@ elif st.session_state.slide == 5:
                         f"📉 <b>Stok Rak:</b> {init_p}P {init_d}{satuan} ➔ <b>{sisa_pallet}P {sisa_dus}{satuan}</b>\n"
                         f"👤 <b>Operator:</b> {escape_html(st.session_state.operator)}\n"
                     )
-                    if catatan_operator.strip():
-                        pesan_tele += f"📝 <b>Catatan:</b> <i>{escape_html(catatan_operator.strip())}</i>\n"
+                    if catatan_operator.strip(): pesan_tele += f"📝 <b>Catatan:</b> <i>{escape_html(catatan_operator.strip())}</i>\n"
                     kirim_notif_telegram(pesan_tele)
                     
                     get_all_racking_data.clear() 
@@ -688,10 +670,7 @@ elif st.session_state.slide == 5:
                     
                     for k in ['kategori', 'gramasi', 'item', 'pilih_kolom', 'pilih_baris', 'pilih_lot', 'pilih_part', 'pilih_catatan_rak', 'max_pallet', 'max_dus']:
                         st.session_state[k] = None
-                    pindah_slide(1)
-                    st.rerun()
+                    pindah_slide(1); st.rerun()
                     
-                except ValueError as err:
-                    st.error(f"❌ Transaksi Dibatalkan: {err}")
-                except Exception as err:
-                    st.error(f"❌ Kesalahan Sistem: {err}")
+                except ValueError as err: st.error(f"❌ Transaksi Dibatalkan: {err}")
+                except Exception as err: st.error(f"❌ Kesalahan Sistem: {err}")
