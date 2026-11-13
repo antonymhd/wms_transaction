@@ -141,64 +141,45 @@ elif st.session_state.slide == 3:
 
 elif st.session_state.slide == 4:
     if st.button("🔙 KEMBALI"): pindah_slide(3); st.rerun()
-    st.markdown("### Lokasi Target (FIFO)")
+    st.markdown("### Lokasi Target (Akses Langsung & FIFO)")
     st.info(core.format_nama_warna_bold(st.session_state.item))
     
-    with st.spinner("🔍 Memindai data stok gudang..."):
+    with st.spinner("🔍 Memindai posisi lorong & stok gudang..."):
         semua_data = core.get_all_racking_data()
-        if not semua_data:
-            st.warning("Database gudang kosong.")
+        df_rekap = core.cari_lokasi_stok_hibrida(semua_data, st.session_state.item)
+        
+        if df_rekap.empty:
+            st.error("❌ Stok untuk item ini tidak ditemukan di seluruh rak!")
         else:
-            df_all = pd.DataFrame(semua_data)
-            df_target = df_all[(df_all['Nama Produk'] == st.session_state.item) & (df_all['Part Number'].astype(str).str.strip() != "")]
-            
-            if df_target.empty:
-                st.error("❌ Stok untuk item ini tidak ditemukan di seluruh rak!")
-            else:
-                df_target['Catatan'] = df_target['Catatan'].fillna("").astype(str).replace('nan', '')
-                df_target['Group_Key'] = df_target['Kolom'].astype(str) + "_" + df_target['Baris'].astype(str) + "_" + df_target['Lot Number'].astype(str)
-                
-                rekap_lokasi = []
-                for _, df_group in df_target.groupby('Group_Key'):
-                    kol = str(df_group.iloc[0]['Kolom'])
-                    bar = int(float(df_group.iloc[0]['Baris']))
-                    lot = str(df_group.iloc[0]['Lot Number'])
-                    catatan = str(df_group.iloc[0]['Catatan'])
-                    part_num = str(df_group.iloc[0]['Part Number'])
-                    satuan_str = core.get_satuan_kemasan(part_num)
+            for idx, row in df_rekap.iterrows():
+                if row['JmlPenghalang'] == 0:
+                    akses_badge = "✅ AKSES LANGSUNG (FIFO)"
+                    prioritas_label = "🌟 REKOMENDASI UTAMA" if idx == 0 else f"⭐ URUTAN {idx + 1}"
+                else:
+                    akses_badge = f"⚠️ TERHALANG {row['JmlPenghalang']} PALET"
+                    prioritas_label = f"🚧 PERLU LANGSIR ({row['InfoPenghalang']})"
                     
-                    jml_utuh = df_group[~df_group['Keterangan'].astype(str).str.contains('Pecahan|Eceran', case=False, na=False)].shape[0]
-                    pecahan_rows = df_group[df_group['Keterangan'].astype(str).str.contains('Pecahan|Eceran', case=False, na=False)]
-                    jml_dus = sum(core.parse_keterangan(r['Keterangan'])[0] for _, r in pecahan_rows.iterrows())
-                        
-                    rekap_lokasi.append({
-                        'Kolom': kol, 'Baris': bar, 'Lot Number': lot, 
-                        'FIFO_Key': core.parse_fifo_key(lot),
-                        'Pallet': jml_utuh, 'Dus': jml_dus, 'Satuan': satuan_str,
-                        'Catatan': catatan, 'Part': part_num
-                    })
+                catatan_label = f"\n🔖 Catatan: {row['Catatan']}" if row['Catatan'] else ""
+                btn_label = f"📍 RAK {row['Kolom']}-{row['Baris']}  |  🏷️ Lot: {row['Lot Number']}\n"
+                btn_label += f"Stok: {row['Pallet']} Pallet, {row['Dus']} {row['Satuan']}  |  {akses_badge}\n"
+                btn_label += f"{prioritas_label}{catatan_label}"
                 
-                df_rekap = pd.DataFrame(rekap_lokasi).sort_values('FIFO_Key', ascending=True).reset_index(drop=True)
-                for idx, row in df_rekap.iterrows():
-                    fifo_label = "🌟 REKOMENDASI UTAMA" if idx == 0 else f"⭐ URUTAN {idx + 1}"
-                    catatan_label = f"\n🔖 Catatan: {row['Catatan']}" if row['Catatan'] else ""
-                    btn_label = f"📍 RAK {row['Kolom']}-{row['Baris']}  |  🏷️ Lot: {row['Lot Number']}\n"
-                    btn_label += f"Stok: {row['Pallet']} Pallet, {row['Dus']} {row['Satuan']}\n"
-                    btn_label += f"{fifo_label}{catatan_label}"
-                    
-                    if st.button(btn_label, use_container_width=True, key=f"btn_loc_{idx}"):
-                        st.session_state.pilih_kolom = row['Kolom']
-                        st.session_state.pilih_baris = row['Baris']
-                        st.session_state.pilih_lot = row['Lot Number']
-                        st.session_state.pilih_part = row['Part']
-                        st.session_state.pilih_catatan_rak = row['Catatan']
-                        st.session_state.max_pallet = row['Pallet']
-                        st.session_state.max_dus = row['Dus']
-                        pindah_slide(5); st.rerun()
+                if st.button(btn_label, use_container_width=True, key=f"btn_loc_{idx}"):
+                    st.session_state.pilih_kolom = row['Kolom']
+                    st.session_state.pilih_baris = row['Baris']
+                    st.session_state.pilih_lot = row['Lot Number']
+                    st.session_state.pilih_part = row['Part']
+                    st.session_state.pilih_catatan_rak = row['Catatan']
+                    st.session_state.max_pallet = row['Pallet']
+                    st.session_state.max_dus = row['Dus']
+                    pindah_slide(5); st.rerun()
 
 elif st.session_state.slide == 5:
     if st.button("🔙 BATAL"): pindah_slide(4); st.rerun()
     
+    k_pilih = st.session_state.pilih_kolom
+    b_pilih = st.session_state.pilih_baris
+    lot_pilih = st.session_state.pilih_lot
     init_p = int(st.session_state.max_pallet or 0)
     init_d = int(st.session_state.max_dus or 0)
     
@@ -215,19 +196,26 @@ elif st.session_state.slide == 5:
     st.markdown("### Konfirmasi Pengeluaran")
     with st.container(border=True):
         st.markdown(core.format_nama_warna_bold(st.session_state.item))
-        st.markdown(f"**Lokasi:** Rak {st.session_state.pilih_kolom}-{st.session_state.pilih_baris}  |  **Lot:** `{st.session_state.pilih_lot}`")
+        st.markdown(f"**Lokasi:** Rak {k_pilih}-{b_pilih}  |  **Lot:** `{lot_pilih}`")
         st.info(f"📦 **Stok Awal (Initial):** {init_p} Pallet, {init_d} {satuan} (**{total_pcs_init:,} Pcs**)")
         st.caption(f"Standar Packing: 1 Pallet = {pecahan_per_pallet} {satuan} | 1 {satuan} = {pcs_per_pecahan:,} Pcs")
         
     st.write("")
     st.markdown("**INPUT SISA STOK AKHIR DI RAK (FINAL):**")
     default_sisa_p = max(0, init_p - 1) if init_p > 0 else 0
+    max_sisa_d = max(init_d, pecahan_per_pallet - 1) if pecahan_per_pallet > 1 else max(init_d, 100)
+    
     col_q1, col_q2 = st.columns(2)
     with col_q1:
-        sisa_pallet = st.number_input("SISA PALLET UTUH", min_value=0, max_value=init_p, step=1, value=default_sisa_p)
+        sisa_pallet = st.number_input(
+            "SISA PALLET UTUH", min_value=0, max_value=init_p, step=1,
+            value=default_sisa_p, key=f"out_sisa_p_{k_pilih}_{b_pilih}_{lot_pilih}"
+        )
     with col_q2:
-        max_sisa_d = max(init_d, pecahan_per_pallet * 2) if pecahan_per_pallet > 1 else max(init_d, 100)
-        sisa_dus = st.number_input(f"SISA PECAHAN ({satuan.upper()})", min_value=0, max_value=max_sisa_d, step=1, value=init_d)
+        sisa_dus = st.number_input(
+            f"SISA PECAHAN ({satuan.upper()})", min_value=0, max_value=max_sisa_d, step=1,
+            value=init_d, key=f"out_sisa_d_{k_pilih}_{b_pilih}_{lot_pilih}"
+        )
         
     total_pcs_final = (sisa_pallet * total_pcs_pallet) + (sisa_dus * pcs_per_pecahan)
     selisih_pcs = total_pcs_init - total_pcs_final
@@ -248,9 +236,6 @@ elif st.session_state.slide == 5:
     if selisih_pcs > 0:
         if st.button("🚀 KONFIRMASI PENGELUARAN", type="primary", use_container_width=True):
             with st.spinner("Memproses ke database..."):
-                k_pilih = st.session_state.pilih_kolom
-                b_pilih = st.session_state.pilih_baris
-                lot_pilih = st.session_state.pilih_lot
                 doc_ref = core.db.collection(core.NAMA_DATABASE).document(f"Kolom_{k_pilih}")
                 transaction = core.db.transaction() 
                 
