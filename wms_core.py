@@ -156,7 +156,7 @@ def format_nama_warna_bold(nama_barang):
     return str(nama_barang)
 
 # ==========================================================
-# 4. DATA LOADERS (CACHED UNTUK EFISIENSI KUOTA FIREBASE)
+# 4. DATA LOADERS & ALGORITMA PENCARIAN HIBRIDA (LIFO + FIFO)
 # ==========================================================
 @st.cache_data(ttl=300)
 def get_all_racking_data():
@@ -194,6 +194,89 @@ def load_master_data():
             'Nama Barang', 'Kategori', 'Gramasi', 'Part Number',
             'Total_Pcs_Pallet', 'Pcs_Per_Box', 'Pcs_Per_Sac'
         ])
+
+def cari_lokasi_stok_hibrida(semua_data, target_item):
+    """
+    Mengurutkan lokasi pengambilan stok dengan aturan Hibrida Shuttle Racking:
+    1. Kelompok AKSES LANGSUNG (0 palet penghalang di depan/mulut rak) -> diurutkan FIFO (Lot terlama dulu).
+    2. Kelompok TERHALANG DI DALAM (ada palet lain di depan) -> diurutkan dari penghalang paling sedikit, lalu FIFO.
+    """
+    if not semua_data:
+        return pd.DataFrame()
+        
+    df_all = pd.DataFrame(semua_data)
+    df_all['Baris_Int'] = pd.to_numeric(df_all['Baris'], errors='coerce').fillna(0).astype(int)
+    df_all['Pallet_Ke_Num'] = pd.to_numeric(df_all['Pallet Ke'], errors='coerce').fillna(0)
+    df_all['Catatan'] = df_all['Catatan'].fillna("").astype(str).replace('nan', '')
+    
+    df_target = df_all[
+        (df_all['Nama Produk'] == target_item) & 
+        (df_all['Part Number'].astype(str).str.strip() != "")
+    ].copy()
+    
+    if df_target.empty:
+        return pd.DataFrame()
+        
+    df_target['Group_Key'] = (
+        df_target['Kolom'].astype(str) + "_" + 
+        df_target['Baris_Int'].astype(str) + "_" + 
+        df_target['Lot Number'].astype(str)
+    )
+    
+    rekap_lokasi = []
+    for _, df_group in df_target.groupby('Group_Key'):
+        kol = str(df_group.iloc[0]['Kolom'])
+        bar = int(df_group.iloc[0]['Baris_Int'])
+        lot = str(df_group.iloc[0]['Lot Number'])
+        catatan = str(df_group.iloc[0]['Catatan'])
+        part_num = str(df_group.iloc[0]['Part Number'])
+        satuan_str = get_satuan_kemasan(part_num)
+        
+        jml_utuh = df_group[~df_group['Keterangan'].astype(str).str.contains('Pecahan|Eceran', case=False, na=False)].shape[0]
+        pecahan_rows = df_group[df_group['Keterangan'].astype(str).str.contains('Pecahan|Eceran', case=False, na=False)]
+        jml_dus = sum(parse_keterangan(r['Keterangan'])[0] for _, r in pecahan_rows.iterrows())
+        
+        # Deteksi apakah palet target terjepit di tengah/belakang lorong (Shuttle LIFO)
+        max_pos_target = df_group['Pallet_Ke_Num'].max()
+        df_aisle = df_all[(df_all['Kolom'] == kol) & (df_all['Baris_Int'] == bar)]
+        
+        df_penghalang = df_aisle[
+            (df_aisle['Pallet_Ke_Num'] > max_pos_target) &
+            ~((df_aisle['Nama Produk'] == target_item) & (df_aisle['Lot Number'].astype(str) == lot))
+        ]
+        jml_penghalang = len(df_penghalang)
+        
+        info_penghalang = ""
+        if jml_penghalang > 0:
+            item_depan = df_penghalang['Nama Produk'].dropna().unique().tolist()
+            if len(item_depan) == 1 and item_depan[0] == target_item:
+                lot_depan = df_penghalang['Lot Number'].dropna().unique().tolist()
+                info_penghalang = f"Lot lebih baru ({', '.join(lot_depan[:2])})"
+            else:
+                nama_depan = [x.split(',')[-1].strip() if ',' in x else x[:18] for x in item_depan[:2]]
+                info_penghalang = f"Item lain ({', '.join(nama_depan)})"
+                
+        rekap_lokasi.append({
+            'Kolom': kol,
+            'Baris': bar,
+            'Lot Number': lot,
+            'FIFO_Key': parse_fifo_key(lot),
+            'Pallet': jml_utuh,
+            'Dus': jml_dus,
+            'Satuan': satuan_str,
+            'Catatan': catatan,
+            'Part': part_num,
+            'JmlPenghalang': jml_penghalang,
+            'InfoPenghalang': info_penghalang,
+            'IsTerhalang': 1 if jml_penghalang > 0 else 0
+        })
+        
+    df_rekap = pd.DataFrame(rekap_lokasi).sort_values(
+        by=['IsTerhalang', 'JmlPenghalang', 'FIFO_Key'],
+        ascending=[True, True, True]
+    ).reset_index(drop=True)
+    
+    return df_rekap
 
 # ==========================================================
 # 5. AUDIT LOG & PERSISTENT UNDO (30 MENIT)
@@ -338,10 +421,6 @@ def render_header_dan_undo(app_title, accent_color, prefix_app, mode_badge="", r
 # ==========================================================
 @firestore.transactional
 def proses_inbound_multi_transaction(transaction, doc_refs_dict, alokasi_list, lot_pilih, part_num, item_name, tipe_pecahan, catatan):
-    """
-    Mengeksekusi penempatan inbound ke 1 atau beberapa rak sekaligus secara atomik,
-    termasuk validasi ulang batas kapasitas baris agar tidak terjadi overlimit.
-    """
     snapshots = {kol: ref.get(transaction=transaction) for kol, ref in doc_refs_dict.items()}
     backup_kolom = {}
     data_per_kolom = {}
@@ -364,7 +443,6 @@ def proses_inbound_multi_transaction(transaction, doc_refs_dict, alokasi_list, l
         rak_ini = [d for d in all_col if float(d.get('Baris', 0) or 0) == b_pilih]
         rak_lain = [d for d in all_col if float(d.get('Baris', 0) or 0) != b_pilih]
         
-        # Validasi ulang kapasitas riil di dalam transaksi terkunci
         max_sac = 31 if b_int <= 16 else 44
         max_dus = 32 if b_int <= 16 else 46
         
