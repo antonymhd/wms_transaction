@@ -18,7 +18,7 @@ st.markdown("""
         footer {visibility: hidden;}
         
         .stButton>button {
-            min-height: 75px; 
+            min-height: 72px; 
             height: auto;
             font-size: 17px; 
             font-weight: 600;
@@ -26,7 +26,7 @@ st.markdown("""
             white-space: pre-wrap; 
             word-wrap: break-word;
             text-align: left; 
-            padding: 16px;
+            padding: 15px;
             box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
             transition: all 0.15s ease-in-out;
         }
@@ -44,6 +44,11 @@ st.markdown("""
             border-color: #EF4444 !important;
             color: white !important;
             text-align: center !important;
+        }
+
+        .btn-center > button {
+            text-align: center !important;
+            font-size: 19px !important;
         }
         
         .progress-container {
@@ -74,25 +79,26 @@ st.markdown("""
 # ==========================================================
 NAMA_DATABASE = 'uji_coba_rak'
 DB_LOG_MUTASI = 'log_mutasi_rak'
+DB_UNDO_STATE = 'wms_undo_state'
+OPERATOR_INBOUND = ["Fahmi", "Adip", "Didik", "Agung"]
 
 if not firebase_admin._apps:
     cred = credentials.Certificate(dict(st.secrets["firebase"]))
     firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-def get_waktu_jkt(): return datetime.utcnow() + timedelta(hours=7)
+def get_waktu_jkt():
+    return datetime.utcnow() + timedelta(hours=7)
 
 def kirim_notif_telegram(pesan_html):
     try:
         token = st.secrets["telegram"]["bot_token"]
-        chat_id = st.secrets["telegram"]["chat_id"]
+        raw_chat_ids = str(st.secrets["telegram"]["chat_id"])
+        daftar_id = [cid.strip() for cid in raw_chat_ids.split(",") if cid.strip()]
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {
-            "chat_id": chat_id,
-            "text": pesan_html,
-            "parse_mode": "HTML"
-        }
-        requests.post(url, json=payload, timeout=3)
+        for cid in daftar_id:
+            payload = {"chat_id": cid, "text": pesan_html, "parse_mode": "HTML"}
+            requests.post(url, json=payload, timeout=2)
     except Exception:
         pass
 
@@ -112,7 +118,45 @@ def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh,
     except Exception: pass 
 
 # ==========================================================
-# 3. FIREBASE TRANSACTIONS & CACHE
+# 3. PERSISTENT UNDO 30 MENIT (HEMAT KUOTA READ)
+# ==========================================================
+def simpan_undo_firestore(operator_name, undo_dict, action_msg):
+    now_str = get_waktu_jkt().strftime("%Y-%m-%d %H:%M:%S")
+    payload = {
+        "status": "DONE",
+        "undo_dict": undo_dict,
+        "action_msg": action_msg,
+        "created_at": now_str
+    }
+    st.session_state.undo_record = payload
+    try:
+        db.collection(DB_UNDO_STATE).document(f"IN_{operator_name}").set(payload)
+    except Exception:
+        pass
+
+def muat_undo_firestore(operator_name):
+    try:
+        doc = db.collection(DB_UNDO_STATE).document(f"IN_{operator_name}").get()
+        if doc.exists:
+            data = doc.to_dict()
+            if data.get("status") == "DONE" and data.get("created_at"):
+                created_dt = datetime.strptime(data["created_at"], "%Y-%m-%d %H:%M:%S")
+                if (get_waktu_jkt() - created_dt) <= timedelta(minutes=30):
+                    st.session_state.undo_record = data
+                    return
+    except Exception:
+        pass
+    st.session_state.undo_record = None
+
+def tutup_undo_firestore(operator_name, new_status="CLOSED"):
+    st.session_state.undo_record = {"status": new_status} if new_status == "UNDONE" else None
+    try:
+        db.collection(DB_UNDO_STATE).document(f"IN_{operator_name}").update({"status": new_status})
+    except Exception:
+        pass
+
+# ==========================================================
+# 4. FIREBASE TRANSACTIONS & CACHE
 # ==========================================================
 @st.cache_data(ttl=300)
 def get_all_racking_data():
@@ -168,7 +212,7 @@ def proses_inbound_transaction(transaction, doc_ref, k_pilih, b_pilih, lot_pilih
     return data_lama_sebelum_update 
 
 # ==========================================================
-# 4. MASTER PRODUK & FORMATTING
+# 5. MASTER PRODUK & FORMATTING
 # ==========================================================
 def ekstrak_gramasi(nama_produk):
     match = re.search(r'(\d+[.,]\d+)\s*(?:gr|GR)', str(nama_produk), re.IGNORECASE)
@@ -202,73 +246,140 @@ def load_master_data():
 
 df_master = load_master_data()
 
-keys_state = ['slide', 'kategori', 'gramasi', 'item', 'pilih_part', 'in_lot', 'in_qty_p', 'in_qty_c', 'in_tipe_c', 'pilih_kolom', 'pilih_baris', 'operator', 'action_msg', 'action_status', 'undo_dict']
+keys_state = [
+    'slide', 'kategori', 'gramasi', 'item', 'pilih_part', 'in_lot',
+    'in_qty_p', 'in_qty_c', 'in_tipe_c', 'pilih_kolom', 'pilih_baris',
+    'operator', 'undo_record'
+]
 for key in keys_state:
     if key not in st.session_state:
-        if key == 'operator': st.session_state[key] = "Operator 1 (Default)"
-        elif key == 'slide': st.session_state[key] = 1
-        elif key == 'undo_dict': st.session_state[key] = {}
-        elif key == 'action_msg': st.session_state[key] = ""
+        if key == 'slide': st.session_state[key] = 0
         else: st.session_state[key] = None
 
-def pindah_slide(tujuan): st.session_state.slide = tujuan
-
-# HEADER STATUS 
-st.markdown(f"""
-    <div class="db-info-box">
-        <div style="font-size: 14px; font-weight: bold; color: #10B981; margin-bottom: 4px;">
-            🧭 Inbound - Rack Navigator
-        </div>
-        <div style="font-size: 12px; opacity: 0.8;">
-            📡 DB: <strong>{NAMA_DATABASE}</strong>  |  👤 <strong>{st.session_state.operator}</strong>
-        </div>
-    </div>
-""", unsafe_allow_html=True)
+def pindah_slide(tujuan):
+    st.session_state.slide = tujuan
 
 # ==========================================================
-# 5. NOTIFIKASI & SISTEM UNDO
+# SLIDE 0: PILIH OPERATOR BERTUGAS
 # ==========================================================
-if st.session_state.action_status == 'DONE':
-    with st.container(border=True):
-        st.success(f"✅ **BERHASIL MASUK:** {st.session_state.action_msg}")
-        c_undo1, c_undo2 = st.columns(2)
-        with c_undo1:
-            st.markdown('<div class="btn-undo">', unsafe_allow_html=True)
-            if st.button("⏪ BATAL MASUK (UNDO)", use_container_width=True):
-                with st.spinner("Membatalkan penerimaan..."):
-                    batch_undo = db.batch()
-                    kol_terdampak = []
-                    for kol, dat in st.session_state.undo_dict.items():
-                        doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{kol}")
-                        batch_undo.set(doc_ref, {'data': dat})
-                        kol_terdampak.append(kol)
-                    batch_undo.commit()
-                    
-                    get_all_racking_data.clear()
-                    st.session_state.action_status = 'UNDONE'
-                    catat_log_mutasi("PEMBATALAN (UNDO INBOUND)", ",".join(kol_terdampak), "ALL", "Koreksi Sistem", "-", "-", 0, 0, 0, f"Dibatalkan oleh: {st.session_state.operator}")
-                    
-                    # Kirim Notif Undo ke Telegram
-                    pesan_undo = (
-                        f"⏪ <b>UNDO INBOUND - RACK NAVIGATOR</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━\n"
-                        f"📍 <b>Kolom Dipulihkan:</b> {', '.join(kol_terdampak)}\n"
-                        f"👤 <b>Operator:</b> {escape_html(st.session_state.operator)}\n"
-                        f"🕒 <b>Waktu:</b> {get_waktu_jkt().strftime('%H:%M:%S WIB')}"
-                    )
-                    kirim_notif_telegram(pesan_undo)
-                    st.rerun()
-            st.markdown('</div>', unsafe_allow_html=True)
-        with c_undo2:
-            if st.button("TUTUP / LANJUT", use_container_width=True):
-                st.session_state.action_status = None
+if st.session_state.slide == 0:
+    st.markdown("""
+        <div class="db-info-box" style="text-align: center;">
+            <div style="font-size: 18px; font-weight: bold; color: #10B981;">
+                🧭 Inbound - Rack Navigator
+            </div>
+            <div style="font-size: 13px; opacity: 0.8; margin-top: 4px;">
+                Pilih Operator Forklift yang Bertugas
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown('<div class="btn-center">', unsafe_allow_html=True)
+    for i in range(0, len(OPERATOR_INBOUND), 2):
+        cols = st.columns(2)
+        with cols[0]:
+            op1 = OPERATOR_INBOUND[i]
+            if st.button(f"👤 {op1}", key=f"op_{op1}", use_container_width=True):
+                st.session_state.operator = op1
+                muat_undo_firestore(op1)
+                pindah_slide(1)
                 st.rerun()
-                
-elif st.session_state.action_status == 'UNDONE':
+        if i + 1 < len(OPERATOR_INBOUND):
+            with cols[1]:
+                op2 = OPERATOR_INBOUND[i+1]
+                if st.button(f"👤 {op2}", key=f"op_{op2}", use_container_width=True):
+                    st.session_state.operator = op2
+                    muat_undo_firestore(op2)
+                    pindah_slide(1)
+                    st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    st.write("")
+    with st.expander("➕ Operator Pengganti / Lainnya"):
+        op_manual = st.text_input("Ketik Nama Operator", placeholder="Masukkan nama...")
+        if st.button("MASUK DENGAN NAMA INI", type="primary", use_container_width=True):
+            if op_manual.strip():
+                nama_fix = op_manual.strip().title()
+                st.session_state.operator = nama_fix
+                muat_undo_firestore(nama_fix)
+                pindah_slide(1)
+                st.rerun()
+            else:
+                st.warning("Nama operator tidak boleh kosong.")
+    st.stop()
+
+# ==========================================================
+# HEADER STATUS & NOTIFIKASI UNDO (BERLAKU 30 MENIT)
+# ==========================================================
+col_hdr1, col_hdr2 = st.columns([3, 1])
+with col_hdr1:
+    st.markdown(f"""
+        <div class="db-info-box" style="margin-bottom: 8px;">
+            <div style="font-size: 14px; font-weight: bold; color: #10B981;">
+                🧭 Inbound - Rack Navigator
+            </div>
+            <div style="font-size: 12px; opacity: 0.85; margin-top: 2px;">
+                👤 <strong>{st.session_state.operator}</strong>  |  📡 {NAMA_DATABASE}
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+with col_hdr2:
+    if st.button("🔄 Ganti\nOperator", use_container_width=True):
+        st.session_state.operator = None
+        st.session_state.undo_record = None
+        pindah_slide(0)
+        st.rerun()
+
+undo_rec = st.session_state.undo_record
+if undo_rec and undo_rec.get("status") == "DONE":
+    masih_berlaku = True
+    if undo_rec.get("created_at"):
+        created_dt = datetime.strptime(undo_rec["created_at"], "%Y-%m-%d %H:%M:%S")
+        if (get_waktu_jkt() - created_dt) > timedelta(minutes=30):
+            masih_berlaku = False
+            st.session_state.undo_record = None
+            
+    if masih_berlaku:
+        with st.container(border=True):
+            st.success(f"✅ **BERHASIL MASUK:** {undo_rec.get('action_msg', '')}")
+            st.caption(f"⏱️ Opsi Undo tersedia selama 30 menit (Input pukul {undo_rec.get('created_at', '')[-8:]} WIB)")
+            c_undo1, c_undo2 = st.columns(2)
+            with c_undo1:
+                st.markdown('<div class="btn-undo">', unsafe_allow_html=True)
+                if st.button("⏪ BATAL MASUK (UNDO)", use_container_width=True):
+                    with st.spinner("Membatalkan penerimaan..."):
+                        batch_undo = db.batch()
+                        kol_terdampak = []
+                        for kol, dat in undo_rec.get("undo_dict", {}).items():
+                            doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{kol}")
+                            batch_undo.set(doc_ref, {'data': dat})
+                            kol_terdampak.append(kol)
+                        batch_undo.commit()
+                        
+                        get_all_racking_data.clear()
+                        tutup_undo_firestore(st.session_state.operator, "UNDONE")
+                        catat_log_mutasi("PEMBATALAN (UNDO INBOUND)", ",".join(kol_terdampak), "ALL", "Koreksi Sistem", "-", "-", 0, 0, 0, f"Dibatalkan oleh: {st.session_state.operator}")
+                        
+                        pesan_undo = (
+                            f"⏪ <b>UNDO INBOUND - RACK NAVIGATOR</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━\n"
+                            f"📍 <b>Kolom Dipulihkan:</b> {', '.join(kol_terdampak)}\n"
+                            f"👤 <b>Operator:</b> {escape_html(st.session_state.operator)}\n"
+                            f"🕒 <b>Waktu:</b> {get_waktu_jkt().strftime('%H:%M:%S WIB')}"
+                        )
+                        kirim_notif_telegram(pesan_undo)
+                        st.rerun()
+                st.markdown('</div>', unsafe_allow_html=True)
+            with c_undo2:
+                if st.button("TUTUP / LANJUT", use_container_width=True):
+                    tutup_undo_firestore(st.session_state.operator, "CLOSED")
+                    st.rerun()
+
+elif undo_rec and undo_rec.get("status") == "UNDONE":
     with st.container(border=True):
         st.warning("⏪ **Transaksi dibatalkan.** Stok ditarik kembali dari sistem.")
         if st.button("TUTUP PESAN", use_container_width=True):
-            st.session_state.action_status = None
+            st.session_state.undo_record = None
             st.rerun()
 
 def render_progress():
@@ -365,9 +476,9 @@ elif st.session_state.slide == 4:
         
         c_q1, c_q2 = st.columns(2)
         with c_q1:
-            in_qty_p = st.number_input("Pallet Utuh", min_value=0, value=st.session_state.in_qty_p if st.session_state.in_qty_p else 1)
+            in_qty_p = st.number_input("Pallet Utuh", min_value=0, value=st.session_state.in_qty_p if st.session_state.in_qty_p is not None else 1)
         with c_q2:
-            in_qty_c = st.number_input(f"Qty Pecahan ({satuan_otomatis})", min_value=0, value=st.session_state.in_qty_c if st.session_state.in_qty_c else 0)
+            in_qty_c = st.number_input(f"Qty Pecahan ({satuan_otomatis})", min_value=0, value=st.session_state.in_qty_c if st.session_state.in_qty_c is not None else 0)
             
     st.write("")
     if st.button("🔍 CARI LOKASI RAK (KONSOLIDASI)", type="primary", use_container_width=True):
@@ -437,7 +548,8 @@ elif st.session_state.slide == 5:
             status = "🟢 KONSOLIDASI (SEJENIS)" if item_sejenis > 0 else "⚪ KOSONG (BARU)"
             
             valid_slots.append({
-                'Kolom': k, 'Baris': b, 'Status': status, 'Sejenis': item_sejenis, 'UsedCap': used_cap
+                'Kolom': k, 'Baris': b, 'Status': status, 'Sejenis': item_sejenis,
+                'UsedCap': used_cap, 'IncCap': inc_cap
             })
             
         if not valid_slots:
@@ -450,9 +562,10 @@ elif st.session_state.slide == 5:
             for idx, row in df_slots.iterrows():
                 prio_label = "🌟 REKOMENDASI TERBAIK" if idx == 0 else ""
                 persentase_terisi = int(row['UsedCap'] * 100)
+                estimasi_akhir = int((row['UsedCap'] + row['IncCap']) * 100)
                 
                 btn_label = f"📍 RAK {row['Kolom']}-{row['Baris']}  |  {row['Status']}\n"
-                btn_label += f"📊 Terisi: {persentase_terisi}% ➔ Estimasi Menjadi: {int((row['UsedCap']+inc_cap)*100)}%\n"
+                btn_label += f"📊 Terisi: {persentase_terisi}% ➔ Estimasi Menjadi: {estimasi_akhir}%\n"
                 btn_label += f"{prio_label}"
                 
                 if st.button(btn_label, use_container_width=True, key=f"btn_loc_{idx}"):
@@ -468,7 +581,7 @@ elif st.session_state.slide == 6:
     st.markdown("### Konfirmasi Inbound")
     with st.container(border=True):
         st.markdown(format_nama_warna_bold(st.session_state.item))
-        st.markdown(f"**Rak Tujuan:** {st.session_state.pilih_kolom}-{st.session_state.pilih_baris}  |  **Lot Masuk:** {st.session_state.in_lot}")
+        st.markdown(f"**Rak Tujuan:** {st.session_state.pilih_kolom}-{st.session_state.pilih_baris}  |  **Lot Masuk:** `{st.session_state.in_lot}`")
         teks_pecahan = f", {st.session_state.in_qty_c} {st.session_state.in_tipe_c}" if st.session_state.in_qty_c > 0 else ""
         st.caption(f"Total Masuk: {st.session_state.in_qty_p} Pallet Utuh{teks_pecahan}")
         
@@ -497,7 +610,6 @@ elif st.session_state.slide == 6:
                 
                 catat_log_mutasi("INBOUND (Remote)", k_pilih, b_pilih, st.session_state.item, st.session_state.pilih_part, st.session_state.in_lot, st.session_state.in_qty_p, st.session_state.in_qty_c, 0, teks_keterangan)
                 
-                # Kirim Notifikasi Telegram
                 pecahan_tele = f", {st.session_state.in_qty_c} {st.session_state.in_tipe_c}" if st.session_state.in_qty_c > 0 else ""
                 pesan_tele = (
                     f"📥 <b>INBOUND - RACK NAVIGATOR</b>\n"
@@ -513,11 +625,10 @@ elif st.session_state.slide == 6:
                 
                 get_all_racking_data.clear() 
                 
-                st.session_state.undo_dict = {k_pilih: data_sebelum_update}
-                st.session_state.action_msg = f"{st.session_state.in_qty_p} Pallet masuk ke Rak {k_pilih}-{b_pilih}."
-                st.session_state.action_status = 'DONE'
+                msg_sukses = f"{st.session_state.in_qty_p} Pallet{pecahan_tele} masuk ke Rak {k_pilih}-{b_pilih}."
+                simpan_undo_firestore(st.session_state.operator, {k_pilih: data_sebelum_update}, msg_sukses)
                 
-                st.toast(st.session_state.action_msg, icon="✅")
+                st.toast(msg_sukses, icon="✅")
                 
                 for k in ['kategori', 'gramasi', 'item', 'pilih_part', 'in_lot', 'in_qty_p', 'in_qty_c', 'in_tipe_c', 'pilih_kolom', 'pilih_baris']:
                     st.session_state[k] = None
