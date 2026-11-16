@@ -208,16 +208,17 @@ elif st.session_state.mode_transaksi == "WIP":
                 st.error("❌ Stok WIP untuk item ini tidak ditemukan di seluruh rak!")
             else:
                 for idx, row in df_rekap.iterrows():
-                    if row['SisiAkses'] == "DEPAN":
+                    sisi_akses = row.get('SisiAkses', 'DEPAN')
+                    if sisi_akses == "DEPAN":
                         akses_badge = "✅ AKSES DEPAN (FIFO)"
                         prioritas_label = "🌟 REKOMENDASI UTAMA" if idx == 0 else f"⭐ URUTAN {idx + 1}"
-                    elif row['SisiAkses'] == "BELAKANG":
+                    elif sisi_akses == "BELAKANG":
                         akses_badge = "✅ AKSES BELAKANG (LIFO)"
                         prioritas_label = "🌟 REKOMENDASI UTAMA" if idx == 0 else f"⭐ URUTAN {idx + 1}"
                     else:
-                        sisi_str = "Depan" if row['SisiAkses'] == "TERHALANG_DEPAN" else "Belakang"
-                        akses_badge = f"⚠️ TERHALANG {row['MinPenghalang']} PALET ({sisi_str})"
-                        prioritas_label = f"🚧 PERLU LANGSIR ({row['InfoPenghalang']})"
+                        sisi_str = "Depan" if sisi_akses == "TERHALANG_DEPAN" else "Belakang"
+                        akses_badge = f"⚠️ TERHALANG {row.get('MinPenghalang', 0)} PALET ({sisi_str})"
+                        prioritas_label = f"🚧 PERLU LANGSIR ({row.get('InfoPenghalang', '-')})"
                         
                     catatan_label = f"\n🔖 Catatan: {row['Catatan']}" if row['Catatan'] else ""
                     btn_label = f"📍 RAK {row['Kolom']}-{row['Baris']}  |  🏷️ Lot: {row['Lot Number']}\n"
