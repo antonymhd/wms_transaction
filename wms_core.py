@@ -226,13 +226,16 @@ def load_master_data():
             'Total_Pcs_Pallet', 'Pcs_Per_Box', 'Pcs_Per_Sac'
         ])
 
-def hitung_kandidat_rak_inbound(semua_data, target_item, part_num):
+def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="BELAKANG"):
     """
-    Menyusun kandidat lorong rak berdasarkan aturan gudang:
-    1. Prioritas 1: Sudah ada item sejenis (baik 1 jenis maupun 2 jenis asal <= 2 jenis total), isi sampai penuh.
-    2. Prioritas 2: Rak kosong (0 palet), isi sampai penuh.
-    3. Prioritas 3: Rak berisi 1 item tidak sejenis (sehingga total menjadi 2 jenis item), isi sampai penuh.
-    Batas mutlak: Maksimal 2 jenis item per lorong rak.
+    Menyusun kandidat lorong rak berdasarkan aturan gudang & pintu masuk:
+    1. Prioritas 1: Sudah ada item sejenis:
+       - Jika rak hanya 1 jenis (murni sejenis): selalu boleh.
+       - Jika rak sudah 2 jenis item (sejenis + item lain): HANYA boleh jika item sejenis berada di ujung
+         pintu masuk yang dipilih (ujung BELAKANG jika masuk Belakang, ujung DEPAN jika masuk Depan),
+         agar item lain tidak terkunci (sandwich) di tengah lorong.
+    2. Prioritas 2: Rak kosong (0 palet).
+    3. Prioritas 3: Rak berisi 1 item tidak sejenis (total menjadi maksimal 2 jenis item).
     """
     KOLOM_LIST = ['A', 'B', 'C', 'D', 'E', 'F', 'G']
     BARIS_LIST = list(range(1, 29))
@@ -255,13 +258,15 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num):
         max_dus = 32 if b <= 16 else 46
         max_target = max_sac if in_is_sac else max_dus
         
+        pallets_sorted = sorted(pallets, key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0), errors='coerce'))
+        
         used_cap = 0.0
         distinct_items = set()
         distinct_lots = set()
         has_sac = False
         jml_sejenis = 0
         
-        for p in pallets:
+        for p in pallets_sorted:
             p_name = str(p.get('Nama Produk', '')).strip()
             p_lot = str(p.get('Lot Number', '')).strip()
             if p_name:
@@ -289,25 +294,38 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num):
         if len(distinct_items) >= 2 and target_item_clean not in distinct_items:
             continue
             
-        if target_item_clean in distinct_items and len(distinct_items) <= 2:
+        if target_item_clean in distinct_items and len(distinct_items) == 1:
             prio, status = 1, "🟢 PRIO 1: KONSOLIDASI SEJENIS"
-            if len(distinct_items) == 1:
-                isi_eksisting = f"{jml_sejenis}P sejenis"
-            else:
-                item_lain = [x for x in distinct_items if x != target_item_clean][0]
-                nama_ringkas = f"{item_lain[:15]}..." if len(item_lain) > 15 else item_lain
-                isi_eksisting = f"{jml_sejenis}P sejenis + {len(pallets)-jml_sejenis}P {nama_ringkas}"
+            isi_eksisting = f"{jml_sejenis}P sejenis"
             sub_sort = -used_cap
+            
+        elif target_item_clean in distinct_items and len(distinct_items) == 2:
+            # Cek posisi ujung sesuai arah masuk agar item lain tidak terkunci di tengah
+            item_ujung = (
+                str(pallets_sorted[0].get('Nama Produk', '')).strip()
+                if sisi_masuk == "DEPAN"
+                else str(pallets_sorted[-1].get('Nama Produk', '')).strip()
+            )
+            if item_ujung != target_item_clean:
+                continue
+                
+            prio, status = 1, f"🟢 PRIO 1: LANJUT SEJENIS ({sisi_masuk})"
+            item_lain = [x for x in distinct_items if x != target_item_clean][0]
+            nama_ringkas = f"{item_lain[:15]}..." if len(item_lain) > 15 else item_lain
+            isi_eksisting = f"{jml_sejenis}P sejenis (di {sisi_masuk.lower()}) + {len(pallets_sorted)-jml_sejenis}P {nama_ringkas}"
+            sub_sort = -used_cap
+            
         elif len(distinct_items) == 0:
             prio, status = 2, "⚪ PRIO 2: RAK KOSONG"
             isi_eksisting = "Kosong"
             sub_sort = 0.0
+            
         elif len(distinct_items) == 1 and target_item_clean not in distinct_items:
             prio, status = 3, "🟡 PRIO 3: CAMPUR (MAX 2 ITEM)"
             item_lain = list(distinct_items)[0]
             lot_str = ", ".join(sorted(list(distinct_lots))[:2])
             nama_ringkas = f"{item_lain[:16]}..." if len(item_lain) > 16 else item_lain
-            isi_eksisting = f"{len(pallets)}P {nama_ringkas} (Lot:{lot_str})"
+            isi_eksisting = f"{len(pallets_sorted)}P {nama_ringkas} (Lot:{lot_str})"
             sub_sort = used_cap
         else:
             continue
@@ -588,14 +606,24 @@ def proses_inbound_multi_transaction(transaction, doc_refs_dict, alokasi_list, l
             continue
             
         all_col = data_per_kolom[k_pilih]
-        rak_ini = [d for d in all_col if float(d.get('Baris', 0) or 0) == b_pilih]
+        rak_ini = sorted(
+            [d for d in all_col if float(d.get('Baris', 0) or 0) == b_pilih],
+            key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0), errors='coerce')
+        )
         rak_lain = [d for d in all_col if float(d.get('Baris', 0) or 0) != b_pilih]
         
-        # Validasi mutlak maksimal 2 jenis item di lorong rak
+        # Validasi mutlak maksimal 2 jenis item & anti-sandwich di lorong rak
         existing_items = {str(p.get('Nama Produk', '')).strip() for p in rak_ini if str(p.get('Nama Produk', '')).strip()}
-        existing_items.add(target_clean)
-        if len(existing_items) > 2:
-            raise ValueError(f"Rak {k_pilih}-{b_int} sudah terisi 2 jenis item lain. Maksimal 2 jenis item per lorong rak!")
+        if len(existing_items) >= 2:
+            if target_clean not in existing_items:
+                raise ValueError(f"Rak {k_pilih}-{b_int} sudah terisi 2 jenis item lain. Maksimal 2 jenis item per lorong rak!")
+            item_ujung = (
+                str(rak_ini[0].get('Nama Produk', '')).strip()
+                if sisi_masuk == "DEPAN"
+                else str(rak_ini[-1].get('Nama Produk', '')).strip()
+            )
+            if item_ujung != target_clean:
+                raise ValueError(f"Rak {k_pilih}-{b_int} memiliki item lain di posisi {sisi_masuk.lower()}, tidak boleh dikunci dari sisi {sisi_masuk.lower()}!")
             
         max_sac = 31 if b_int <= 16 else 44
         max_dus = 32 if b_int <= 16 else 46
@@ -611,8 +639,6 @@ def proses_inbound_multi_transaction(transaction, doc_refs_dict, alokasi_list, l
         if used_cap + inc_cap > 1.0001:
             raise ValueError(f"Rak {k_pilih}-{b_int} melebihi kapasitas maksimal baris ({max_sac if in_is_sac else max_dus} palet).")
             
-        rak_ini = sorted(rak_ini, key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
-        
         pallets_baru = []
         for i in range(qty_p):
             pallets_baru.append({
@@ -630,8 +656,6 @@ def proses_inbound_multi_transaction(transaction, doc_refs_dict, alokasi_list, l
                 'Pallet Ke': float(qty_p + 1)
             })
             
-        # DEPAN = Push-Back (mendorong stok lama mundur ke dalam lorong)
-        # BELAKANG = Normal (melanjutkan antrean di posisi belakang)
         if sisi_masuk == "DEPAN":
             gabungan_rak = pallets_baru + rak_ini
         else:
@@ -833,9 +857,10 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
             st.session_state.slide = 5
             st.rerun()
             
-        sisi_str = "DEPAN (Push-Back)" if st.session_state.in_sisi_masuk == "DEPAN" else "BELAKANG (Normal)"
+        sisi_masuk = st.session_state.get("in_sisi_masuk", default_sisi_masuk)
+        sisi_str = "DEPAN (Push-Back)" if sisi_masuk == "DEPAN" else "BELAKANG (Normal)"
         st.markdown(f"### Rencana Alokasi Multi-Rak")
-        st.caption(f"Pintu Masuk: **{sisi_str}** | Aturan: 1. Sejenis ➔ 2. Kosong ➔ 3. Campur (Max 2 Item)")
+        st.caption(f"Pintu Masuk: **{sisi_str}** | Aturan: 1. Sejenis (di {sisi_masuk.lower()}) ➔ 2. Kosong ➔ 3. Campur (Max 2 Item)")
         
         qty_p_in = int(st.session_state.in_qty_p or 0)
         qty_c_in = int(st.session_state.in_qty_c or 0)
@@ -843,11 +868,11 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
         
         with st.spinner("📐 Menyusun alokasi multi-rak sesuai prioritas..."):
             semua_data = get_all_racking_data()
-            df_kandidat = hitung_kandidat_rak_inbound(semua_data, st.session_state.item, st.session_state.pilih_part)
+            df_kandidat = hitung_kandidat_rak_inbound(semua_data, st.session_state.item, st.session_state.pilih_part, sisi_masuk=sisi_masuk)
             in_is_sac = str(st.session_state.pilih_part).strip().upper().endswith('C')
                 
             if df_kandidat.empty:
-                st.error("❌ Seluruh rak penuh atau sudah berisi 2 jenis item berbeda!")
+                st.error("❌ Seluruh rak penuh atau tidak memenuhi syarat posisi item!")
             else:
                 if in_is_sac:
                     st.caption("🛡️ *Filter aktif: Rak Sak dengan sisa ≤ 1 slot otomatis dilewati karena toleransi panjang fisik.*")
@@ -983,7 +1008,7 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                 + " (karena rak sebelumnya sudah penuh di fisik)."
             )
             semua_data = get_all_racking_data()
-            df_kandidat_sisa = hitung_kandidat_rak_inbound(semua_data, st.session_state.item, st.session_state.pilih_part)
+            df_kandidat_sisa = hitung_kandidat_rak_inbound(semua_data, st.session_state.item, st.session_state.pilih_part, sisi_masuk=sisi_masuk)
             rak_sudah_dipakai = {f"{x['Kolom']}-{x['Baris']}" for x in alokasi_aktual}
             
             if not df_kandidat_sisa.empty:
