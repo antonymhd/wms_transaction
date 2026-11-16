@@ -4,11 +4,11 @@ import wms_core as core
 st.set_page_config(page_title="Outbound & Bongkar - Rack Navigator", layout="centered", initial_sidebar_state="collapsed")
 core.inject_custom_css(accent_color="#2563EB", accent_border="#3B82F6", accent_bg_rgba="rgba(37, 99, 235, 0.1)")
 
-OPERATOR_OUTBOUND = ["Maheswara", "Amir", "Bakir", "Danny", "Abdul", "Joko"]
+OPERATOR_OUTBOUND = ["Maheswara", "Amir", "Bakir", "Danny"]
 df_master = core.load_master_data()
 
 keys_state = [
-    'slide', 'kategori', 'gramasi', 'item', 'pilih_part', 'mode_transaksi',
+    'slide', 'mode_transaksi', 'kategori', 'gramasi', 'item', 'pilih_part',
     'pilih_kolom', 'pilih_baris', 'pilih_lot', 'pilih_catatan_rak', 'max_pallet', 'max_dus',
     'in_lot', 'in_qty_p', 'in_qty_c', 'in_tipe_c', 'in_sisi_masuk', 'alokasi_terpilih',
     'operator', 'undo_record'
@@ -67,7 +67,7 @@ if st.session_state.slide == 0:
     st.stop()
 
 # ==========================================================
-# HEADER STATUS & NOTIFIKASI UNDO
+# HEADER STATUS, NOTIFIKASI UNDO & PROGRESS BAR
 # ==========================================================
 mode_badge = ""
 if st.session_state.mode_transaksi == "OUTBOUND":
@@ -82,109 +82,38 @@ core.render_header_dan_undo(
     mode_badge=mode_badge,
     reset_keys=['mode_transaksi']
 )
-
-def render_progress():
-    current = st.session_state.slide
-    mode = st.session_state.mode_transaksi
-    if mode == "OUTBOUND":
-        steps = ["Kategori", "Item", "Aksi", "Lokasi", "Selesai"]
-        idx_map = {1:1, 2:1, 3:2, 4:3, 5:4, 6:5}
-    elif mode == "INBOUND_SISA":
-        steps = ["Kategori", "Item", "Aksi", "Input", "Lokasi", "Selesai"]
-        idx_map = {1:1, 2:1, 3:2, 4:3, 5:4, 6:5, 7:6}
-    else:
-        steps = ["Kategori", "Item", "Aksi", "Proses", "Selesai"]
-        idx_map = {1:1, 2:1, 3:2, 4:3, 5:4, 6:5, 7:5}
-        
-    curr_step = idx_map.get(current, 1)
-    html = "<div class='progress-container'>"
-    for i, s in enumerate(steps, 1):
-        if i == curr_step: html += f"<span class='step-active'>{s}</span>"
-        else: html += f"<span class='step-inactive'>{s}</span>"
-        if i < len(steps): html += " <span style='opacity: 0.5;'>➔</span> "
-    html += "</div>"
-    st.markdown(html, unsafe_allow_html=True)
-
-render_progress()
+core.render_progress_bar(st.session_state.slide, st.session_state.mode_transaksi)
 
 # ==========================================================
-# SLIDE 1 - 4: KATEGORI -> GRAMASI -> ITEM -> PILIH AKTIVITAS
+# SLIDE 1: PILIH AKSI UTAMA (TASK-FIRST)
 # ==========================================================
 if st.session_state.slide == 1:
     st.session_state.mode_transaksi = None
-    st.markdown("### Pilih Kategori Produk")
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("PREFORM", use_container_width=True): st.session_state.kategori = "PREFORM"; pindah_slide(2); st.rerun()
-        if st.button("CUP COLOR", use_container_width=True): st.session_state.kategori = "CUP COLOR"; pindah_slide(2); st.rerun()
-        if st.button("CAP (TUTUP)", use_container_width=True): st.session_state.kategori = "CAP"; pindah_slide(2); st.rerun()
-    with col2:
-        if st.button("CUP NATURAL", use_container_width=True): st.session_state.kategori = "CUP NATURAL"; pindah_slide(2); st.rerun()
-        if st.button("CUP PRINTING", use_container_width=True): st.session_state.kategori = "CUP PRINTING"; pindah_slide(2); st.rerun()
-
-elif st.session_state.slide == 2:
-    if st.button("🔙 KEMBALI"): pindah_slide(1); st.rerun()
-    st.markdown(f"### Gramasi: **{st.session_state.kategori}**")
-    df_kat = df_master[df_master['Kategori'] == st.session_state.kategori]
-    list_gramasi = sorted(df_kat['Gramasi'].unique())
-    
-    st.markdown('<div class="btn-gramasi">', unsafe_allow_html=True)
-    for i in range(0, len(list_gramasi), 2):
-        cols = st.columns(2)
-        with cols[0]:
-            if st.button(f"{list_gramasi[i]}", key=f"g_{i}", use_container_width=True): st.session_state.gramasi = list_gramasi[i]; pindah_slide(3); st.rerun()
-        if i + 1 < len(list_gramasi):
-            with cols[1]:
-                if st.button(f"{list_gramasi[i+1]}", key=f"g_{i+1}", use_container_width=True): st.session_state.gramasi = list_gramasi[i+1]; pindah_slide(3); st.rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
-
-elif st.session_state.slide == 3:
-    if st.button("🔙 KEMBALI"): pindah_slide(2); st.rerun()
-    st.markdown("### Pilih Item Spesifik")
-    st.caption(f"{st.session_state.kategori} | {st.session_state.gramasi}")
-    
-    df_item = df_master[(df_master['Kategori'] == st.session_state.kategori) & (df_master['Gramasi'] == st.session_state.gramasi)]
-    for idx, row in df_item.iterrows():
-        nama_brg = row['Nama Barang']
-        part_num = str(row['Part Number']).strip().upper()
-        
-        tipe_kemasan = ""
-        if part_num:
-            if part_num[-1] in ['D', 'G']: tipe_kemasan = "[📦 DUS] "
-            elif part_num[-1] == 'C': tipe_kemasan = "[👝 SAK] "
-            elif part_num[-1] == 'A': tipe_kemasan = "[🗃️ NICTAINER] "
-                
-        btn_label = f"{tipe_kemasan}{core.format_nama_warna_bold(nama_brg)}"
-        if st.button(btn_label, use_container_width=True, key=f"btn_item_{idx}"): 
-            st.session_state.item = nama_brg
-            st.session_state.pilih_part = part_num
-            pindah_slide(4); st.rerun()
-
-elif st.session_state.slide == 4:
-    if st.button("🔙 KEMBALI KE ITEM"):
-        st.session_state.mode_transaksi = None
-        pindah_slide(3); st.rerun()
-        
     st.markdown("### Pilih Jenis Aktivitas")
-    st.info(core.format_nama_warna_bold(st.session_state.item))
     
     st.write("")
     if st.button("📤 OUTBOUND (Keluarkan Barang dari Rak)\nMengambil stok berdasarkan akses 2 pintu (Depan FIFO / Belakang LIFO)", type="primary", use_container_width=True):
         st.session_state.mode_transaksi = "OUTBOUND"
-        pindah_slide(5); st.rerun()
+        pindah_slide(2); st.rerun()
         
     st.write("")
     if st.button("📥 HASIL BONGKAR / INBOUND SISA\nMemasukkan barang bongkaran atau sisa muatan kembali ke rak (Default Sisi Depan FIFO)", use_container_width=True):
         st.session_state.mode_transaksi = "INBOUND_SISA"
         st.session_state.in_sisi_masuk = "DEPAN"
-        pindah_slide(5); st.rerun()
+        pindah_slide(2); st.rerun()
+
+# ==========================================================
+# SLIDE 2 - 4: PEMILIHAN PRODUK (KATEGORI -> GRAMASI -> ITEM)
+# ==========================================================
+elif st.session_state.slide in [2, 3, 4]:
+    core.render_pemilihan_produk(df_master)
 
 # ==========================================================
 # CABANG A: PROSES OUTBOUND (SLIDE 5 -> 6, 2 PINTU SHUTTLE)
 # ==========================================================
 elif st.session_state.mode_transaksi == "OUTBOUND":
     if st.session_state.slide == 5:
-        if st.button("🔙 GANTI AKTIVITAS"): pindah_slide(4); st.rerun()
+        if st.button("🔙 GANTI ITEM"): pindah_slide(4); st.rerun()
         st.markdown("### Lokasi Target Outbound (Akses 2 Pintu)")
         st.info(core.format_nama_warna_bold(st.session_state.item))
         
@@ -196,16 +125,17 @@ elif st.session_state.mode_transaksi == "OUTBOUND":
                 st.error("❌ Stok untuk item ini tidak ditemukan di seluruh rak!")
             else:
                 for idx, row in df_rekap.iterrows():
-                    if row['SisiAkses'] == "DEPAN":
+                    sisi_akses = row.get('SisiAkses', 'DEPAN')
+                    if sisi_akses == "DEPAN":
                         akses_badge = "✅ AKSES DEPAN (FIFO)"
                         prioritas_label = "🌟 REKOMENDASI UTAMA" if idx == 0 else f"⭐ URUTAN {idx + 1}"
-                    elif row['SisiAkses'] == "BELAKANG":
+                    elif sisi_akses == "BELAKANG":
                         akses_badge = "✅ AKSES BELAKANG (LIFO)"
                         prioritas_label = "🌟 REKOMENDASI UTAMA" if idx == 0 else f"⭐ URUTAN {idx + 1}"
                     else:
-                        sisi_str = "Depan" if row['SisiAkses'] == "TERHALANG_DEPAN" else "Belakang"
-                        akses_badge = f"⚠️ TERHALANG {row['MinPenghalang']} PALET ({sisi_str})"
-                        prioritas_label = f"🚧 PERLU LANGSIR ({row['InfoPenghalang']})"
+                        sisi_str = "Depan" if sisi_akses == "TERHALANG_DEPAN" else "Belakang"
+                        akses_badge = f"⚠️ TERHALANG {row.get('MinPenghalang', 0)} PALET ({sisi_str})"
+                        prioritas_label = f"🚧 PERLU LANGSIR ({row.get('InfoPenghalang', '-')})"
                         
                     catatan_label = f"\n🔖 Catatan: {row['Catatan']}" if row['Catatan'] else ""
                     btn_label = f"📍 RAK {row['Kolom']}-{row['Baris']}  |  🏷️ Lot: {row['Lot Number']}\n"
