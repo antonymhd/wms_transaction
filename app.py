@@ -5,7 +5,7 @@ from firebase_admin import credentials, firestore
 import io
 import copy
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # ==========================================================
 # 1. KONFIGURASI WEB & SISTEM LOGIN
@@ -14,6 +14,14 @@ st.set_page_config(page_title="WMS Data Entry - Hokkan Deltapack", page_icon="�
 
 if 'logged_in' not in st.session_state:
     st.session_state['logged_in'] = False
+
+# Inisialisasi Session Quota Counter (0 Read/Write tambahan)
+if 'fb_usage' not in st.session_state:
+    st.session_state['fb_usage'] = {'read': 0, 'write': 0, 'delete': 0}
+
+def log_fb_usage(op_type, count=1):
+    if op_type in st.session_state['fb_usage']:
+        st.session_state['fb_usage'][op_type] += count
 
 if not st.session_state['logged_in']:
     st.title("🔒 WMS Security Login")
@@ -42,6 +50,17 @@ if st.sidebar.button("🔄 Reload Master Data CSV", use_container_width=True):
     st.rerun()
 
 st.sidebar.divider()
+st.sidebar.markdown("### 📊 Monitor Kuota Sesi Ini")
+u_col1, u_col2, u_col3 = st.sidebar.columns(3)
+u_col1.metric("Read", st.session_state['fb_usage']['read'])
+u_col2.metric("Write", st.session_state['fb_usage']['write'])
+u_col3.metric("Delete", st.session_state['fb_usage']['delete'])
+st.sidebar.caption("Menghitung operasi Firebase pada sesi browser aktif ini.")
+if st.sidebar.button("Reset Counter Sesi", use_container_width=True):
+    st.session_state['fb_usage'] = {'read': 0, 'write': 0, 'delete': 0}
+    st.rerun()
+
+st.sidebar.divider()
 st.sidebar.button("🚪 Logout", on_click=lambda: st.session_state.update({'logged_in': False}), use_container_width=True)
 
 # ==========================================================
@@ -62,8 +81,22 @@ st.caption(f"Alat khusus PPIC. Terhubung ke database: {NAMA_DATABASE}")
 # 3. FUNGSI BANTUAN (HELPER FUNCTIONS)
 # ==========================================================
 def get_waktu_jkt():
-    """Mendapatkan waktu saat ini di zona WIB (UTC+7)"""
-    return datetime.utcnow() + timedelta(hours=7)
+    """Mendapatkan waktu saat ini di zona WIB (UTC+7) yang aman untuk Python 3.12+"""
+    return datetime.now(timezone.utc) + timedelta(hours=7)
+
+def fetch_kolom_cached(kolom_id, state_key, force_refresh=False):
+    """Membaca dokumen Kolom sekali saja saat diminta, lalu simpan di session_state"""
+    if force_refresh or state_key not in st.session_state or st.session_state[state_key] is None:
+        doc = db.collection(NAMA_DATABASE).document(f"Kolom_{kolom_id}").get()
+        log_fb_usage('read', 1)
+        data = doc.to_dict().get('data', []) if doc.exists else []
+        st.session_state[state_key] = data
+    return st.session_state[state_key]
+
+def clear_all_rak_caches():
+    """Membersihkan cache lokal rak setiap kali ada mutasi tersimpan"""
+    for k in ['cache_in_data', 'cache_out_data', 'cache_book_data', 'cache_relok_asal', 'cache_kor_data']:
+        st.session_state[k] = None
 
 def parse_keterangan(ket_str):
     """Fungsi sentral membaca jumlah Pecahan dan Eceran dari format teks string yang solid"""
@@ -101,8 +134,11 @@ def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh,
         "Mutasi Eceran (Pcs)": float(eceran), "Keterangan": keterangan,
         "Timestamp_System": firestore.SERVER_TIMESTAMP
     }
-    try: db.collection(DB_LOG_MUTASI).add(log_data)
-    except Exception as e: st.toast(f"⚠️ Peringatan: Gagal mencatat log mutasi ({e})", icon="⚠️")
+    try:
+        db.collection(DB_LOG_MUTASI).add(log_data)
+        log_fb_usage('write', 1)
+    except Exception as e:
+        st.toast(f"⚠️ Peringatan: Gagal mencatat log mutasi ({e})", icon="⚠️")
 
 # ==========================================================
 # 4. NOTIFIKASI & FITUR UNDO (NATIVE STREAMLIT)
@@ -128,6 +164,8 @@ if st.session_state['action_status'] == 'DONE':
                         batch_undo.set(doc_ref, {'data': dat})
                         kolom_terdampak.append(kol)
                     batch_undo.commit()
+                    log_fb_usage('write', len(kolom_terdampak))
+                    clear_all_rak_caches()
                     
                     st.session_state['action_status'] = 'UNDONE'
                     catat_log_mutasi("PEMBATALAN (UNDO)", ",".join(kolom_terdampak), "ALL", "Koreksi Sistem", "-", "-", 0, 0, 0, f"Membatalkan: {st.session_state['action_msg']}")
@@ -181,13 +219,12 @@ with tab1:
         
         if st.button("🔍 Cek Status Rak", use_container_width=True):
             st.session_state.update({'in_lokasi_dicari': True, 'in_k_pilih': in_kolom, 'in_b_pilih': in_baris})
+            fetch_kolom_cached(in_kolom, 'cache_in_data', force_refresh=True)
             
     with col_in2:
         if st.session_state['in_lokasi_dicari']:
             k_pilih, b_pilih = st.session_state['in_k_pilih'], st.session_state['in_b_pilih']
-            doc_ref_in = db.collection(NAMA_DATABASE).document(f"Kolom_{k_pilih}")
-            doc_in = doc_ref_in.get()
-            all_data_raw = doc_in.to_dict().get('data', []) if doc_in.exists else []
+            all_data_raw = fetch_kolom_cached(k_pilih, 'cache_in_data', force_refresh=False)
             
             baris_data_preview = [d for d in all_data_raw if float(d.get('Baris', 0) or 0) == float(b_pilih) and str(d.get('Part Number', '')).strip() != '']
             is_all_box_existing = all(str(d.get('Part Number', '')).strip().upper().endswith(('D', 'G')) for d in baris_data_preview) if baris_data_preview else False
@@ -243,74 +280,92 @@ with tab1:
                 elif in_qty == 0 and in_pecahan == 0 and in_eceran == 0:
                     st.error("⚠️ Masukkan minimal 1 Qty!")
                 else:
-                    with st.spinner("Menyusun data ke dalam rak..."):
-                        all_data = [d for d in all_data_raw if not (float(d.get('Baris', 0) or 0) == float(b_pilih) and str(d.get('Part Number', '')).strip() == '')]
-                        baris_data_actual = [d for d in all_data if float(d.get('Baris', 0) or 0) == float(b_pilih)]
+                    with st.spinner("Menyusun data ke dalam rak (Transactional Lock)..."):
+                        doc_ref_in = db.collection(NAMA_DATABASE).document(f"Kolom_{k_pilih}")
                         
-                        is_all_box_actual = in_part_clean.endswith(('D', 'G'))
-                        existing_fraction_row = None
-                        
-                        for d in baris_data_actual:
-                            pn = str(d.get('Part Number', '')).strip().upper()
-                            if pn and not pn.endswith(('D', 'G')): is_all_box_actual = False
-                            if not in_dari_depan and pn == in_part_clean and str(d.get('Lot Number', '')).strip() == in_lot_final:
-                                ket = str(d.get('Keterangan', ''))
-                                if 'Pecahan' in ket or 'Eceran' in ket: existing_fraction_row = d
-                                    
-                        max_slot_actual = 999 if k_pilih == 'S' else (32 if (is_all_box_actual and b_pilih <= 16) else (46 if is_all_box_actual else (31 if b_pilih <= 16 else 44)))
-                        
-                        slot_tambahan_in = 0
-                        if (in_pecahan > 0 or in_eceran > 0) and not existing_fraction_row: slot_tambahan_in = 1
-                        total_inbound_slots = in_qty + slot_tambahan_in
-                        
-                        new_records = []
-                        
-                        if in_dari_depan and baris_data_actual:
-                            for d in all_data:
-                                if float(d.get('Baris', 0) or 0) == float(b_pilih):
-                                    d['Pallet Ke'] = float(d.get('Pallet Ke', 0)) + total_inbound_slots
-                            next_pallet = 1
-                            filled_pallets = []
-                        else:
-                            filled_pallets = [int(float(d.get('Pallet Ke', 0) or 0)) for d in baris_data_actual if pd.notna(d.get('Pallet Ke'))]
-                            next_pallet = max(filled_pallets) + 1 if filled_pallets else 1
+                        @firestore.transactional
+                        def tx_inbound(transaction, doc_ref):
+                            snap = doc_ref.get(transaction=transaction)
+                            log_fb_usage('read', 1)
+                            fresh_raw = snap.to_dict().get('data', []) if snap.exists else []
                             
-                        for _ in range(int(in_qty)):
-                            while not in_dari_depan and next_pallet in filled_pallets: next_pallet += 1
-                            is_bayangan = next_pallet > max_slot_actual
-                            new_records.append({
-                                'Kolom': k_pilih, 'Baris': float(b_pilih), 'Pallet Ke': float(next_pallet),
-                                'Part Number': in_part_clean, 'Lot Number': in_lot_final, 'Nama Produk': in_produk_clean,
-                                'Status': 'Terisi', 'Keterangan': '', 'Catatan': "[BAYANGAN - OVERCAPACITY]" if is_bayangan else ""
-                            })
-                            filled_pallets.append(next_pallet)
-                            next_pallet += 1
+                            all_data = [d for d in fresh_raw if not (float(d.get('Baris', 0) or 0) == float(b_pilih) and str(d.get('Part Number', '')).strip() == '')]
+                            baris_data_actual = [d for d in all_data if float(d.get('Baris', 0) or 0) == float(b_pilih)]
                             
-                        if in_pecahan > 0 or in_eceran > 0:
-                            if existing_fraction_row and not in_dari_depan:
-                                ex_pecahan, ex_eceran = parse_keterangan(existing_fraction_row.get('Keterangan', ''))
-                                new_pec, new_ec = ex_pecahan + in_pecahan, ex_eceran + in_eceran
-                                ket_parts = []
-                                if new_pec > 0: ket_parts.append(f"Pecahan: {new_pec} qty")
-                                if new_ec > 0: ket_parts.append(f"Eceran: {new_ec} pcs")
-                                existing_fraction_row['Keterangan'] = " | ".join(ket_parts)
+                            is_all_box_actual = in_part_clean.endswith(('D', 'G'))
+                            existing_fraction_row = None
+                            
+                            for d in baris_data_actual:
+                                pn = str(d.get('Part Number', '')).strip().upper()
+                                if pn and not pn.endswith(('D', 'G')): is_all_box_actual = False
+                                if not in_dari_depan and pn == in_part_clean and str(d.get('Lot Number', '')).strip() == in_lot_final:
+                                    ket = str(d.get('Keterangan', ''))
+                                    if 'Pecahan' in ket or 'Eceran' in ket: existing_fraction_row = d
+                                        
+                            max_slot_actual = 999 if k_pilih == 'S' else (32 if (is_all_box_actual and b_pilih <= 16) else (46 if is_all_box_actual else (31 if b_pilih <= 16 else 44)))
+                            
+                            slot_tambahan_in = 0
+                            if (in_pecahan > 0 or in_eceran > 0) and not existing_fraction_row: slot_tambahan_in = 1
+                            total_inbound = in_qty + slot_tambahan_in
+                            
+                            new_records = []
+                            
+                            if in_dari_depan and baris_data_actual:
+                                for d in all_data:
+                                    if float(d.get('Baris', 0) or 0) == float(b_pilih):
+                                        new_idx = float(d.get('Pallet Ke', 0)) + total_inbound
+                                        d['Pallet Ke'] = new_idx
+                                        # Update status bayangan untuk palet lama yang terdorong
+                                        cat_lama = str(d.get('Catatan', '')).replace('nan', '')
+                                        if new_idx > max_slot_actual and 'BAYANGAN' not in cat_lama.upper():
+                                            d['Catatan'] = ("[BAYANGAN - OVERCAPACITY] " + cat_lama).strip()
+                                next_pallet = 1
+                                filled_pallets = []
                             else:
+                                filled_pallets = [int(float(d.get('Pallet Ke', 0) or 0)) for d in baris_data_actual if pd.notna(d.get('Pallet Ke'))]
+                                next_pallet = max(filled_pallets) + 1 if filled_pallets else 1
+                                
+                            for _ in range(int(in_qty)):
                                 while not in_dari_depan and next_pallet in filled_pallets: next_pallet += 1
-                                ket_parts = []
-                                if in_pecahan > 0: ket_parts.append(f"Pecahan: {in_pecahan} qty")
-                                if in_eceran > 0: ket_parts.append(f"Eceran: {in_eceran} pcs")
+                                is_bayangan = next_pallet > max_slot_actual
                                 new_records.append({
                                     'Kolom': k_pilih, 'Baris': float(b_pilih), 'Pallet Ke': float(next_pallet),
                                     'Part Number': in_part_clean, 'Lot Number': in_lot_final, 'Nama Produk': in_produk_clean,
-                                    'Status': 'Terisi', 'Keterangan': " | ".join(ket_parts), 'Catatan': "[BAYANGAN - OVERCAPACITY]" if next_pallet > max_slot_actual else ""
+                                    'Status': 'Terisi', 'Keterangan': '', 'Catatan': "[BAYANGAN - OVERCAPACITY]" if is_bayangan else ""
                                 })
+                                filled_pallets.append(next_pallet)
+                                next_pallet += 1
                                 
-                        all_data.extend(new_records)
-                        doc_ref_in.set({'data': all_data})
+                            if in_pecahan > 0 or in_eceran > 0:
+                                if existing_fraction_row and not in_dari_depan:
+                                    ex_pecahan, ex_eceran = parse_keterangan(existing_fraction_row.get('Keterangan', ''))
+                                    new_pec, new_ec = ex_pecahan + in_pecahan, ex_eceran + in_eceran
+                                    ket_parts = []
+                                    if new_pec > 0: ket_parts.append(f"Pecahan: {new_pec} qty")
+                                    if new_ec > 0: ket_parts.append(f"Eceran: {new_ec} pcs")
+                                    existing_fraction_row['Keterangan'] = " | ".join(ket_parts)
+                                else:
+                                    while not in_dari_depan and next_pallet in filled_pallets: next_pallet += 1
+                                    ket_parts = []
+                                    if in_pecahan > 0: ket_parts.append(f"Pecahan: {in_pecahan} qty")
+                                    if in_eceran > 0: ket_parts.append(f"Eceran: {in_eceran} pcs")
+                                    new_records.append({
+                                        'Kolom': k_pilih, 'Baris': float(b_pilih), 'Pallet Ke': float(next_pallet),
+                                        'Part Number': in_part_clean, 'Lot Number': in_lot_final, 'Nama Produk': in_produk_clean,
+                                        'Status': 'Terisi', 'Keterangan': " | ".join(ket_parts), 'Catatan': "[BAYANGAN - OVERCAPACITY]" if next_pallet > max_slot_actual else ""
+                                    })
+                                    
+                            all_data.extend(new_records)
+                            transaction.set(doc_ref, {'data': all_data})
+                            log_fb_usage('write', 1)
+                            return fresh_raw, total_inbound
+
+                        fresh_snapshot, total_inbound_slots = tx_inbound(db.transaction(), doc_ref_in)
                         catat_log_mutasi("INBOUND", k_pilih, b_pilih, in_produk_clean, in_part_clean, in_lot_final, in_qty, in_pecahan, in_eceran)
+                        clear_all_rak_caches()
                         
                         st.session_state.update({
-                            'undo_dict': {k_pilih: all_data_raw}, 
+                            'undo_dict': {k_pilih: fresh_snapshot}, 
                             'action_msg': f"Inbound {total_inbound_slots} Slot '{in_produk_clean}' ke Rak {k_pilih}-{b_pilih} {'(Push-back)' if in_dari_depan else ''}", 
                             'action_status': 'DONE',
                             'kor_dicari': False,
@@ -342,14 +397,13 @@ with tab2:
         st.write("")
         if st.button("🔍 Cari Data Rak", use_container_width=True): 
             st.session_state.update({'out_lokasi_dicari': True, 'out_k_pilih': out_kolom, 'out_b_pilih': out_baris})
+            fetch_kolom_cached(out_kolom, 'cache_out_data', force_refresh=True)
             
     st.divider()
     
     if st.session_state['out_lokasi_dicari']:
         k_pilih, b_pilih = st.session_state['out_k_pilih'], st.session_state['out_b_pilih']
-        doc_ref_out = db.collection(NAMA_DATABASE).document(f"Kolom_{k_pilih}")
-        doc_out = doc_ref_out.get()
-        all_out_data = doc_out.to_dict().get('data', []) if doc_out.exists else []
+        all_out_data = fetch_kolom_cached(k_pilih, 'cache_out_data', force_refresh=False)
         baris_out_data = [d for d in all_out_data if float(d.get('Baris', 0) or 0) == float(b_pilih) and str(d.get('Part Number', '')).strip() != '']
         
         if baris_out_data:
@@ -404,37 +458,48 @@ with tab2:
                 'Catatan Tambahan': st.column_config.TextColumn("Catatan Tambahan", max_chars=100)
             }
             
-            # --- FIX: Ditambahkan KEY agar tidak bentrok rendering di background ---
             edited_df = st.data_editor(df_rekap, column_config=config_kolom, hide_index=True, use_container_width=True, num_rows="fixed", key=f"editor_out_{k_pilih}_{b_pilih}")
             
             if st.button("🚜 Simpan Penyesuaian Massal (OUTBOUND)", type="primary", use_container_width=True):
-                has_changes = False
-                error_msg = ""
-                
-                data_rak_ini = [d for d in all_out_data if float(d.get('Baris', 0) or 0) == float(b_pilih)]
-                data_rak_lain = [d for d in all_out_data if float(d.get('Baris', 0) or 0) != float(b_pilih)]
+                doc_ref_out = db.collection(NAMA_DATABASE).document(f"Kolom_{k_pilih}")
                 
                 def match_g_key(d, target_key):
                     c = str(d.get('Catatan', '')).replace('nan', '')
                     return (str(d.get('Lot Number','')) + "_" + str(d.get('Nama Produk','')) + "_" + c) == target_key
 
-                for index, row in edited_df.iterrows():
-                    g_key = str(row['Group_Key'])
-                    l = str(row['Lot Number'])
-                    sisa_utuh = int(row['Sisa Utuh Baru'])
-                    sisa_dus = int(row['Sisa Dus Baru'])
-                    sisa_pcs = int(row['Sisa Pcs Baru'])
-                    catatan_out = str(row['Catatan Tambahan'])
+                @firestore.transactional
+                def tx_outbound(transaction, doc_ref):
+                    snap = doc_ref.get(transaction=transaction)
+                    log_fb_usage('read', 1)
+                    fresh_out_data = snap.to_dict().get('data', []) if snap.exists else []
                     
-                    awal_utuh = int(row['Awal Utuh'])
-                    awal_dus = int(row['Awal Dus'])
-                    awal_pcs = int(row['Awal Pcs'])
+                    has_changes = False
+                    error_msg = ""
+                    logs_to_write = []
                     
-                    if sisa_utuh != awal_utuh or sisa_dus != awal_dus or sisa_pcs != awal_pcs or catatan_out != "":
-                        has_changes = True
-                        df_lot = pd.DataFrame([d for d in data_rak_ini if match_g_key(d, g_key)])
+                    data_rak_ini = [d for d in fresh_out_data if float(d.get('Baris', 0) or 0) == float(b_pilih)]
+                    data_rak_lain = [d for d in fresh_out_data if float(d.get('Baris', 0) or 0) != float(b_pilih)]
+
+                    for _, row in edited_df.iterrows():
+                        g_key = str(row['Group_Key'])
+                        l = str(row['Lot Number'])
+                        sisa_utuh = int(row['Sisa Utuh Baru'])
+                        sisa_dus = int(row['Sisa Dus Baru'])
+                        sisa_pcs = int(row['Sisa Pcs Baru'])
+                        catatan_out = str(row['Catatan Tambahan'])
                         
-                        if not df_lot.empty:
+                        awal_utuh = int(row['Awal Utuh'])
+                        awal_dus = int(row['Awal Dus'])
+                        awal_pcs = int(row['Awal Pcs'])
+                        
+                        if sisa_utuh != awal_utuh or sisa_dus != awal_dus or sisa_pcs != awal_pcs or catatan_out != "":
+                            has_changes = True
+                            df_lot = pd.DataFrame([d for d in data_rak_ini if match_g_key(d, g_key)])
+                            
+                            if df_lot.empty:
+                                error_msg = f"❌ Data Lot {l} berubah oleh user lain. Silakan klik 'Cari Data Rak' ulang."
+                                break
+
                             df_lot['Pallet Ke'] = pd.to_numeric(df_lot['Pallet Ke'])
                             df_lot = df_lot.sort_values('Pallet Ke', ascending=False)
                             
@@ -442,7 +507,7 @@ with tab2:
                             total_slot_dibutuhkan = sisa_utuh + slot_tambahan
                             
                             if total_slot_dibutuhkan > len(df_lot):
-                                error_msg = f"❌ Sisa akhir Lot {l} melebihi kapasitas awal."
+                                error_msg = f"❌ Sisa akhir Lot {l} melebihi kapasitas stok terkini ({len(df_lot)} slot)."
                                 break
                             
                             out_qty = len(df_lot) - total_slot_dibutuhkan
@@ -475,25 +540,35 @@ with tab2:
                             keluar_utuh = awal_utuh - sisa_utuh
                             keluar_pecahan = awal_dus - sisa_dus
                             keluar_eceran = awal_pcs - sisa_pcs
-                            catat_log_mutasi("OUTBOUND (Massal)", k_pilih, b_pilih, str(row['Produk']), str(row['Part Number']), l, keluar_utuh, keluar_pecahan, keluar_eceran, catatan_out)
+                            logs_to_write.append(("OUTBOUND (Massal)", k_pilih, b_pilih, str(row['Produk']), str(row['Part Number']), l, keluar_utuh, keluar_pecahan, keluar_eceran, catatan_out))
 
-                if error_msg: st.error(error_msg)
-                elif has_changes:
+                    if error_msg or not has_changes:
+                        return False, error_msg, fresh_out_data, []
+
                     data_rak_ini = sorted([d for d in data_rak_ini if float(d.get('Baris', 0) or 0) == float(b_pilih)], key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
                     for i, d in enumerate(data_rak_ini, 1): d['Pallet Ke'] = float(i)
                     
-                    doc_ref_out.set({'data': data_rak_lain + data_rak_ini})
-                    
-                    # --- FIX: Reset State Pencarian Tab Lain Agar Tidak Ghost Rendering ---
+                    transaction.set(doc_ref, {'data': data_rak_lain + data_rak_ini})
+                    log_fb_usage('write', 1)
+                    return True, "", fresh_out_data, logs_to_write
+
+                sukses, error_msg, fresh_snapshot, logs_list = tx_outbound(db.transaction(), doc_ref_out)
+                if error_msg:
+                    st.error(error_msg)
+                elif sukses:
+                    for lg in logs_list:
+                        catat_log_mutasi(*lg)
+                    clear_all_rak_caches()
                     st.session_state.update({
-                        'undo_dict': {k_pilih: all_out_data},
+                        'undo_dict': {k_pilih: fresh_snapshot},
                         'action_msg': f"Penyesuaian Outbound Massal di Rak {k_pilih}-{b_pilih}",
                         'action_status': 'DONE',
                         'kor_dicari': False,
                         'relok_dicari': False
                     })
                     st.rerun()
-                else: st.info("Tidak ada perubahan angka pada tabel. Outbound dibatalkan.")
+                else:
+                    st.info("Tidak ada perubahan angka pada tabel. Outbound dibatalkan.")
         else: st.info("Rak Kosong.")
 
 # ----------------------------------------------------------
@@ -510,7 +585,8 @@ with tab3:
     if st.button("⚙️ Jalankan Re-Indexing Semua Rak Sekarang", type="secondary"):
         with st.spinner("Memperbaiki urutan index pallet..."):
             try:
-                docs = db.collection(NAMA_DATABASE).stream()
+                docs = list(db.collection(NAMA_DATABASE).stream())
+                log_fb_usage('read', len(docs))
                 batch = db.batch()
                 total_koreksi = 0
                 
@@ -550,6 +626,8 @@ with tab3:
                     total_koreksi += 1
                 
                 batch.commit()
+                log_fb_usage('write', total_koreksi)
+                clear_all_rak_caches()
                 st.session_state['last_reindex'] = get_waktu_jkt().strftime("%d-%m-%Y %H:%M:%S")
                 st.balloons()
                 st.session_state.update({'action_msg': f"Re-Indexing Selesai! {total_koreksi} Kolom diperbarui.", 'action_status': 'DONE_NO_UNDO'})
@@ -560,7 +638,8 @@ with tab3:
     st.subheader("📥 Tarik Laporan Audit (CSV Super)")
     if st.button("Racik Laporan Audit Stok Sekarang", type="primary"):
         with st.spinner("Membaca database..."):
-            docs = db.collection(NAMA_DATABASE).stream()
+            docs = list(db.collection(NAMA_DATABASE).stream())
+            log_fb_usage('read', len(docs))
             semua_data = []
             for doc in docs:
                 doc_data = doc.to_dict()
@@ -618,15 +697,34 @@ with tab3:
             else: st.warning("Database kosong.")
 
 # ----------------------------------------------------------
-# TAB 4: LAPORAN MUTASI HARIAN
+# TAB 4: LAPORAN MUTASI (FILTER TANGGAL HEMAT KUOTA)
 # ----------------------------------------------------------
 with tab4:
-    st.header("📊 Laporan Mutasi Harian (24 Jam Terakhir)")
+    st.header("📊 Laporan Riwayat Mutasi")
+    st.caption("Pilih rentang tanggal agar penarikan log tetap ringan dan hemat kuota Firebase Read.")
+    
+    hari_ini_jkt = get_waktu_jkt().date()
+    c_tgl1, c_tgl2 = st.columns(2)
+    with c_tgl1:
+        tgl_mulai = st.date_input("Dari Tanggal", value=hari_ini_jkt, max_value=hari_ini_jkt)
+    with c_tgl2:
+        tgl_selesai = st.date_input("Sampai Tanggal", value=hari_ini_jkt, min_value=tgl_mulai, max_value=hari_ini_jkt)
+
     if st.button("Racik Laporan Mutasi Sekarang", type="primary"):
         with st.spinner("Menarik data log mutasi..."):
             try:
-                waktu_24_jam_lalu_utc = datetime.utcnow() - timedelta(hours=24)
-                log_docs = db.collection(DB_LOG_MUTASI).where("Timestamp_System", ">=", waktu_24_jam_lalu_utc).order_by("Timestamp_System", direction=firestore.Query.DESCENDING).stream()
+                # Konversi rentang tanggal WIB ke UTC untuk query Timestamp_System
+                start_utc = datetime.combine(tgl_mulai, datetime.min.time(), tzinfo=timezone.utc) - timedelta(hours=7)
+                end_utc = datetime.combine(tgl_selesai, datetime.max.time(), tzinfo=timezone.utc) - timedelta(hours=7)
+                
+                log_docs = list(
+                    db.collection(DB_LOG_MUTASI)
+                    .where("Timestamp_System", ">=", start_utc)
+                    .where("Timestamp_System", "<=", end_utc)
+                    .order_by("Timestamp_System", direction=firestore.Query.DESCENDING)
+                    .stream()
+                )
+                log_fb_usage('read', len(log_docs))
                 log_list = [d.to_dict() for d in log_docs]
                     
                 if log_list:
@@ -634,12 +732,15 @@ with tab4:
                     avail_cols = [c for c in ["Waktu Transaksi", "Jenis Transaksi", "Lokasi Rak", "Nama Produk", "No Lot", "Mutasi Pallet", "Mutasi Pecahan (Dus/Sak)", "Mutasi Eceran (Pcs)", "Part Number", "Keterangan"] if c in df_log.columns]
                     df_log = df_log[avail_cols]
                     
+                    st.dataframe(df_log, hide_index=True, use_container_width=True, height=250)
                     csv_log_buffer = io.StringIO()
                     df_log.to_csv(csv_log_buffer, index=False, sep=";")
-                    st.success("✅ Laporan Mutasi berhasil diracik!")
-                    st.download_button(label="⬇️ Unduh Laporan Mutasi", data=csv_log_buffer.getvalue(), file_name=f"Mutasi_WMS_{get_waktu_jkt().strftime('%Y%m%d')}.csv", mime="text/csv")
-                else: st.info("Belum ada mutasi dalam 24 jam terakhir.")
-            except Exception as e: st.error(f"Gagal memuat log mutasi: {e}. Pastikan Index di Firestore sudah dibuat!")
+                    st.success(f"✅ Ditemukan {len(df_log)} catatan mutasi ({len(log_docs)} Reads).")
+                    st.download_button(label="⬇️ Unduh Laporan Mutasi", data=csv_log_buffer.getvalue(), file_name=f"Mutasi_WMS_{tgl_mulai.strftime('%Y%m%d')}_{tgl_selesai.strftime('%Y%m%d')}.csv", mime="text/csv")
+                else:
+                    st.info("Tidak ada catatan mutasi pada rentang tanggal tersebut.")
+            except Exception as e:
+                st.error(f"Gagal memuat log mutasi: {e}. Pastikan Index di Firestore sudah dibuat!")
 
 # ----------------------------------------------------------
 # TAB 5: SYNC CSV (RESTORE)
@@ -661,7 +762,8 @@ with tab5:
                         st.error("❌ Format CSV tidak valid! Kolom wajib tidak ditemukan.")
                     else:
                         batch = db.batch()
-                        for kol in ["A", "B", "C", "D", "E", "F", "G", "S"]:
+                        kolom_list = ["A", "B", "C", "D", "E", "F", "G", "S"]
+                        for kol in kolom_list:
                             df_kol = df_sync[df_sync['Kolom'] == kol]
                             new_data = []
                             if not df_kol.empty:
@@ -685,6 +787,8 @@ with tab5:
                             batch.set(doc_ref, {'data': new_data})
                         
                         batch.commit()
+                        log_fb_usage('write', len(kolom_list))
+                        clear_all_rak_caches()
                         catat_log_mutasi("RESTORE CSV", "ALL", "ALL", "Sistem Database", "-", "-", 0, 0, 0, "Hard Reset via CSV Upload")
                         
                         st.session_state.update({'action_msg': "Database berhasil di-restore dari file CSV!", 'action_status': 'DONE_NO_UNDO'})
@@ -705,14 +809,14 @@ with tab6:
         book_kolom_label = st.selectbox("Lokasi Kolom", ["A", "B", "C", "D", "E", "F", "G", "S (Staging)"], key="book_kolom_3")
         book_kolom = book_kolom_label.split(" ")[0]
         book_baris = st.number_input("Nomor Baris (Booking)", min_value=1, max_value=28, value=1, key="book_baris_3")
-        if st.button("🔍 Cari Data Rak (Booking)", use_container_width=True): st.session_state.update({'book_lokasi_dicari': True, 'book_k_pilih': book_kolom, 'book_b_pilih': book_baris})
+        if st.button("🔍 Cari Data Rak (Booking)", use_container_width=True):
+            st.session_state.update({'book_lokasi_dicari': True, 'book_k_pilih': book_kolom, 'book_b_pilih': book_baris})
+            fetch_kolom_cached(book_kolom, 'cache_book_data', force_refresh=True)
             
     with col_b2:
         if st.session_state['book_lokasi_dicari']:
             k_pilih, b_pilih = st.session_state['book_k_pilih'], st.session_state['book_b_pilih']
-            doc_ref_book = db.collection(NAMA_DATABASE).document(f"Kolom_{k_pilih}")
-            doc_book = doc_ref_book.get()
-            all_book_data = doc_book.to_dict().get('data', []) if doc_book.exists else []
+            all_book_data = fetch_kolom_cached(k_pilih, 'cache_book_data', force_refresh=False)
             baris_book_data = [d for d in all_book_data if float(d.get('Baris', 0) or 0) == float(b_pilih)]
             
             if baris_book_data:
@@ -753,20 +857,32 @@ with tab6:
                         if st.button("🔒 Kunci / Booking Pallet Sekarang", type="primary", use_container_width=True):
                             if book_do.strip() == "": st.error("❌ Keterangan jadwal wajib diisi!")
                             else:
-                                with st.spinner("Menyematkan label booking..."):
+                                with st.spinner("Menyematkan label booking (Transactional Lock)..."):
+                                    doc_ref_book = db.collection(NAMA_DATABASE).document(f"Kolom_{k_pilih}")
                                     pallets_to_book = df_belum_book['Pallet Ke'].head(book_qty).tolist()
-                                    new_all_book_data = []
-                                    for d in all_book_data:
-                                        b_val = float(d.get('Baris', 0) or 0)
-                                        p_val = pd.to_numeric(d.get('Pallet Ke', 0))
-                                        if b_val == float(b_pilih) and p_val in pallets_to_book:
-                                            catatan_lama = str(d.get('Catatan', '')).replace('nan', '')
-                                            d['Catatan'] = (f"[BOOKED: {book_do.strip()}] " + catatan_lama).strip()
-                                        new_all_book_data.append(d)
-                                        
-                                    doc_ref_book.set({'data': new_all_book_data})
+
+                                    @firestore.transactional
+                                    def tx_booking(transaction, doc_ref):
+                                        snap = doc_ref.get(transaction=transaction)
+                                        log_fb_usage('read', 1)
+                                        fresh_book = snap.to_dict().get('data', []) if snap.exists else []
+                                        new_all_book_data = []
+                                        for d in fresh_book:
+                                            b_val = float(d.get('Baris', 0) or 0)
+                                            p_val = pd.to_numeric(d.get('Pallet Ke', 0))
+                                            if b_val == float(b_pilih) and p_val in pallets_to_book:
+                                                catatan_lama = str(d.get('Catatan', '')).replace('nan', '')
+                                                if 'BOOKED' not in catatan_lama.upper():
+                                                    d['Catatan'] = (f"[BOOKED: {book_do.strip()}] " + catatan_lama).strip()
+                                            new_all_book_data.append(d)
+                                        transaction.set(doc_ref, {'data': new_all_book_data})
+                                        log_fb_usage('write', 1)
+                                        return fresh_book
+
+                                    fresh_snapshot = tx_booking(db.transaction(), doc_ref_book)
+                                    clear_all_rak_caches()
                                     st.session_state.update({
-                                        'undo_dict': {k_pilih: all_book_data}, 
+                                        'undo_dict': {k_pilih: fresh_snapshot}, 
                                         'action_msg': f"Booking {book_qty} Pallet Lot '{pilih_lot}' untuk '{book_do}'", 
                                         'action_status': 'DONE'
                                     })
@@ -795,13 +911,13 @@ with tab7:
 
     if st.button("🔍 Cari Data Rak Asal", type="primary", use_container_width=True):
         st.session_state.update({'relok_dicari': True, 'relok_ak': r_asal_k, 'relok_ab': r_asal_b, 'relok_tk': r_tuj_k, 'relok_tb': r_tuj_b})
+        fetch_kolom_cached(r_asal_k, 'cache_relok_asal', force_refresh=True)
         
     if st.session_state.get('relok_dicari'):
         ak, ab = st.session_state['relok_ak'], st.session_state['relok_ab']
         tk, tb = st.session_state['relok_tk'], st.session_state['relok_tb']
         
-        doc_asal = db.collection(NAMA_DATABASE).document(f"Kolom_{ak}").get()
-        all_asal_data = doc_asal.to_dict().get('data', []) if doc_asal.exists else []
+        all_asal_data = fetch_kolom_cached(ak, 'cache_relok_asal', force_refresh=False)
         baris_asal_data = [d for d in all_asal_data if float(d.get('Baris', 0) or 0) == float(ab) and str(d.get('Part Number', '')).strip() != '']
         
         if baris_asal_data:
@@ -851,144 +967,166 @@ with tab7:
                 'PINDAH PCS': st.column_config.NumberColumn("🧩 PINDAH PCS", min_value=0)
             }
             
-            # --- FIX: Ditambahkan KEY agar tidak bentrok rendering di background ---
             edited_relok = st.data_editor(df_rekap_relok, column_config=config_kolom, hide_index=True, use_container_width=True, key=f"editor_relok_{ak}_{ab}_{tk}_{tb}")
             
             if st.button("🚀 Eksekusi Pindah Rak", type="primary", use_container_width=True):
                 if ak == tk and ab == tb:
                     st.error("❌ Rak asal dan tujuan tidak boleh sama!")
                 else:
-                    has_changes = False
-                    error_msg = ""
-                    
-                    if ak != tk:
-                        doc_tuj = db.collection(NAMA_DATABASE).document(f"Kolom_{tk}").get()
-                        all_tuj_data = doc_tuj.to_dict().get('data', []) if doc_tuj.exists else []
-                    else:
-                        all_tuj_data = all_asal_data # Reference list yang sama untuk Kolom yang sama
-                    
-                    data_rak_gabungan = copy.deepcopy(all_asal_data) if ak == tk else None
-                    data_rak_asal = copy.deepcopy(all_asal_data) if ak != tk else data_rak_gabungan
-                    data_rak_tujuan = copy.deepcopy(all_tuj_data) if ak != tk else data_rak_gabungan
-                    
-                    undo_dict_setup = {ak: all_asal_data}
-                    if ak != tk: undo_dict_setup[tk] = all_tuj_data
-                        
+                    doc_ref_asal = db.collection(NAMA_DATABASE).document(f"Kolom_{ak}")
+                    doc_ref_tuj = db.collection(NAMA_DATABASE).document(f"Kolom_{tk}") if ak != tk else None
+
                     def match_g_key(d, target_key):
                         c = str(d.get('Catatan', '')).replace('nan', '')
                         return (str(d.get('Lot Number','')) + "_" + str(d.get('Nama Produk','')) + "_" + c) == target_key
 
-                    for index, row in edited_relok.iterrows():
-                        pindah_utuh = int(row['PINDAH UTUH'])
-                        pindah_dus = int(row['PINDAH DUS'])
-                        pindah_pcs = int(row['PINDAH PCS'])
-                        if pindah_utuh == 0 and pindah_dus == 0 and pindah_pcs == 0: continue
-                            
-                        g_key, l, nama_prod = str(row['Group_Key']), str(row['Lot Number']), str(row['Produk'])
-                        part_num, catatan_awal = str(row['Part Number']), str(row['Catatan'])
-                        
-                        awal_utuh, awal_dus, awal_pcs = int(row['Tersedia Utuh']), int(row['Tersedia Dus']), int(row['Tersedia Pcs'])
-                        sisa_utuh = awal_utuh - pindah_utuh
-                        sisa_dus, sisa_pcs = awal_dus - pindah_dus, awal_pcs - pindah_pcs
-                        
-                        if sisa_utuh < 0 or sisa_dus < 0 or sisa_pcs < 0:
-                            error_msg = f"❌ Jumlah pindah Lot {l} melebihi stok tersedia!"
-                            break
-                            
-                        has_changes = True
-                        df_lot = pd.DataFrame([d for d in data_rak_asal if match_g_key(d, g_key) and float(d.get('Baris',0) or 0)==float(ab)]).sort_values('Pallet Ke', ascending=False)
-                        
-                        # --- 1. DEDUCT DARI RAK ASAL ---
-                        slot_tambahan = 1 if (sisa_dus > 0 or sisa_pcs > 0) else 0
-                        total_slot_sisa = sisa_utuh + slot_tambahan
-                        out_qty = len(df_lot) - total_slot_sisa
-                        pallets_to_remove = df_lot['Pallet Ke'].head(out_qty).tolist() if out_qty > 0 else []
-                        
-                        updated_rak_asal = []
-                        for d in data_rak_asal:
-                            if match_g_key(d, g_key) and float(d.get('Baris', 0) or 0) == float(ab):
-                                p_val = pd.to_numeric(d.get('Pallet Ke', 0))
-                                if p_val in pallets_to_remove: continue 
-                                
-                                sisa_pallets = df_lot[~df_lot['Pallet Ke'].isin(pallets_to_remove)]
-                                if not sisa_pallets.empty and p_val == sisa_pallets['Pallet Ke'].max():
-                                    if sisa_dus > 0 or sisa_pcs > 0:
-                                        kp = []
-                                        if sisa_dus > 0: kp.append(f"Pecahan: {sisa_dus} qty")
-                                        if sisa_pcs > 0: kp.append(f"Eceran: {sisa_pcs} pcs")
-                                        d['Keterangan'] = " | ".join(kp)
-                                    else: d['Keterangan'] = ""
-                                else:
-                                    if 'Pecahan' in str(d.get('Keterangan', '')) or 'Eceran' in str(d.get('Keterangan', '')): 
-                                        d['Keterangan'] = ""
-                            updated_rak_asal.append(d)
-                            
-                        data_rak_asal = updated_rak_asal
-                        if ak == tk: data_rak_tujuan = data_rak_asal # Sinkronisasi reference
-                        
-                        # --- 2. ADD KE RAK TUJUAN ---
-                        catatan_baru = catatan_awal
-                        if tk == 'S' and ak != 'S':
-                            cat_bersih = re.sub(r'\[Asal:.*?\]\s*', '', catatan_baru)
-                            catatan_baru = (f"[Asal: {ak}-{ab}] " + cat_bersih).strip()
-                        elif tk != 'S':
-                            catatan_baru = re.sub(r'\[Asal:.*?\]\s*', '', catatan_baru).strip()
-                            
-                        b_tuj = [pd.to_numeric(d.get('Pallet Ke', 0)) for d in data_rak_tujuan if float(d.get('Baris',0) or 0)==float(tb) and pd.notna(d.get('Pallet Ke'))]
-                        next_pallet = max(b_tuj) + 1 if b_tuj else 1
-                        
-                        new_records = []
-                        for _ in range(pindah_utuh):
-                            new_records.append({
-                                'Kolom': tk, 'Baris': float(tb), 'Pallet Ke': float(next_pallet),
-                                'Part Number': part_num, 'Lot Number': l, 'Nama Produk': nama_prod,
-                                'Status': 'Terisi', 'Keterangan': '', 'Catatan': catatan_baru
-                            })
-                            next_pallet += 1
-                            
-                        if pindah_dus > 0 or pindah_pcs > 0:
-                            kp = []
-                            if pindah_dus > 0: kp.append(f"Pecahan: {pindah_dus} qty")
-                            if pindah_pcs > 0: kp.append(f"Eceran: {pindah_pcs} pcs")
-                            new_records.append({
-                                'Kolom': tk, 'Baris': float(tb), 'Pallet Ke': float(next_pallet),
-                                'Part Number': part_num, 'Lot Number': l, 'Nama Produk': nama_prod,
-                                'Status': 'Terisi', 'Keterangan': " | ".join(kp), 'Catatan': catatan_baru
-                            })
-                            next_pallet += 1
-                            
-                        data_rak_tujuan.extend(new_records)
-                        if ak == tk: data_rak_asal = data_rak_tujuan # Sinkronisasi reference
-                        
-                        catat_log_mutasi("RELOKASI", f"{ak} ke {tk}", f"{ab} ke {tb}", nama_prod, part_num, l, pindah_utuh, pindah_dus, pindah_pcs)
+                    @firestore.transactional
+                    def tx_relokasi(transaction):
+                        snap_asal = doc_ref_asal.get(transaction=transaction)
+                        log_fb_usage('read', 1)
+                        fresh_asal = snap_asal.to_dict().get('data', []) if snap_asal.exists else []
 
-                    if error_msg: st.error(error_msg)
-                    elif has_changes:
-                        batch = db.batch()
+                        if ak != tk:
+                            snap_tuj = doc_ref_tuj.get(transaction=transaction)
+                            log_fb_usage('read', 1)
+                            fresh_tuj = snap_tuj.to_dict().get('data', []) if snap_tuj.exists else []
+                        else:
+                            fresh_tuj = fresh_asal
+
+                        has_changes = False
+                        error_msg = ""
+                        logs_to_write = []
+
+                        data_rak_gabungan = copy.deepcopy(fresh_asal) if ak == tk else None
+                        data_rak_asal = copy.deepcopy(fresh_asal) if ak != tk else data_rak_gabungan
+                        data_rak_tujuan = copy.deepcopy(fresh_tuj) if ak != tk else data_rak_gabungan
                         
+                        undo_dict_setup = {ak: fresh_asal}
+                        if ak != tk: undo_dict_setup[tk] = fresh_tuj
+
+                        for _, row in edited_relok.iterrows():
+                            pindah_utuh = int(row['PINDAH UTUH'])
+                            pindah_dus = int(row['PINDAH DUS'])
+                            pindah_pcs = int(row['PINDAH PCS'])
+                            if pindah_utuh == 0 and pindah_dus == 0 and pindah_pcs == 0: continue
+                                
+                            g_key, l, nama_prod = str(row['Group_Key']), str(row['Lot Number']), str(row['Produk'])
+                            part_num, catatan_awal = str(row['Part Number']), str(row['Catatan'])
+                            
+                            awal_utuh, awal_dus, awal_pcs = int(row['Tersedia Utuh']), int(row['Tersedia Dus']), int(row['Tersedia Pcs'])
+                            sisa_utuh = awal_utuh - pindah_utuh
+                            sisa_dus, sisa_pcs = awal_dus - pindah_dus, awal_pcs - pindah_pcs
+                            
+                            if sisa_utuh < 0 or sisa_dus < 0 or sisa_pcs < 0:
+                                error_msg = f"❌ Jumlah pindah Lot {l} melebihi stok tersedia!"
+                                break
+                                
+                            has_changes = True
+                            df_lot = pd.DataFrame([d for d in data_rak_asal if match_g_key(d, g_key) and float(d.get('Baris',0) or 0)==float(ab)])
+                            if df_lot.empty:
+                                error_msg = f"❌ Data Lot {l} di rak asal sudah berubah. Silakan klik 'Cari Data Rak Asal' ulang."
+                                break
+                            df_lot = df_lot.sort_values('Pallet Ke', ascending=False)
+                            
+                            # --- 1. DEDUCT DARI RAK ASAL ---
+                            slot_tambahan = 1 if (sisa_dus > 0 or sisa_pcs > 0) else 0
+                            total_slot_sisa = sisa_utuh + slot_tambahan
+                            out_qty = len(df_lot) - total_slot_sisa
+                            if out_qty < 0:
+                                error_msg = f"❌ Stok terkini Lot {l} tidak mencukupi untuk dipindahkan."
+                                break
+                            pallets_to_remove = df_lot['Pallet Ke'].head(out_qty).tolist() if out_qty > 0 else []
+                            
+                            updated_rak_asal = []
+                            for d in data_rak_asal:
+                                if match_g_key(d, g_key) and float(d.get('Baris', 0) or 0) == float(ab):
+                                    p_val = pd.to_numeric(d.get('Pallet Ke', 0))
+                                    if p_val in pallets_to_remove: continue 
+                                    
+                                    sisa_pallets = df_lot[~df_lot['Pallet Ke'].isin(pallets_to_remove)]
+                                    if not sisa_pallets.empty and p_val == sisa_pallets['Pallet Ke'].max():
+                                        if sisa_dus > 0 or sisa_pcs > 0:
+                                            kp = []
+                                            if sisa_dus > 0: kp.append(f"Pecahan: {sisa_dus} qty")
+                                            if sisa_pcs > 0: kp.append(f"Eceran: {sisa_pcs} pcs")
+                                            d['Keterangan'] = " | ".join(kp)
+                                        else: d['Keterangan'] = ""
+                                    else:
+                                        if 'Pecahan' in str(d.get('Keterangan', '')) or 'Eceran' in str(d.get('Keterangan', '')): 
+                                            d['Keterangan'] = ""
+                                updated_rak_asal.append(d)
+                                
+                            data_rak_asal = updated_rak_asal
+                            if ak == tk: data_rak_tujuan = data_rak_asal
+                            
+                            # --- 2. ADD KE RAK TUJUAN ---
+                            catatan_baru = catatan_awal
+                            if tk == 'S' and ak != 'S':
+                                cat_bersih = re.sub(r'\[Asal:.*?\]\s*', '', catatan_baru)
+                                catatan_baru = (f"[Asal: {ak}-{ab}] " + cat_bersih).strip()
+                            elif tk != 'S':
+                                catatan_baru = re.sub(r'\[Asal:.*?\]\s*', '', catatan_baru).strip()
+                                
+                            b_tuj = [pd.to_numeric(d.get('Pallet Ke', 0)) for d in data_rak_tujuan if float(d.get('Baris',0) or 0)==float(tb) and pd.notna(d.get('Pallet Ke'))]
+                            next_pallet = max(b_tuj) + 1 if b_tuj else 1
+                            
+                            new_records = []
+                            for _ in range(pindah_utuh):
+                                new_records.append({
+                                    'Kolom': tk, 'Baris': float(tb), 'Pallet Ke': float(next_pallet),
+                                    'Part Number': part_num, 'Lot Number': l, 'Nama Produk': nama_prod,
+                                    'Status': 'Terisi', 'Keterangan': '', 'Catatan': catatan_baru
+                                })
+                                next_pallet += 1
+                                
+                            if pindah_dus > 0 or pindah_pcs > 0:
+                                kp = []
+                                if pindah_dus > 0: kp.append(f"Pecahan: {pindah_dus} qty")
+                                if pindah_pcs > 0: kp.append(f"Eceran: {pindah_pcs} pcs")
+                                new_records.append({
+                                    'Kolom': tk, 'Baris': float(tb), 'Pallet Ke': float(next_pallet),
+                                    'Part Number': part_num, 'Lot Number': l, 'Nama Produk': nama_prod,
+                                    'Status': 'Terisi', 'Keterangan': " | ".join(kp), 'Catatan': catatan_baru
+                                })
+                                next_pallet += 1
+                                
+                            data_rak_tujuan.extend(new_records)
+                            if ak == tk: data_rak_asal = data_rak_tujuan
+                            
+                            logs_to_write.append(("RELOKASI", f"{ak} ke {tk}", f"{ab} ke {tb}", nama_prod, part_num, l, pindah_utuh, pindah_dus, pindah_pcs))
+
+                        if error_msg or not has_changes:
+                            return False, error_msg, {}, []
+
                         if ak == tk:
-                            # Re-index baris asal dan baris tujuan di dalam kolom yang sama
                             for target_baris in set([ab, tb]):
                                 b_sisa = sorted([d for d in data_rak_asal if float(d.get('Baris',0) or 0)==float(target_baris)], key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
                                 b_lain = [d for d in data_rak_asal if float(d.get('Baris',0) or 0)!=float(target_baris)]
                                 for i, d in enumerate(b_sisa, 1): d['Pallet Ke'] = float(i)
                                 data_rak_asal = b_lain + b_sisa
-                            batch.set(db.collection(NAMA_DATABASE).document(f"Kolom_{ak}"), {'data': data_rak_asal})
+                            transaction.set(doc_ref_asal, {'data': data_rak_asal})
+                            log_fb_usage('write', 1)
                         else:
-                            # Re-index terpisah jika beda kolom
                             baris_asal_sisa = sorted([d for d in data_rak_asal if float(d.get('Baris',0) or 0)==float(ab)], key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
                             lain_asal = [d for d in data_rak_asal if float(d.get('Baris',0) or 0)!=float(ab)]
                             for i, d in enumerate(baris_asal_sisa, 1): d['Pallet Ke'] = float(i)
-                            batch.set(db.collection(NAMA_DATABASE).document(f"Kolom_{ak}"), {'data': lain_asal + baris_asal_sisa})
+                            transaction.set(doc_ref_asal, {'data': lain_asal + baris_asal_sisa})
                             
                             baris_tuj_sisa = sorted([d for d in data_rak_tujuan if float(d.get('Baris',0) or 0)==float(tb)], key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
                             lain_tuj = [d for d in data_rak_tujuan if float(d.get('Baris',0) or 0)!=float(tb)]
                             for i, d in enumerate(baris_tuj_sisa, 1): d['Pallet Ke'] = float(i)
-                            batch.set(db.collection(NAMA_DATABASE).document(f"Kolom_{tk}"), {'data': lain_tuj + baris_tuj_sisa})
-                            
-                        batch.commit()
-                        
-                        # --- FIX: Reset State Pencarian Tab Lain Agar Tidak Ghost Rendering ---
+                            transaction.set(doc_ref_tuj, {'data': lain_tuj + baris_tuj_sisa})
+                            log_fb_usage('write', 2)
+
+                        return True, "", undo_dict_setup, logs_to_write
+
+                    sukses, error_msg, undo_dict_setup, logs_list = tx_relokasi(db.transaction())
+                    if error_msg:
+                        st.error(error_msg)
+                    elif sukses:
+                        for lg in logs_list:
+                            catat_log_mutasi(*lg)
+                        clear_all_rak_caches()
                         st.session_state.update({
                             'undo_dict': undo_dict_setup,
                             'action_msg': f"Berhasil memindahkan item dari Rak {ak}-{ab} ke {tk}-{tb}",
@@ -997,7 +1135,8 @@ with tab7:
                             'kor_dicari': False
                         })
                         st.rerun()
-                    else: st.info("Tidak ada jumlah yang dipindah.")
+                    else:
+                        st.info("Tidak ada jumlah yang dipindah.")
         else:
             st.warning("Rak Asal Kosong!")
             st.session_state['relok_dicari'] = False
@@ -1022,23 +1161,19 @@ with tab8:
         st.write("")
         if st.button("🔍 Tarik Data untuk Koreksi", use_container_width=True): 
             st.session_state.update({'kor_dicari': True, 'kor_k': kor_kolom, 'kor_b': kor_baris})
+            fetch_kolom_cached(kor_kolom, 'cache_kor_data', force_refresh=True)
             
     st.divider()
 
     if st.session_state.get('kor_dicari'):
         kk, kb = st.session_state['kor_k'], st.session_state['kor_b']
-        
-        doc_kor = db.collection(NAMA_DATABASE).document(f"Kolom_{kk}").get()
-        all_kor_data = doc_kor.to_dict().get('data', []) if doc_kor.exists else []
-        
+        all_kor_data = fetch_kolom_cached(kk, 'cache_kor_data', force_refresh=False)
         baris_kor_data = [d for d in all_kor_data if float(d.get('Baris', 0) or 0) == float(kb)]
-        lain_kor_data = [d for d in all_kor_data if float(d.get('Baris', 0) or 0) != float(kb)]
         
         if baris_kor_data:
             df_kor = pd.DataFrame(baris_kor_data)
             df_kor['Pallet Ke'] = pd.to_numeric(df_kor['Pallet Ke'], errors='coerce')
             
-            # --- FIX: Bersihkan tipe data Null/NaN ke Empty String untuk mencegah error serialisasi PyArrow ---
             for col in ['Part Number', 'Lot Number', 'Nama Produk', 'Keterangan', 'Catatan']:
                 if col in df_kor.columns:
                     df_kor[col] = df_kor[col].fillna("").astype(str).replace('nan', '')
@@ -1057,7 +1192,6 @@ with tab8:
                 'Catatan': st.column_config.TextColumn("Catatan / Booking Tag")
             }
             
-            # --- FIX: Ditambahkan KEY agar aman dari Concurrency Crash ---
             edited_kor_df = st.data_editor(
                 df_kor, 
                 column_config=config_kor, 
@@ -1071,10 +1205,10 @@ with tab8:
                 has_changed = not edited_kor_df.equals(df_kor)
                 
                 if has_changed:
-                    with st.spinner("Menyimpan koreksi..."):
+                    with st.spinner("Menyimpan koreksi (Transactional Lock)..."):
+                        doc_ref_kor = db.collection(NAMA_DATABASE).document(f"Kolom_{kk}")
                         new_baris_data = edited_kor_df.to_dict('records')
                         
-                        # Pastikan tipe data bersih kembali sebelum di-push ke Firebase
                         for d in new_baris_data:
                             d['Kolom'] = kk
                             d['Baris'] = float(kb)
@@ -1083,15 +1217,23 @@ with tab8:
                             d['Part Number'] = str(d.get('Part Number', '')).strip().upper()
                             d['Keterangan'] = str(d.get('Keterangan', '')).strip().replace('nan', '')
                             d['Catatan'] = str(d.get('Catatan', '')).strip().replace('nan', '')
-                            
-                        final_data_kor = lain_kor_data + new_baris_data
-                        
-                        db.collection(NAMA_DATABASE).document(f"Kolom_{kk}").set({'data': final_data_kor})
-                        
+
+                        @firestore.transactional
+                        def tx_koreksi(transaction, doc_ref):
+                            snap = doc_ref.get(transaction=transaction)
+                            log_fb_usage('read', 1)
+                            fresh_kor = snap.to_dict().get('data', []) if snap.exists else []
+                            lain_kor_fresh = [d for d in fresh_kor if float(d.get('Baris', 0) or 0) != float(kb)]
+                            transaction.set(doc_ref, {'data': lain_kor_fresh + new_baris_data})
+                            log_fb_usage('write', 1)
+                            return fresh_kor
+
+                        fresh_snapshot = tx_koreksi(db.transaction(), doc_ref_kor)
                         catat_log_mutasi("KOREKSI DATA", kk, kb, "Multiple Edit", "Multiple", "-", 0, 0, 0, "Koreksi Manual via Tab Koreksi")
+                        clear_all_rak_caches()
                         
                         st.session_state.update({
-                            'undo_dict': {kk: all_kor_data},
+                            'undo_dict': {kk: fresh_snapshot},
                             'action_msg': f"Koreksi data di Rak {kk}-{kb} berhasil disimpan.",
                             'action_status': 'DONE'
                         })
