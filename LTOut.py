@@ -97,7 +97,7 @@ if st.session_state.slide == 1:
         pindah_slide(2); st.rerun()
         
     st.write("")
-    if st.button("📥 HASIL BONGKAR / INBOUND SISA\nMemasukkan barang bongkaran atau sisa muatan kembali ke rak (Default Sisi Depan FIFO)", use_container_width=True):
+    if st.button("📥 HASIL BONGKAR / INBOUND SISA\nMemasukkan barang bongkaran atau sisa muatan kembali ke rak (Default Sisi Depan Push-Back)", use_container_width=True):
         st.session_state.mode_transaksi = "INBOUND_SISA"
         st.session_state.in_sisi_masuk = "DEPAN"
         pindah_slide(2); st.rerun()
