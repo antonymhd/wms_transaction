@@ -23,7 +23,7 @@ def get_waktu_jkt():
     return datetime.utcnow() + timedelta(hours=7)
 
 # ==========================================================
-# 2. CSS ADAPTIF & KOMPONEN HEADER + SINKRONISASI STOK
+# 2. CSS ADAPTIF & KOMPONEN HEADER + PROGRESS BAR
 # ==========================================================
 def inject_custom_css(accent_color="#10B981", accent_border="#059669", accent_bg_rgba="rgba(16, 185, 129, 0.1)"):
     st.markdown(f"""
@@ -102,6 +102,29 @@ def inject_custom_css(accent_color="#10B981", accent_border="#059669", accent_bg
             .btn-gramasi > button {{ font-size: 20px !important; text-align: center !important; }}
         </style>
     """, unsafe_allow_html=True)
+
+def render_progress_bar(current_slide, mode_transaksi):
+    if mode_transaksi in ["INBOUND", "INBOUND_SISA"]:
+        steps = ["Aksi", "Kategori", "Item", "Input", "Lokasi", "Selesai"]
+        idx_map = {1: 1, 2: 2, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6}
+    elif mode_transaksi in ["WIP", "OUTBOUND"]:
+        steps = ["Aksi", "Kategori", "Item", "Lokasi", "Selesai"]
+        idx_map = {1: 1, 2: 2, 3: 2, 4: 3, 5: 4, 6: 5}
+    else:
+        steps = ["Aksi", "Kategori", "Item", "Proses", "Selesai"]
+        idx_map = {1: 1, 2: 2, 3: 2, 4: 3, 5: 4, 6: 5, 7: 5}
+        
+    curr_step = idx_map.get(current_slide, 1)
+    html = "<div class='progress-container'>"
+    for i, s in enumerate(steps, 1):
+        if i == curr_step:
+            html += f"<span class='step-active'>{s}</span>"
+        else:
+            html += f"<span class='step-inactive'>{s}</span>"
+        if i < len(steps):
+            html += " <span style='opacity: 0.5;'>➔</span> "
+    html += "</div>"
+    st.markdown(html, unsafe_allow_html=True)
 
 # ==========================================================
 # 3. TELEGRAM & PARSING UTILITAS
@@ -204,7 +227,6 @@ def load_master_data():
         ])
 
 def hitung_kandidat_rak_inbound(semua_data, target_item, part_num):
-    """Menghitung daftar seluruh kandidat rak beserta kapasitas dan prioritas konsolidasinya"""
     KOLOM_LIST = ['A', 'B', 'C', 'D', 'E', 'F', 'G']
     BARIS_LIST = list(range(1, 29))
     slot_map = {f"{k}-{b}": [] for k in KOLOM_LIST for b in BARIS_LIST}
@@ -659,12 +681,81 @@ def proses_pengambilan_stok(transaction, doc_ref, k_pilih, b_pilih, lot_pilih, p
     return data_lama_sebelum_update
 
 # ==========================================================
-# 7. MODUL UI INBOUND TERPADU (EDITABLE AKTUAL DI LAPANGAN)
+# 7. MODUL PEMILIHAN PRODUK TERPADU (SLIDE 2 -> 3 -> 4)
+# ==========================================================
+def render_pemilihan_produk(df_master):
+    """Menangani Slide 2 (Kategori), Slide 3 (Gramasi), dan Slide 4 (Item) setelah Aksi dipilih"""
+    if st.session_state.slide == 2:
+        if st.button("🔙 GANTI AKSI"):
+            st.session_state.mode_transaksi = None
+            st.session_state.slide = 1
+            st.rerun()
+        st.markdown("### Pilih Kategori Produk")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("PREFORM", use_container_width=True): st.session_state.kategori = "PREFORM"; st.session_state.slide = 3; st.rerun()
+            if st.button("CUP COLOR", use_container_width=True): st.session_state.kategori = "CUP COLOR"; st.session_state.slide = 3; st.rerun()
+            if st.button("CAP (TUTUP)", use_container_width=True): st.session_state.kategori = "CAP"; st.session_state.slide = 3; st.rerun()
+        with col2:
+            if st.button("CUP NATURAL", use_container_width=True): st.session_state.kategori = "CUP NATURAL"; st.session_state.slide = 3; st.rerun()
+            if st.button("CUP PRINTING", use_container_width=True): st.session_state.kategori = "CUP PRINTING"; st.session_state.slide = 3; st.rerun()
+
+    elif st.session_state.slide == 3:
+        if st.button("🔙 KEMBALI"):
+            st.session_state.slide = 2
+            st.rerun()
+        st.markdown(f"### Gramasi: **{st.session_state.kategori}**")
+        df_kat = df_master[df_master['Kategori'] == st.session_state.kategori]
+        list_gramasi = sorted(df_kat['Gramasi'].unique())
+        
+        st.markdown('<div class="btn-gramasi">', unsafe_allow_html=True)
+        for i in range(0, len(list_gramasi), 2):
+            cols = st.columns(2)
+            with cols[0]:
+                if st.button(f"{list_gramasi[i]}", key=f"g_{i}", use_container_width=True):
+                    st.session_state.gramasi = list_gramasi[i]
+                    st.session_state.slide = 4
+                    st.rerun()
+            if i + 1 < len(list_gramasi):
+                with cols[1]:
+                    if st.button(f"{list_gramasi[i+1]}", key=f"g_{i+1}", use_container_width=True):
+                        st.session_state.gramasi = list_gramasi[i+1]
+                        st.session_state.slide = 4
+                        st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    elif st.session_state.slide == 4:
+        if st.button("🔙 KEMBALI"):
+            st.session_state.slide = 3
+            st.rerun()
+        st.markdown("### Pilih Item Spesifik")
+        st.caption(f"{st.session_state.kategori} | {st.session_state.gramasi}")
+        
+        df_item = df_master[(df_master['Kategori'] == st.session_state.kategori) & (df_master['Gramasi'] == st.session_state.gramasi)]
+        for idx, row in df_item.iterrows():
+            nama_brg = row['Nama Barang']
+            part_num = str(row['Part Number']).strip().upper()
+            
+            tipe_kemasan = ""
+            if part_num:
+                if part_num[-1] in ['D', 'G']: tipe_kemasan = "[📦 DUS] "
+                elif part_num[-1] == 'C': tipe_kemasan = "[👝 SAK] "
+                elif part_num[-1] == 'A': tipe_kemasan = "[🗃️ NICTAINER] "
+                    
+            btn_label = f"{tipe_kemasan}{format_nama_warna_bold(nama_brg)}"
+            if st.button(btn_label, use_container_width=True, key=f"btn_item_{idx}"): 
+                st.session_state.item = nama_brg
+                st.session_state.pilih_part = part_num
+                st.session_state.slide = 5
+                st.rerun()
+
+# ==========================================================
+# 8. MODUL UI INBOUND TERPADU (EDITABLE AKTUAL LAPANGAN)
 # ==========================================================
 def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="BELAKANG", jenis_log="INBOUND (Remote)", judul_tele="INBOUND - RACK NAVIGATOR", mode_undo_label="INBOUND", reset_keys=None):
     # --- SLIDE 5: INPUT LOT, QTY & SISI PINTU MASUK ---
     if st.session_state.slide == 5:
-        if st.button("🔙 GANTI AKTIVITAS"):
+        if st.button("🔙 GANTI ITEM"):
             st.session_state.slide = 4
             st.rerun()
             
@@ -855,7 +946,6 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
             st.session_state.alokasi_terpilih = alokasi
             st.rerun()
             
-        # Sinkronisasi perubahan angka aktual kembali ke state
         st.session_state.alokasi_terpilih = alokasi_aktual
         
         total_p_aktual = sum(x['qty_p'] for x in alokasi_aktual)
@@ -863,7 +953,6 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
         sisa_p_belum = target_p_awal - total_p_aktual
         sisa_c_belum = target_c_awal - total_c_aktual
         
-        # Jika fisik kurang dari rencana awal, sediakan jalan pintas tambah rak untuk sisa palet
         if sisa_p_belum > 0 or sisa_c_belum > 0:
             st.warning(
                 f"⚠️ **Ada sisa belum ditempatkan:** **{max(0, sisa_p_belum)} Pallet**"
