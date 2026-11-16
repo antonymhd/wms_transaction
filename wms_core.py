@@ -8,11 +8,24 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 
 # ==========================================================
-# 1. KONSTANTA & INISIALISASI FIREBASE
+# 1. KONSTANTA, ZONA KHUSUS & INISIALISASI FIREBASE
 # ==========================================================
 NAMA_DATABASE = 'uji_coba_rak'
 DB_LOG_MUTASI = 'log_mutasi_rak'
 DB_UNDO_STATE = 'wms_undo_state'
+
+# Item khusus yang hanya ditempatkan di rak teratas (Kolom F baris 1-16 & Kolom G baris 17-28)
+PART_KHUSUS_TOP_TIER = {'MJSCN3802703D', 'MJSCN3802901D'}
+
+def is_zona_top_tier(kolom, baris_int):
+    k = str(kolom).strip().upper()
+    return (k == 'F' and 1 <= baris_int <= 16) or (k == 'G' and 17 <= baris_int <= 28)
+
+def is_rak_valid_untuk_produk(kolom, baris_int, part_num):
+    p = str(part_num).strip().upper()
+    if p in PART_KHUSUS_TOP_TIER:
+        return is_zona_top_tier(kolom, baris_int)
+    return True
 
 if not firebase_admin._apps:
     cred = credentials.Certificate(dict(st.secrets["firebase"]))
@@ -228,14 +241,13 @@ def load_master_data():
 
 def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="BELAKANG"):
     """
-    Menyusun kandidat lorong rak berdasarkan aturan gudang & pintu masuk:
-    1. Prioritas 1: Sudah ada item sejenis:
-       - Jika rak hanya 1 jenis (murni sejenis): selalu boleh.
-       - Jika rak sudah 2 jenis item (sejenis + item lain): HANYA boleh jika item sejenis berada di ujung
-         pintu masuk yang dipilih (ujung BELAKANG jika masuk Belakang, ujung DEPAN jika masuk Depan),
-         agar item lain tidak terkunci (sandwich) di tengah lorong.
+    Menyusun kandidat lorong rak berdasarkan aturan gudang, zona khusus & pintu masuk:
+    0. Zona Khusus:
+       - Item JDO Diamond (PART_KHUSUS_TOP_TIER) hanya valid di F1-16 & G17-28.
+       - Item reguler mengutamakan rak selain F1-16 & G17-28 terlebih dahulu (ZonePenalty = 0).
+    1. Prioritas 1: Sudah ada item sejenis (jika sudah 2 item, ujung pintu masuk wajib item sejenis).
     2. Prioritas 2: Rak kosong (0 palet).
-    3. Prioritas 3: Rak berisi 1 item tidak sejenis (total menjadi maksimal 2 jenis item).
+    3. Prioritas 3: Rak berisi 1 item tidak sejenis (maksimal 2 jenis item per lorong).
     """
     KOLOM_LIST = ['A', 'B', 'C', 'D', 'E', 'F', 'G']
     BARIS_LIST = list(range(1, 29))
@@ -247,13 +259,22 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="B
         except Exception: continue
         if f"{k}-{b}" in slot_map: slot_map[f"{k}-{b}"].append(d)
             
-    in_is_sac = str(part_num).strip().upper().endswith('C')
+    part_clean = str(part_num).strip().upper()
+    in_is_sac = part_clean.endswith('C')
+    is_produk_khusus = part_clean in PART_KHUSUS_TOP_TIER
     target_item_clean = str(target_item).strip()
     
     kandidat_rak = []
     for loc, pallets in slot_map.items():
         k, b = loc.split('-')
         b = int(b)
+        
+        if not is_rak_valid_untuk_produk(k, b, part_clean):
+            continue
+            
+        in_top_tier = is_zona_top_tier(k, b)
+        zone_penalty = 1 if (not is_produk_khusus and in_top_tier) else 0
+        
         max_sac = 31 if b <= 16 else 44
         max_dus = 32 if b <= 16 else 46
         max_target = max_sac if in_is_sac else max_dus
@@ -290,7 +311,6 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="B
         if sisa_slot_pallet <= 0:
             continue
             
-        # Batas mutlak maksimal 2 jenis item dalam 1 lorong rak
         if len(distinct_items) >= 2 and target_item_clean not in distinct_items:
             continue
             
@@ -300,7 +320,6 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="B
             sub_sort = -used_cap
             
         elif target_item_clean in distinct_items and len(distinct_items) == 2:
-            # Cek posisi ujung sesuai arah masuk agar item lain tidak terkunci di tengah
             item_ujung = (
                 str(pallets_sorted[0].get('Nama Produk', '')).strip()
                 if sisi_masuk == "DEPAN"
@@ -331,7 +350,8 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="B
             continue
             
         kandidat_rak.append({
-            'Loc': loc, 'Kolom': k, 'Baris': b, 'Priority': prio, 'Status': status,
+            'Loc': loc, 'Kolom': k, 'Baris': b, 'Priority': prio,
+            'ZonePenalty': zone_penalty, 'Status': status,
             'IsiEksisting': isi_eksisting, 'UsedCap': used_cap, 'SubSort': sub_sort,
             'MaxTarget': max_target, 'SisaSlot': sisa_slot_pallet
         })
@@ -340,7 +360,8 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="B
         return pd.DataFrame()
         
     return pd.DataFrame(kandidat_rak).sort_values(
-        by=['Priority', 'SubSort', 'Kolom', 'Baris'], ascending=[True, True, True, True]
+        by=['Priority', 'ZonePenalty', 'SubSort', 'Kolom', 'Baris'],
+        ascending=[True, True, True, True, True]
     ).reset_index(drop=True)
 
 def cari_lokasi_stok_hibrida(semua_data, target_item):
@@ -605,6 +626,9 @@ def proses_inbound_multi_transaction(transaction, doc_refs_dict, alokasi_list, l
         if qty_p == 0 and qty_c == 0:
             continue
             
+        if not is_rak_valid_untuk_produk(k_pilih, b_int, part_num):
+            raise ValueError(f"Rak {k_pilih}-{b_int} bukan zona khusus untuk {item_name} (wajib Kolom F baris 1-16 atau Kolom G baris 17-28).")
+            
         all_col = data_per_kolom[k_pilih]
         rak_ini = sorted(
             [d for d in all_col if float(d.get('Baris', 0) or 0) == b_pilih],
@@ -612,7 +636,6 @@ def proses_inbound_multi_transaction(transaction, doc_refs_dict, alokasi_list, l
         )
         rak_lain = [d for d in all_col if float(d.get('Baris', 0) or 0) != b_pilih]
         
-        # Validasi mutlak maksimal 2 jenis item & anti-sandwich di lorong rak
         existing_items = {str(p.get('Nama Produk', '')).strip() for p in rak_ini if str(p.get('Nama Produk', '')).strip()}
         if len(existing_items) >= 2:
             if target_clean not in existing_items:
@@ -814,6 +837,8 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
             
         st.markdown(f"### {judul_inbound}")
         st.info(format_nama_warna_bold(st.session_state.item))
+        if str(st.session_state.pilih_part).strip().upper() in PART_KHUSUS_TOP_TIER:
+            st.caption("🏗️ *Item Zona Teratas: Alokasi otomatis dikunci khusus untuk Rak F1–F16 dan G17–G28.*")
         
         satuan_otomatis = get_satuan_kemasan(st.session_state.pilih_part)
         opsi_sisi = [
@@ -859,8 +884,13 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
             
         sisi_masuk = st.session_state.get("in_sisi_masuk", default_sisi_masuk)
         sisi_str = "DEPAN (Push-Back)" if sisi_masuk == "DEPAN" else "BELAKANG (Normal)"
+        part_aktif = str(st.session_state.pilih_part).strip().upper()
+        
         st.markdown(f"### Rencana Alokasi Multi-Rak")
-        st.caption(f"Pintu Masuk: **{sisi_str}** | Aturan: 1. Sejenis (di {sisi_masuk.lower()}) ➔ 2. Kosong ➔ 3. Campur (Max 2 Item)")
+        if part_aktif in PART_KHUSUS_TOP_TIER:
+            st.caption(f"🏗️ **Zona Teratas (F1–F16 & G17–G28)** | Pintu: **{sisi_str}**")
+        else:
+            st.caption(f"Pintu Masuk: **{sisi_str}** | Aturan: 1. Sejenis (di {sisi_masuk.lower()}) ➔ 2. Kosong ➔ 3. Campur (Max 2 Item)")
         
         qty_p_in = int(st.session_state.in_qty_p or 0)
         qty_c_in = int(st.session_state.in_qty_c or 0)
@@ -868,11 +898,14 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
         
         with st.spinner("📐 Menyusun alokasi multi-rak sesuai prioritas..."):
             semua_data = get_all_racking_data()
-            df_kandidat = hitung_kandidat_rak_inbound(semua_data, st.session_state.item, st.session_state.pilih_part, sisi_masuk=sisi_masuk)
-            in_is_sac = str(st.session_state.pilih_part).strip().upper().endswith('C')
+            df_kandidat = hitung_kandidat_rak_inbound(semua_data, st.session_state.item, part_aktif, sisi_masuk=sisi_masuk)
+            in_is_sac = part_aktif.endswith('C')
                 
             if df_kandidat.empty:
-                st.error("❌ Seluruh rak penuh atau tidak memenuhi syarat posisi item!")
+                if part_aktif in PART_KHUSUS_TOP_TIER:
+                    st.error("❌ Seluruh rak zona teratas (F1–F16 & G17–G28) penuh atau tidak memenuhi syarat posisi item!")
+                else:
+                    st.error("❌ Seluruh rak penuh atau tidak memenuhi syarat posisi item!")
             else:
                 if in_is_sac:
                     st.caption("🛡️ *Filter aktif: Rak Sak dengan sisa ≤ 1 slot otomatis dilewati karena toleransi panjang fisik.*")
@@ -887,7 +920,8 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                     
                 total_kapasitas_gudang = int(df_kandidat['SisaSlot'].sum()) if not df_kandidat.empty else 0
                 if total_kapasitas_gudang < total_slot_butuh:
-                    st.error(f"❌ Total sisa kapasitas gudang ({total_kapasitas_gudang} palet) tidak mencukupi untuk menampung {total_slot_butuh} palet!")
+                    zona_teks = "zona teratas (F1–F16 & G17–G28)" if part_aktif in PART_KHUSUS_TOP_TIER else "gudang"
+                    st.error(f"❌ Total sisa kapasitas {zona_teks} ({total_kapasitas_gudang} palet) tidak mencukupi untuk menampung {total_slot_butuh} palet!")
                 else:
                     rencana_alokasi = []
                     sisa_utuh, sisa_pecahan = qty_p_in, qty_c_in
