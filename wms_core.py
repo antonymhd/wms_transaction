@@ -262,9 +262,9 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="B
     0. Zona Khusus:
        - JDO Diamond (PART_KHUSUS_TOP_TIER) wajib di F1-16 & G17-28.
        - Item reguler mengutamakan rak selain F1-16 & G17-28 lebih dulu (ZonePenalty = 0).
-    1. Prioritas 1: Lorong murni 1 jenis produk sejenis — diutamakan yang lot-nya sama / lot terbaru, isi sampai penuh.
+    1. Prioritas 1: Lorong murni 1 jenis produk sejenis — diutamakan lot sama / lot terbaru, isi sampai penuh.
     2. Prioritas 2: Lorong rak kosong (0 palet), isi sampai penuh.
-    3. Prioritas 3: Lorong isi 2 jenis produk di mana item sejenis berada di ujung pintu masuk (Belakang/Depan), isi sampai penuh.
+    3. Prioritas 3: Lorong isi 2 jenis produk di mana item sejenis berada di ujung pintu masuk, isi sampai penuh.
     4. Prioritas 4: Lorong isi 1 jenis produk berbeda (campur maks 2 jenis item per lorong).
     """
     KOLOM_LIST = ['A', 'B', 'C', 'D', 'E', 'F', 'G']
@@ -336,7 +336,6 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="B
         if len(distinct_items) >= 2 and target_item_clean not in distinct_items:
             continue
             
-        # SubSort tuple: (lot_match_penalty, -newest_lot_date, -used_cap)
         if target_item_clean in distinct_items and len(distinct_items) == 1:
             prio = 1
             lot_ujung = (
@@ -347,21 +346,16 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="B
             sama_lot = any(l.upper() == target_lot_clean for l in sejenis_lots) if target_lot_clean else False
             newest_rank = max([parse_lifo_rank(l) for l in sejenis_lots], default=0)
             
-            if sama_lot:
-                status = "🟢 PRIO 1: LANJUTKAN LOT SAMA"
-                lot_match_pen = 0
-            else:
-                status = "🟢 PRIO 1: LANJUTKAN SEJENIS (LOT TERBARU)"
-                lot_match_pen = 1
-                
+            status = "🟢 Lanjutkan Lot Sama" if sama_lot else "🟢 Lanjutkan Sejenis (Lot Terbaru)"
+            lot_match_pen = 0 if sama_lot else 1
             info_lot = f"Lot {lot_ujung}" if lot_ujung else "sejenis"
-            isi_eksisting = f"{jml_sejenis}P ({info_lot})"
+            isi_eksisting = f"{jml_sejenis} Pallet ({info_lot})"
             sub_sort = (lot_match_pen, -newest_rank, -used_cap)
             
         elif len(distinct_items) == 0:
             prio = 2
-            status = "⚪ PRIO 2: LORONG KOSONG"
-            isi_eksisting = "Kosong"
+            status = "⚪ Lorong Kosong"
+            isi_eksisting = f"Kosong (Kapasitas {max_target} Pallet)"
             sub_sort = (0, 0, 0.0)
             
         elif target_item_clean in distinct_items and len(distinct_items) == 2:
@@ -374,21 +368,21 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="B
                 continue
                 
             prio = 3
-            status = f"🔵 PRIO 3: LANJUT DI {sisi_masuk} LORONG 2 ITEM"
+            status = f"🔵 Lorong 2 Item (Sejenis di {sisi_masuk.title()})"
             sama_lot = any(l.upper() == target_lot_clean for l in sejenis_lots) if target_lot_clean else False
             newest_rank = max([parse_lifo_rank(l) for l in sejenis_lots], default=0)
             item_lain = [x for x in distinct_items if x != target_item_clean][0]
-            nama_ringkas = f"{item_lain[:14]}..." if len(item_lain) > 14 else item_lain
-            isi_eksisting = f"{jml_sejenis}P sejenis (di {sisi_masuk.lower()}) + {len(pallets_sorted)-jml_sejenis}P {nama_ringkas}"
+            nama_ringkas = f"{item_lain[:16]}..." if len(item_lain) > 16 else item_lain
+            isi_eksisting = f"{jml_sejenis}P sejenis + {len(pallets_sorted)-jml_sejenis}P {nama_ringkas}"
             sub_sort = (0 if sama_lot else 1, -newest_rank, -used_cap)
             
         elif len(distinct_items) == 1 and target_item_clean not in distinct_items:
             prio = 4
-            status = "🟡 PRIO 4: CAMPUR (MAX 2 ITEM)"
+            status = "🟡 Campur (Max 2 Item)"
             item_lain = list(distinct_items)[0]
             lot_str = ", ".join(sorted(list(distinct_lots))[:2])
-            nama_ringkas = f"{item_lain[:15]}..." if len(item_lain) > 15 else item_lain
-            isi_eksisting = f"{len(pallets_sorted)}P {nama_ringkas} (Lot:{lot_str})"
+            nama_ringkas = f"{item_lain[:16]}..." if len(item_lain) > 16 else item_lain
+            isi_eksisting = f"{len(pallets_sorted)}P {nama_ringkas} (Lot: {lot_str})"
             sub_sort = (0, 0, used_cap)
         else:
             continue
@@ -920,28 +914,29 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                 st.session_state.slide = 6
                 st.rerun()
 
-    # --- SLIDE 6: RENCANA ALOKASI MULTI-RAK OTOMATIS ---
+    # --- SLIDE 6: REKOMENDASI LOKASI RAK ---
     elif st.session_state.slide == 6:
         if st.button("🔙 UBAH INPUT"):
             st.session_state.slide = 5
             st.rerun()
             
         sisi_masuk = st.session_state.get("in_sisi_masuk", default_sisi_masuk)
+        sisi_label = "Depan" if sisi_masuk == "DEPAN" else "Belakang"
         sisi_str = "DEPAN (Push-Back)" if sisi_masuk == "DEPAN" else "BELAKANG (Normal)"
         part_aktif = str(st.session_state.pilih_part).strip().upper()
         lot_aktif = str(st.session_state.in_lot or "").strip()
-        
-        st.markdown("### Rencana Alokasi Multi-Rak")
-        if part_aktif in PART_KHUSUS_TOP_TIER:
-            st.caption(f"🏗️ **Zona Teratas (F1–F16 & G17–G28)** | Pintu: **{sisi_str}**")
-        else:
-            st.caption(f"Pintu: **{sisi_str}** | 1. Lot Terbaru Sejenis ➔ 2. Lorong Kosong ➔ 3. Lorong 2 Item ➔ 4. Campur")
-        
         qty_p_in = int(st.session_state.in_qty_p or 0)
         qty_c_in = int(st.session_state.in_qty_c or 0)
+        satuan_c = st.session_state.in_tipe_c
         total_slot_butuh = qty_p_in + (1 if qty_c_in > 0 else 0)
         
-        with st.spinner("📐 Menyusun alokasi multi-rak sesuai prioritas..."):
+        st.markdown("### Rekomendasi Lokasi Rak")
+        teks_pec_hdr = f" + {qty_c_in} {satuan_c}" if qty_c_in > 0 else ""
+        with st.container(border=True):
+            st.markdown(f"📦 {format_nama_warna_bold(st.session_state.item)}")
+            st.caption(f"Lot: **{lot_aktif}**  |  Total: **{qty_p_in} Pallet{teks_pec_hdr}**  |  Masuk: **{sisi_label.upper()}**")
+        
+        with st.spinner("📐 Mencari lorong rak terbaik..."):
             semua_data = get_all_racking_data()
             df_kandidat = hitung_kandidat_rak_inbound(
                 semua_data, st.session_state.item, part_aktif,
@@ -956,12 +951,12 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                     st.error("❌ Seluruh rak penuh atau tidak memenuhi syarat posisi item!")
             else:
                 if in_is_sac:
-                    st.caption("🛡️ *Filter aktif: Rak Sak dengan sisa ≤ 1 slot otomatis dilewati karena toleransi panjang fisik.*")
+                    st.caption("🛡️ *Rak Sak sisa ≤ 1 slot otomatis dilewati (toleransi panjang fisik).*")
                     
                 rak_skip = st.multiselect(
-                    "🚫 Lewati Rak (Jika di lapangan penuh / terhalang):",
+                    "🚫 Lewati Rak (Jika penuh / terhalang):",
                     options=df_kandidat['Loc'].tolist(),
-                    placeholder="Pilih rak untuk dilewati agar dialihkan ke rak berikutnya..."
+                    placeholder="Pilih rak yang dilewati..."
                 )
                 if rak_skip:
                     df_kandidat = df_kandidat[~df_kandidat['Loc'].isin(rak_skip)].reset_index(drop=True)
@@ -998,22 +993,37 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                                 'SisaSlot': int(row['SisaSlot'])
                             })
                             
-                    st.info(f"📦 Total Kebutuhan: **{total_slot_butuh} Slot Palet** terbagi ke **{len(rencana_alokasi)} Lorong Rak**:")
                     for i_alok, al in enumerate(rencana_alokasi, 1):
-                        teks_pec = f" + {al['qty_c']} {st.session_state.in_tipe_c}" if al['qty_c'] > 0 else ""
+                        teks_pec = f" + {al['qty_c']} {satuan_c}" if al['qty_c'] > 0 else ""
                         slot_dipakai = al['qty_p'] + (1 if al['qty_c'] > 0 else 0)
                         sisa_setelah = al['SisaSlot'] - slot_dipakai
-                        ket_penuh = "🔒 PENUH" if sisa_setelah == 0 else f"Sisa {sisa_setelah} slot"
                         
+                        if sisa_setelah == 0:
+                            instruksi_baris = f"Isi dari {sisi_label} sampai penuh ± {al['qty_p']} Pallet{teks_pec}"
+                        else:
+                            instruksi_baris = f"Isi dari {sisi_label} ± {al['qty_p']} Pallet{teks_pec}"
+                            
                         with st.container(border=True):
-                            st.markdown(f"**{i_alok}. 📍 RAK {al['Kolom']}-{al['Baris']}**  |  {al['Status']}")
-                            st.markdown(f"➡️ **Masukkan: {al['qty_p']} Pallet{teks_pec}** *(Awal: {al['IsiEksisting']} ➔ {ket_penuh})*")
+                            st.markdown(f"**{i_alok}. 📍 RAK {al['Kolom']}-{al['Baris']}**")
+                            st.markdown(f"➡️ **{instruksi_baris}**")
+                            st.caption(f"Kondisi rak: {al['IsiEksisting']}")
                             
                     st.write("")
                     if st.button("✅ LANJUT KE KONFIRMASI AKTUAL", type="primary", use_container_width=True):
                         st.session_state.alokasi_terpilih = rencana_alokasi
                         st.session_state.slide = 7
                         st.rerun()
+
+        st.write("")
+        with st.expander("ℹ️ Aturan Urutan Rekomendasi Rak", expanded=False):
+            st.markdown("""
+1. **Lorong 1 Item Sejenis:** Melanjutkan lot yang sama atau lot terbaru sampai penuh.
+2. **Lorong Kosong:** Membuka lorong kosong baru jika lorong sejenis sudah penuh.
+3. **Lorong 2 Item:** Melanjutkan di lorong 2 item jika posisi item sejenis berada di ujung pintu masuk (`Belakang` / `Depan`).
+4. **Campur (Max 2 Item):** Menggabung ke lorong yang baru berisi 1 item lain sebagai pilihan terakhir.
+
+*Catatan: Produk JDO Diamond khusus ditempatkan di Rak F1–F16 & G17–G28.*
+            """)
 
     # --- SLIDE 7: KONFIRMASI & KOREKSI AKTUAL LAPANGAN ---
     elif st.session_state.slide == 7:
