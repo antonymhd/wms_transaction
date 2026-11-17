@@ -109,6 +109,24 @@ def parse_keterangan(ket_str):
     if m_ec: eceran = int(m_ec.group(1))
     return pecahan, eceran
 
+def update_bayangan_baris(records_baris, kolom_id, baris_num):
+    """Mengevaluasi ulang indeks Pallet Ke (1..N) dan tag [BAYANGAN - OVERCAPACITY] pada satu baris rak"""
+    valid_items = [d for d in records_baris if str(d.get('Part Number', '')).strip().lower() not in ["", "nan", "none", "<na>"]]
+    is_all_box = False
+    if valid_items:
+        is_all_box = all(str(d.get('Part Number', '')).strip().upper().endswith(('D', 'G')) for d in valid_items)
+    
+    max_slot = 999 if kolom_id == 'S' else ((32 if baris_num <= 16 else 46) if is_all_box else (31 if baris_num <= 16 else 44))
+    
+    for idx, item in enumerate(records_baris, start=1):
+        item['Pallet Ke'] = float(idx)
+        cat_lama = str(item.get('Catatan', '')).replace('nan', '')
+        if idx > max_slot and 'BAYANGAN' not in cat_lama.upper():
+            item['Catatan'] = ("[BAYANGAN - OVERCAPACITY] " + cat_lama).strip()
+        elif idx <= max_slot and 'BAYANGAN' in cat_lama.upper():
+            item['Catatan'] = cat_lama.replace("[BAYANGAN - OVERCAPACITY]", "").strip()
+    return records_baris
+
 @st.cache_data(ttl=300)
 def load_master_produk():
     """Memuat Master Data Produk untuk Auto-fill Part Number"""
@@ -315,7 +333,6 @@ with tab1:
                                     if float(d.get('Baris', 0) or 0) == float(b_pilih):
                                         new_idx = float(d.get('Pallet Ke', 0)) + total_inbound
                                         d['Pallet Ke'] = new_idx
-                                        # Update status bayangan untuk palet lama yang terdorong
                                         cat_lama = str(d.get('Catatan', '')).replace('nan', '')
                                         if new_idx > max_slot_actual and 'BAYANGAN' not in cat_lama.upper():
                                             d['Catatan'] = ("[BAYANGAN - OVERCAPACITY] " + cat_lama).strip()
@@ -546,7 +563,7 @@ with tab2:
                         return False, error_msg, fresh_out_data, []
 
                     data_rak_ini = sorted([d for d in data_rak_ini if float(d.get('Baris', 0) or 0) == float(b_pilih)], key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
-                    for i, d in enumerate(data_rak_ini, 1): d['Pallet Ke'] = float(i)
+                    data_rak_ini = update_bayangan_baris(data_rak_ini, k_pilih, b_pilih)
                     
                     transaction.set(doc_ref, {'data': data_rak_lain + data_rak_ini})
                     log_fb_usage('write', 1)
@@ -713,7 +730,6 @@ with tab4:
     if st.button("Racik Laporan Mutasi Sekarang", type="primary"):
         with st.spinner("Menarik data log mutasi..."):
             try:
-                # Konversi rentang tanggal WIB ke UTC untuk query Timestamp_System
                 start_utc = datetime.combine(tgl_mulai, datetime.min.time(), tzinfo=timezone.utc) - timedelta(hours=7)
                 end_utc = datetime.combine(tgl_selesai, datetime.max.time(), tzinfo=timezone.utc) - timedelta(hours=7)
                 
@@ -891,11 +907,11 @@ with tab6:
             else: st.info("Rak Kosong.")
 
 # ----------------------------------------------------------
-# TAB 7: RELOKASI RAK
+# TAB 7: RELOKASI RAK (SUPPORT PUSH-BACK & ROTASI LORONG SAMA)
 # ----------------------------------------------------------
 with tab7:
-    st.header("🔄 Relokasi Pallet (Pindah Rak / Subsidi Silang)")
-    st.caption("Pindahkan item antar rak secara presisi (Pallet, Dus, Pcs). Sangat cocok untuk tarik barang ke Staging Area.")
+    st.header("🔄 Relokasi Pallet (Pindah Rak / Rotasi Push-Back)")
+    st.caption("Pindahkan item antar rak secara presisi (Pallet, Dus, Pcs), atau tarik Lot ke posisi terdepan (Pallet Ke-1) dengan mode Push-Back.")
     
     col_r1, col_r2 = st.columns(2)
     with col_r1:
@@ -915,7 +931,9 @@ with tab7:
         
     if st.session_state.get('relok_dicari'):
         ak, ab = st.session_state['relok_ak'], st.session_state['relok_ab']
-        tk, tb = st.session_state['relok_tk'], st.session_state['relok_tb']
+        # Izinkan user mengubah tujuan setelah klik cari tanpa kehilangan tabel asal
+        tk, tb = r_tuj_k, r_tuj_b
+        is_same_rack = (ak == tk and ab == tb)
         
         all_asal_data = fetch_kolom_cached(ak, 'cache_relok_asal', force_refresh=False)
         baris_asal_data = [d for d in all_asal_data if float(d.get('Baris', 0) or 0) == float(ab) and str(d.get('Part Number', '')).strip() != '']
@@ -952,7 +970,7 @@ with tab7:
             df_rekap_relok = pd.DataFrame(rekap_relok)
             
             st.divider()
-            st.markdown(f"**2. Tentukan Jumlah yang Dipindah dari {ak}-{ab} ke {tk}-{tb}**")
+            st.markdown(f"**2. Tentukan Jumlah yang Dipindah dari `{ak}-{ab}` ke `{tk}-{tb}`**")
             
             config_kolom = {
                 'Group_Key': None, 'Part Number': None,
@@ -969,9 +987,21 @@ with tab7:
             
             edited_relok = st.data_editor(df_rekap_relok, column_config=config_kolom, hide_index=True, use_container_width=True, key=f"editor_relok_{ak}_{ab}_{tk}_{tb}")
             
+            relok_dari_depan = st.checkbox(
+                "📥 Masukkan ke Rak Tujuan dari DEPAN (Push-back)", 
+                value=is_same_rack,
+                key="relok_dari_depan"
+            )
+            
+            if is_same_rack:
+                if relok_dari_depan:
+                    st.info(f"🔄 **Mode Rotasi Lorong ({ak}-{ab}):** Item yang dipilih akan ditarik keluar dan dimasukkan kembali dari pintu depan (**Pallet Ke-1**), mendorong slot lainnya ke belakang.")
+                else:
+                    st.warning("⚠️ Rak Asal dan Tujuan sama. Centang opsi **Push-back** di atas jika ingin memindahkan item ke posisi terdepan (Pallet Ke-1).")
+            
             if st.button("🚀 Eksekusi Pindah Rak", type="primary", use_container_width=True):
-                if ak == tk and ab == tb:
-                    st.error("❌ Rak asal dan tujuan tidak boleh sama!")
+                if is_same_rack and not relok_dari_depan:
+                    st.error("❌ Rak asal dan tujuan sama! Aktifkan checkbox Push-back jika ingin memutar posisi Lot ke depan.")
                 else:
                     doc_ref_asal = db.collection(NAMA_DATABASE).document(f"Kolom_{ak}")
                     doc_ref_tuj = db.collection(NAMA_DATABASE).document(f"Kolom_{tk}") if ak != tk else None
@@ -1004,6 +1034,8 @@ with tab7:
                         undo_dict_setup = {ak: fresh_asal}
                         if ak != tk: undo_dict_setup[tk] = fresh_tuj
 
+                        all_moved_records = []
+
                         for _, row in edited_relok.iterrows():
                             pindah_utuh = int(row['PINDAH UTUH'])
                             pindah_dus = int(row['PINDAH DUS'])
@@ -1028,7 +1060,7 @@ with tab7:
                                 break
                             df_lot = df_lot.sort_values('Pallet Ke', ascending=False)
                             
-                            # --- 1. DEDUCT DARI RAK ASAL ---
+                            # --- FASE 1: CABUT DARI RAK ASAL ---
                             slot_tambahan = 1 if (sisa_dus > 0 or sisa_pcs > 0) else 0
                             total_slot_sisa = sisa_utuh + slot_tambahan
                             out_qty = len(df_lot) - total_slot_sisa
@@ -1059,63 +1091,89 @@ with tab7:
                             data_rak_asal = updated_rak_asal
                             if ak == tk: data_rak_tujuan = data_rak_asal
                             
-                            # --- 2. ADD KE RAK TUJUAN ---
-                            catatan_baru = catatan_awal
+                            # --- SIAPKAN RECORD PINDAHAN ---
+                            catatan_baru = catatan_awal.replace("[BAYANGAN - OVERCAPACITY]", "").strip()
                             if tk == 'S' and ak != 'S':
                                 cat_bersih = re.sub(r'\[Asal:.*?\]\s*', '', catatan_baru)
                                 catatan_baru = (f"[Asal: {ak}-{ab}] " + cat_bersih).strip()
                             elif tk != 'S':
                                 catatan_baru = re.sub(r'\[Asal:.*?\]\s*', '', catatan_baru).strip()
                                 
-                            b_tuj = [pd.to_numeric(d.get('Pallet Ke', 0)) for d in data_rak_tujuan if float(d.get('Baris',0) or 0)==float(tb) and pd.notna(d.get('Pallet Ke'))]
-                            next_pallet = max(b_tuj) + 1 if b_tuj else 1
-                            
-                            new_records = []
                             for _ in range(pindah_utuh):
-                                new_records.append({
-                                    'Kolom': tk, 'Baris': float(tb), 'Pallet Ke': float(next_pallet),
+                                all_moved_records.append({
+                                    'Kolom': tk, 'Baris': float(tb), 'Pallet Ke': 0.0,
                                     'Part Number': part_num, 'Lot Number': l, 'Nama Produk': nama_prod,
                                     'Status': 'Terisi', 'Keterangan': '', 'Catatan': catatan_baru
                                 })
-                                next_pallet += 1
                                 
                             if pindah_dus > 0 or pindah_pcs > 0:
                                 kp = []
                                 if pindah_dus > 0: kp.append(f"Pecahan: {pindah_dus} qty")
                                 if pindah_pcs > 0: kp.append(f"Eceran: {pindah_pcs} pcs")
-                                new_records.append({
-                                    'Kolom': tk, 'Baris': float(tb), 'Pallet Ke': float(next_pallet),
+                                all_moved_records.append({
+                                    'Kolom': tk, 'Baris': float(tb), 'Pallet Ke': 0.0,
                                     'Part Number': part_num, 'Lot Number': l, 'Nama Produk': nama_prod,
                                     'Status': 'Terisi', 'Keterangan': " | ".join(kp), 'Catatan': catatan_baru
                                 })
-                                next_pallet += 1
-                                
-                            data_rak_tujuan.extend(new_records)
-                            if ak == tk: data_rak_asal = data_rak_tujuan
                             
-                            logs_to_write.append(("RELOKASI", f"{ak} ke {tk}", f"{ab} ke {tb}", nama_prod, part_num, l, pindah_utuh, pindah_dus, pindah_pcs))
+                            jenis_log = f"RELOKASI{' (Push-Back)' if relok_dari_depan else ''}"
+                            logs_to_write.append((jenis_log, f"{ak} ke {tk}", f"{ab} ke {tb}", nama_prod, part_num, l, pindah_utuh, pindah_dus, pindah_pcs))
 
                         if error_msg or not has_changes:
                             return False, error_msg, {}, []
 
-                        if ak == tk:
-                            for target_baris in set([ab, tb]):
-                                b_sisa = sorted([d for d in data_rak_asal if float(d.get('Baris',0) or 0)==float(target_baris)], key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
-                                b_lain = [d for d in data_rak_asal if float(d.get('Baris',0) or 0)!=float(target_baris)]
-                                for i, d in enumerate(b_sisa, 1): d['Pallet Ke'] = float(i)
-                                data_rak_asal = b_lain + b_sisa
-                            transaction.set(doc_ref_asal, {'data': data_rak_asal})
-                            log_fb_usage('write', 1)
-                        else:
-                            baris_asal_sisa = sorted([d for d in data_rak_asal if float(d.get('Baris',0) or 0)==float(ab)], key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
-                            lain_asal = [d for d in data_rak_asal if float(d.get('Baris',0) or 0)!=float(ab)]
-                            for i, d in enumerate(baris_asal_sisa, 1): d['Pallet Ke'] = float(i)
-                            transaction.set(doc_ref_asal, {'data': lain_asal + baris_asal_sisa})
+                        # --- FASE 2: SUSUN ULANG RAK ASAL & SISIPKAN KE RAK TUJUAN ---
+                        if ak == tk and ab == tb:
+                            # Rotasi di baris yang sama: item pindahan ditaruh di depan, sisa penghuni lama di belakangnya
+                            existing_tb = sorted(
+                                [d for d in data_rak_tujuan if float(d.get('Baris', 0) or 0) == float(tb) and str(d.get('Part Number', '')).strip() != ''],
+                                key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0))
+                            )
+                            lain_tb = [d for d in data_rak_tujuan if float(d.get('Baris', 0) or 0) != float(tb)]
                             
-                            baris_tuj_sisa = sorted([d for d in data_rak_tujuan if float(d.get('Baris',0) or 0)==float(tb)], key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
-                            lain_tuj = [d for d in data_rak_tujuan if float(d.get('Baris',0) or 0)!=float(tb)]
-                            for i, d in enumerate(baris_tuj_sisa, 1): d['Pallet Ke'] = float(i)
-                            transaction.set(doc_ref_tuj, {'data': lain_tuj + baris_tuj_sisa})
+                            combined_tb = (all_moved_records + existing_tb) if relok_dari_depan else (existing_tb + all_moved_records)
+                            combined_tb = update_bayangan_baris(combined_tb, tk, tb)
+                            
+                            transaction.set(doc_ref_asal, {'data': lain_tb + combined_tb})
+                            log_fb_usage('write', 1)
+
+                        elif ak == tk and ab != tb:
+                            # Beda baris tapi dalam satu dokumen Kolom yang sama
+                            baris_asal_sisa = sorted(
+                                [d for d in data_rak_asal if float(d.get('Baris', 0) or 0) == float(ab) and str(d.get('Part Number', '')).strip() != ''],
+                                key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0))
+                            )
+                            baris_asal_sisa = update_bayangan_baris(baris_asal_sisa, ak, ab)
+
+                            existing_tb = sorted(
+                                [d for d in data_rak_asal if float(d.get('Baris', 0) or 0) == float(tb) and str(d.get('Part Number', '')).strip() != ''],
+                                key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0))
+                            )
+                            combined_tb = (all_moved_records + existing_tb) if relok_dari_depan else (existing_tb + all_moved_records)
+                            combined_tb = update_bayangan_baris(combined_tb, tk, tb)
+
+                            lain_bars = [d for d in data_rak_asal if float(d.get('Baris', 0) or 0) not in (float(ab), float(tb))]
+                            transaction.set(doc_ref_asal, {'data': lain_bars + baris_asal_sisa + combined_tb})
+                            log_fb_usage('write', 1)
+
+                        else:
+                            # Beda dokumen Kolom (ak != tk)
+                            baris_asal_sisa = sorted(
+                                [d for d in data_rak_asal if float(d.get('Baris', 0) or 0) == float(ab) and str(d.get('Part Number', '')).strip() != ''],
+                                key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0))
+                            )
+                            baris_asal_sisa = update_bayangan_baris(baris_asal_sisa, ak, ab)
+                            lain_asal = [d for d in data_rak_asal if float(d.get('Baris', 0) or 0) != float(ab)]
+                            transaction.set(doc_ref_asal, {'data': lain_asal + baris_asal_sisa})
+
+                            existing_tb = sorted(
+                                [d for d in data_rak_tujuan if float(d.get('Baris', 0) or 0) == float(tb) and str(d.get('Part Number', '')).strip() != ''],
+                                key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0))
+                            )
+                            combined_tb = (all_moved_records + existing_tb) if relok_dari_depan else (existing_tb + all_moved_records)
+                            combined_tb = update_bayangan_baris(combined_tb, tk, tb)
+                            lain_tuj = [d for d in data_rak_tujuan if float(d.get('Baris', 0) or 0) != float(tb)]
+                            transaction.set(doc_ref_tuj, {'data': lain_tuj + combined_tb})
                             log_fb_usage('write', 2)
 
                         return True, "", undo_dict_setup, logs_to_write
@@ -1127,9 +1185,10 @@ with tab7:
                         for lg in logs_list:
                             catat_log_mutasi(*lg)
                         clear_all_rak_caches()
+                        mode_txt = " (Push-Back ke Depan)" if relok_dari_depan else ""
                         st.session_state.update({
                             'undo_dict': undo_dict_setup,
-                            'action_msg': f"Berhasil memindahkan item dari Rak {ak}-{ab} ke {tk}-{tb}",
+                            'action_msg': f"Berhasil memindahkan item dari Rak {ak}-{ab} ke {tk}-{tb}{mode_txt}",
                             'action_status': 'DONE',
                             'relok_dicari': False,
                             'kor_dicari': False
