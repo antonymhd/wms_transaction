@@ -9,7 +9,7 @@ df_master = core.load_master_data()
 
 keys_state = [
     'slide', 'mode_transaksi', 'kategori', 'gramasi', 'item', 'pilih_part',
-    'in_lot', 'in_qty_p', 'in_qty_c', 'in_tipe_c', 'in_sisi_masuk', 'alokasi_terpilih',
+    'in_lot', 'in_qty_p', 'in_qty_c', 'in_tipe_c', 'in_sisi_masuk', 'in_rak_skip', 'alokasi_terpilih',
     'wip_kolom', 'wip_baris', 'wip_lot', 'wip_catatan_rak', 'wip_max_pallet', 'wip_max_dus',
     'operator', 'undo_record'
 ]
