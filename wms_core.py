@@ -111,6 +111,14 @@ def inject_custom_css(accent_color="#10B981", accent_border="#059669", accent_bg
                 border-radius: 10px;
                 margin-bottom: 10px;
             }}
+
+            .cek-fisik-box {{
+                background-color: var(--secondary-background-color);
+                border-left: 5px solid {accent_color};
+                padding: 12px 14px;
+                border-radius: 8px;
+                margin: 10px 0;
+            }}
             
             .btn-gramasi > button {{ font-size: 20px !important; text-align: center !important; }}
         </style>
@@ -173,6 +181,15 @@ def parse_fifo_key(lot_str):
         dd, mm, yy = match.groups()
         return f"{yy}{mm}{dd}_{s}"
     return f"999999_{s}"
+
+def parse_lifo_rank(lot_str):
+    """Nilai numerik lebih besar = tanggal produksi lebih baru (untuk prioritas meneruskan lot terbaru)."""
+    s = str(lot_str).strip()
+    match = re.search(r'(\d{2})(\d{2})(\d{2})$', s)
+    if match:
+        dd, mm, yy = match.groups()
+        return int(f"{yy}{mm}{dd}")
+    return 0
 
 def get_satuan_kemasan(part_num):
     p = str(part_num).strip().upper()
@@ -239,15 +256,16 @@ def load_master_data():
             'Total_Pcs_Pallet', 'Pcs_Per_Box', 'Pcs_Per_Sac'
         ])
 
-def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="BELAKANG"):
+def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="BELAKANG", target_lot=""):
     """
-    Menyusun kandidat lorong rak berdasarkan aturan gudang, zona khusus & pintu masuk:
+    Urutan Prioritas Penempatan Multi-Rak:
     0. Zona Khusus:
-       - Item JDO Diamond (PART_KHUSUS_TOP_TIER) hanya valid di F1-16 & G17-28.
-       - Item reguler mengutamakan rak selain F1-16 & G17-28 terlebih dahulu (ZonePenalty = 0).
-    1. Prioritas 1: Sudah ada item sejenis (jika sudah 2 item, ujung pintu masuk wajib item sejenis).
-    2. Prioritas 2: Rak kosong (0 palet).
-    3. Prioritas 3: Rak berisi 1 item tidak sejenis (maksimal 2 jenis item per lorong).
+       - JDO Diamond (PART_KHUSUS_TOP_TIER) wajib di F1-16 & G17-28.
+       - Item reguler mengutamakan rak selain F1-16 & G17-28 lebih dulu (ZonePenalty = 0).
+    1. Prioritas 1: Lorong murni 1 jenis produk sejenis — diutamakan yang lot-nya sama / lot terbaru, isi sampai penuh.
+    2. Prioritas 2: Lorong rak kosong (0 palet), isi sampai penuh.
+    3. Prioritas 3: Lorong isi 2 jenis produk di mana item sejenis berada di ujung pintu masuk (Belakang/Depan), isi sampai penuh.
+    4. Prioritas 4: Lorong isi 1 jenis produk berbeda (campur maks 2 jenis item per lorong).
     """
     KOLOM_LIST = ['A', 'B', 'C', 'D', 'E', 'F', 'G']
     BARIS_LIST = list(range(1, 29))
@@ -263,6 +281,7 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="B
     in_is_sac = part_clean.endswith('C')
     is_produk_khusus = part_clean in PART_KHUSUS_TOP_TIER
     target_item_clean = str(target_item).strip()
+    target_lot_clean = str(target_lot).strip().upper()
     
     kandidat_rak = []
     for loc, pallets in slot_map.items():
@@ -284,6 +303,7 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="B
         used_cap = 0.0
         distinct_items = set()
         distinct_lots = set()
+        sejenis_lots = []
         has_sac = False
         jml_sejenis = 0
         
@@ -294,6 +314,8 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="B
                 distinct_items.add(p_name)
                 if p_name == target_item_clean:
                     jml_sejenis += 1
+                    if p_lot:
+                        sejenis_lots.append(p_lot)
             if p_lot:
                 distinct_lots.add(p_lot)
             p_part = str(p.get('Part Number', '')).strip().upper()
@@ -314,10 +336,33 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="B
         if len(distinct_items) >= 2 and target_item_clean not in distinct_items:
             continue
             
+        # SubSort tuple: (lot_match_penalty, -newest_lot_date, -used_cap)
         if target_item_clean in distinct_items and len(distinct_items) == 1:
-            prio, status = 1, "🟢 PRIO 1: KONSOLIDASI SEJENIS"
-            isi_eksisting = f"{jml_sejenis}P sejenis"
-            sub_sort = -used_cap
+            prio = 1
+            lot_ujung = (
+                str(pallets_sorted[0].get('Lot Number', '')).strip()
+                if sisi_masuk == "DEPAN"
+                else str(pallets_sorted[-1].get('Lot Number', '')).strip()
+            )
+            sama_lot = any(l.upper() == target_lot_clean for l in sejenis_lots) if target_lot_clean else False
+            newest_rank = max([parse_lifo_rank(l) for l in sejenis_lots], default=0)
+            
+            if sama_lot:
+                status = "🟢 PRIO 1: LANJUTKAN LOT SAMA"
+                lot_match_pen = 0
+            else:
+                status = "🟢 PRIO 1: LANJUTKAN SEJENIS (LOT TERBARU)"
+                lot_match_pen = 1
+                
+            info_lot = f"Lot {lot_ujung}" if lot_ujung else "sejenis"
+            isi_eksisting = f"{jml_sejenis}P ({info_lot})"
+            sub_sort = (lot_match_pen, -newest_rank, -used_cap)
+            
+        elif len(distinct_items) == 0:
+            prio = 2
+            status = "⚪ PRIO 2: LORONG KOSONG"
+            isi_eksisting = "Kosong"
+            sub_sort = (0, 0, 0.0)
             
         elif target_item_clean in distinct_items and len(distinct_items) == 2:
             item_ujung = (
@@ -328,24 +373,23 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="B
             if item_ujung != target_item_clean:
                 continue
                 
-            prio, status = 1, f"🟢 PRIO 1: LANJUT SEJENIS ({sisi_masuk})"
+            prio = 3
+            status = f"🔵 PRIO 3: LANJUT DI {sisi_masuk} LORONG 2 ITEM"
+            sama_lot = any(l.upper() == target_lot_clean for l in sejenis_lots) if target_lot_clean else False
+            newest_rank = max([parse_lifo_rank(l) for l in sejenis_lots], default=0)
             item_lain = [x for x in distinct_items if x != target_item_clean][0]
-            nama_ringkas = f"{item_lain[:15]}..." if len(item_lain) > 15 else item_lain
+            nama_ringkas = f"{item_lain[:14]}..." if len(item_lain) > 14 else item_lain
             isi_eksisting = f"{jml_sejenis}P sejenis (di {sisi_masuk.lower()}) + {len(pallets_sorted)-jml_sejenis}P {nama_ringkas}"
-            sub_sort = -used_cap
-            
-        elif len(distinct_items) == 0:
-            prio, status = 2, "⚪ PRIO 2: RAK KOSONG"
-            isi_eksisting = "Kosong"
-            sub_sort = 0.0
+            sub_sort = (0 if sama_lot else 1, -newest_rank, -used_cap)
             
         elif len(distinct_items) == 1 and target_item_clean not in distinct_items:
-            prio, status = 3, "🟡 PRIO 3: CAMPUR (MAX 2 ITEM)"
+            prio = 4
+            status = "🟡 PRIO 4: CAMPUR (MAX 2 ITEM)"
             item_lain = list(distinct_items)[0]
             lot_str = ", ".join(sorted(list(distinct_lots))[:2])
-            nama_ringkas = f"{item_lain[:16]}..." if len(item_lain) > 16 else item_lain
+            nama_ringkas = f"{item_lain[:15]}..." if len(item_lain) > 15 else item_lain
             isi_eksisting = f"{len(pallets_sorted)}P {nama_ringkas} (Lot:{lot_str})"
-            sub_sort = used_cap
+            sub_sort = (0, 0, used_cap)
         else:
             continue
             
@@ -826,7 +870,7 @@ def render_pemilihan_produk(df_master):
                 st.rerun()
 
 # ==========================================================
-# 8. MODUL UI INBOUND MULTI-RAK TERPADU
+# 8. MODUL UI INBOUND MULTI-RAK TERPADU (SLIDE 5 -> 6 -> 7)
 # ==========================================================
 def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="BELAKANG", jenis_log="INBOUND (Remote)", judul_tele="INBOUND - RACK NAVIGATOR", mode_undo_label="INBOUND", reset_keys=None):
     # --- SLIDE 5: INPUT LOT, QTY & SISI PINTU MASUK ---
@@ -885,12 +929,13 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
         sisi_masuk = st.session_state.get("in_sisi_masuk", default_sisi_masuk)
         sisi_str = "DEPAN (Push-Back)" if sisi_masuk == "DEPAN" else "BELAKANG (Normal)"
         part_aktif = str(st.session_state.pilih_part).strip().upper()
+        lot_aktif = str(st.session_state.in_lot or "").strip()
         
-        st.markdown(f"### Rencana Alokasi Multi-Rak")
+        st.markdown("### Rencana Alokasi Multi-Rak")
         if part_aktif in PART_KHUSUS_TOP_TIER:
             st.caption(f"🏗️ **Zona Teratas (F1–F16 & G17–G28)** | Pintu: **{sisi_str}**")
         else:
-            st.caption(f"Pintu Masuk: **{sisi_str}** | Aturan: 1. Sejenis (di {sisi_masuk.lower()}) ➔ 2. Kosong ➔ 3. Campur (Max 2 Item)")
+            st.caption(f"Pintu: **{sisi_str}** | 1. Lot Terbaru Sejenis ➔ 2. Lorong Kosong ➔ 3. Lorong 2 Item ➔ 4. Campur")
         
         qty_p_in = int(st.session_state.in_qty_p or 0)
         qty_c_in = int(st.session_state.in_qty_c or 0)
@@ -898,7 +943,10 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
         
         with st.spinner("📐 Menyusun alokasi multi-rak sesuai prioritas..."):
             semua_data = get_all_racking_data()
-            df_kandidat = hitung_kandidat_rak_inbound(semua_data, st.session_state.item, part_aktif, sisi_masuk=sisi_masuk)
+            df_kandidat = hitung_kandidat_rak_inbound(
+                semua_data, st.session_state.item, part_aktif,
+                sisi_masuk=sisi_masuk, target_lot=lot_aktif
+            )
             in_is_sac = part_aktif.endswith('C')
                 
             if df_kandidat.empty:
@@ -959,7 +1007,7 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                         
                         with st.container(border=True):
                             st.markdown(f"**{i_alok}. 📍 RAK {al['Kolom']}-{al['Baris']}**  |  {al['Status']}")
-                            st.markdown(f"➡️ **Masukkan: {al['qty_p']} Pallet{teks_pec}** *(Kondisi awal: {al['IsiEksisting']} ➔ {ket_penuh})*")
+                            st.markdown(f"➡️ **Masukkan: {al['qty_p']} Pallet{teks_pec}** *(Awal: {al['IsiEksisting']} ➔ {ket_penuh})*")
                             
                     st.write("")
                     if st.button("✅ LANJUT KE KONFIRMASI AKTUAL", type="primary", use_container_width=True):
@@ -980,11 +1028,12 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
         target_c_awal = int(st.session_state.in_qty_c or 0)
         satuan_c = st.session_state.in_tipe_c
         in_is_sac = str(st.session_state.pilih_part).strip().upper().endswith('C')
+        lot_aktif = str(st.session_state.in_lot or "").strip()
         
         st.markdown(f"### Konfirmasi Aktual {judul_inbound}")
         with st.container(border=True):
             st.markdown(format_nama_warna_bold(st.session_state.item))
-            st.markdown(f"**Lot:** `{st.session_state.in_lot}`  |  **Pintu:** {sisi_str}")
+            st.markdown(f"**Lot:** `{lot_aktif}`  |  **Pintu:** {sisi_str}")
             teks_pec_target = f", {target_c_awal} {satuan_c}" if target_c_awal > 0 else ""
             st.caption(f"Rencana Awal: {target_p_awal} Pallet Utuh{teks_pec_target} *(Ubah angka di bawah jika aktual lapangan berbeda)*")
             
@@ -1042,7 +1091,10 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                 + " (karena rak sebelumnya sudah penuh di fisik)."
             )
             semua_data = get_all_racking_data()
-            df_kandidat_sisa = hitung_kandidat_rak_inbound(semua_data, st.session_state.item, st.session_state.pilih_part, sisi_masuk=sisi_masuk)
+            df_kandidat_sisa = hitung_kandidat_rak_inbound(
+                semua_data, st.session_state.item, st.session_state.pilih_part,
+                sisi_masuk=sisi_masuk, target_lot=lot_aktif
+            )
             rak_sudah_dipakai = {f"{x['Kolom']}-{x['Baris']}" for x in alokasi_aktual}
             
             if not df_kandidat_sisa.empty:
@@ -1099,7 +1151,7 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                     try:
                         backup_kolom = proses_inbound_multi_transaction(
                             transaction, doc_refs_dict, alokasi_valid,
-                            st.session_state.in_lot, st.session_state.pilih_part, st.session_state.item,
+                            lot_aktif, st.session_state.pilih_part, st.session_state.item,
                             satuan_c, catatan_operator, sisi_masuk=sisi_masuk
                         )
                         
@@ -1113,7 +1165,7 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                         for al in alokasi_valid:
                             catat_log_mutasi(
                                 jenis_log, al['Kolom'], al['Baris'],
-                                st.session_state.item, st.session_state.pilih_part, st.session_state.in_lot,
+                                st.session_state.item, st.session_state.pilih_part, lot_aktif,
                                 al['qty_p'], al['qty_c'], 0, teks_keterangan
                             )
                             p_str = f"+{al['qty_c']}{satuan_c}" if al['qty_c'] > 0 else ""
@@ -1126,7 +1178,7 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                             f"📥 <b>{judul_tele}</b>\n"
                             f"━━━━━━━━━━━━━━━━━━\n"
                             f"📦 <b>Item:</b> {escape_html(st.session_state.item)}\n"
-                            f"🏷️ <b>Lot:</b> <code>{escape_html(st.session_state.in_lot)}</code>\n"
+                            f"🏷️ <b>Lot:</b> <code>{escape_html(lot_aktif)}</code>\n"
                             f"📊 <b>Total Aktual:</b> {total_p_aktual} Pallet{pecahan_tele}\n"
                             f"📍 <b>Penempatan:</b> {escape_html(lokasi_gabungan)} ({sisi_str})\n"
                             f"👤 <b>Operator:</b> {escape_html(st.session_state.operator)}\n"
@@ -1153,3 +1205,164 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                         st.error(f"❌ Validasi Kapasitas: {err}")
                     except Exception as err:
                         st.error(f"❌ Kesalahan Sistem: {err}")
+
+# ==========================================================
+# 9. MODUL UI PENGAMBILAN TERPADU: INPUT AMBIL + CEK FISIK SISA
+# ==========================================================
+def render_alur_pengambilan_terpadu(
+    prefix_app, df_master, judul_ambil, label_tombol_eksekusi,
+    jenis_log, judul_tele, mode_undo_label, reset_keys
+):
+    k_pilih = st.session_state.get(reset_keys['kolom'])
+    b_pilih = st.session_state.get(reset_keys['baris'])
+    lot_pilih = st.session_state.get(reset_keys['lot'])
+    init_p = int(st.session_state.get(reset_keys['max_p']) or 0)
+    init_d = int(st.session_state.get(reset_keys['max_d']) or 0)
+    catatan_rak_lama = st.session_state.get(reset_keys['catatan']) or ""
+    
+    row_m = df_master[df_master['Nama Barang'] == st.session_state.item]
+    total_pcs_pallet = int(row_m.iloc[0]['Total_Pcs_Pallet']) if not row_m.empty and int(row_m.iloc[0]['Total_Pcs_Pallet']) > 0 else 1
+    pcs_per_box = int(row_m.iloc[0]['Pcs_Per_Box']) if not row_m.empty and int(row_m.iloc[0]['Pcs_Per_Box']) > 0 else 1
+    pcs_per_sac = int(row_m.iloc[0]['Pcs_Per_Sac']) if not row_m.empty and int(row_m.iloc[0]['Pcs_Per_Sac']) > 0 else 1
+    
+    satuan = get_satuan_kemasan(st.session_state.pilih_part)
+    pcs_per_pecahan = pcs_per_sac if satuan == "Sak" else pcs_per_box
+    pecahan_per_pallet = max(1, total_pcs_pallet // pcs_per_pecahan) if pcs_per_pecahan > 0 else 1
+    total_pcs_init = (init_p * total_pcs_pallet) + (init_d * pcs_per_pecahan)
+    
+    st.markdown(f"### {judul_ambil}")
+    with st.container(border=True):
+        st.markdown(format_nama_warna_bold(st.session_state.item))
+        st.markdown(f"**Lokasi:** Rak {k_pilih}-{b_pilih}  |  **Lot:** `{lot_pilih}`")
+        st.info(f"📦 **Stok Tercatat di Rak:** **{init_p} Pallet**, **{init_d} {satuan}** ({total_pcs_init:,} Pcs)")
+        
+    st.markdown("**1. Berapa yang Diambil Forklift?**")
+    default_ambil_p = 1 if init_p > 0 else 0
+    default_ambil_d = init_d if init_p == 0 else 0
+    
+    c_amb1, c_amb2 = st.columns(2)
+    with c_amb1:
+        ambil_p = st.number_input(
+            "Pallet Utuh Diambil", min_value=0, max_value=init_p, step=1,
+            value=default_ambil_p, key=f"amb_p_{prefix_app}_{k_pilih}_{b_pilih}_{lot_pilih}"
+        )
+    with c_amb2:
+        max_ambil_d = init_d if init_p == 0 else max(init_d, pecahan_per_pallet - 1)
+        ambil_d = st.number_input(
+            f"Pecahan Diambil ({satuan})", min_value=0, max_value=max_ambil_d, step=1,
+            value=default_ambil_d, key=f"amb_d_{prefix_app}_{k_pilih}_{b_pilih}_{lot_pilih}"
+        )
+        
+    pcs_diambil_input = (ambil_p * total_pcs_pallet) + (ambil_d * pcs_per_pecahan)
+    pcs_sisa_hitung = max(0, total_pcs_init - pcs_diambil_input)
+    sisa_p_hitung = pcs_sisa_hitung // total_pcs_pallet if total_pcs_pallet > 0 else max(0, init_p - ambil_p)
+    sisa_pcs_rem = pcs_sisa_hitung % total_pcs_pallet if total_pcs_pallet > 0 else 0
+    sisa_d_hitung = sisa_pcs_rem // pcs_per_pecahan if pcs_per_pecahan > 0 else max(0, init_d - ambil_d)
+    
+    st.markdown(f"""
+        <div class="cek-fisik-box">
+            <div style="font-size: 13px; opacity: 0.85;">👀 <strong>CEK FISIK LORONG RAK {k_pilih}-{b_pilih}:</strong></div>
+            <div style="font-size: 20px; font-weight: bold; margin-top: 4px;">
+                Sisa di rak harus tinggal: <u>{sisa_p_hitung} Pallet, {sisa_d_hitung} {satuan}</u>
+            </div>
+            <div style="font-size: 12px; opacity: 0.8; margin-top: 2px;">
+                ({pcs_sisa_hitung:,} Pcs) — Pastikan jumlah palet tersisa di lorong sesuai!
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+    
+    with st.expander("🛠️ Sisa fisik di rak berbeda? Koreksi sisa akhir di sini"):
+        st.caption("Ubah angka di bawah jika setelah diambil ternyata sisa fisik di lorong tidak sama dengan hitungan di atas:")
+        max_sisa_d_kor = max(init_d, pecahan_per_pallet - 1) if pecahan_per_pallet > 1 else max(init_d, 100)
+        c_kor1, c_kor2 = st.columns(2)
+        with c_kor1:
+            sisa_pallet_final = st.number_input(
+                "Sisa Pallet Utuh Aktual", min_value=0, max_value=init_p, step=1,
+                value=int(sisa_p_hitung), key=f"kor_p_{prefix_app}_{k_pilih}_{b_pilih}_{lot_pilih}_{ambil_p}_{ambil_d}"
+            )
+        with c_kor2:
+            sisa_dus_final = st.number_input(
+                f"Sisa Pecahan Aktual ({satuan})", min_value=0, max_value=max_sisa_d_kor, step=1,
+                value=int(sisa_d_hitung), key=f"kor_d_{prefix_app}_{k_pilih}_{b_pilih}_{lot_pilih}_{ambil_p}_{ambil_d}"
+            )
+            
+    total_pcs_final = (sisa_pallet_final * total_pcs_pallet) + (sisa_dus_final * pcs_per_pecahan)
+    selisih_pcs_total = total_pcs_init - total_pcs_final
+    keluar_pallet_eq = selisih_pcs_total // total_pcs_pallet if total_pcs_pallet > 0 else 0
+    sisa_pcs_temp = selisih_pcs_total % total_pcs_pallet if total_pcs_pallet > 0 else selisih_pcs_total
+    keluar_dus_eq = sisa_pcs_temp // pcs_per_pecahan if pcs_per_pecahan > 0 else 0
+    
+    ada_koreksi_fisik = (sisa_pallet_final != sisa_p_hitung) or (sisa_dus_final != sisa_d_hitung)
+    if ada_koreksi_fisik and selisih_pcs_total > 0:
+        st.warning(
+            f"⚠️ **Koreksi Sisa Aktif:** Tercatat keluar **{selisih_pcs_total:,} Pcs** "
+            f"({keluar_pallet_eq} Pallet, {keluar_dus_eq} {satuan}), sisa akhir rak menjadi **{sisa_pallet_final} Pallet, {sisa_dus_final} {satuan}**."
+        )
+    elif pcs_diambil_input > total_pcs_init:
+        st.error("❌ Jumlah diambil melebihi stok yang tersedia di rak!")
+    elif selisih_pcs_total <= 0:
+        st.warning("⚠️ Masukkan minimal 1 Pallet atau Pecahan yang diambil.")
+        
+    catatan_operator = st.text_input("📝 CATATAN (Opsional)", placeholder="Cth: Muat Truk / Suplai Mesin 3")
+    st.write("")
+    
+    if selisih_pcs_total > 0 and pcs_diambil_input <= total_pcs_init:
+        if st.button(label_tombol_eksekusi, type="primary", use_container_width=True):
+            with st.spinner("Menyimpan transaksi ke database..."):
+                doc_ref = db.collection(NAMA_DATABASE).document(f"Kolom_{k_pilih}")
+                transaction = db.transaction()
+                
+                try:
+                    data_sebelum_update = proses_pengambilan_stok(
+                        transaction, doc_ref, k_pilih, b_pilih, lot_pilih,
+                        st.session_state.pilih_part, st.session_state.item,
+                        init_p, init_d, sisa_pallet_final, sisa_dus_final, satuan,
+                        catatan_rak_lama
+                    )
+                    
+                    teks_keterangan = (
+                        f"Op: {st.session_state.operator} | Ambil: {ambil_p}P {ambil_d}{satuan[0]} | "
+                        f"Awal: {init_p}P {init_d}{satuan[0]} -> Sisa: {sisa_pallet_final}P {sisa_dus_final}{satuan[0]}"
+                    )
+                    if ada_koreksi_fisik:
+                        teks_keterangan += f" [Koreksi Fisik dari {sisa_p_hitung}P {sisa_d_hitung}{satuan[0]}]"
+                    if catatan_operator.strip():
+                        teks_keterangan += f" | Catatan: {catatan_operator.strip()}"
+                        
+                    catat_log_mutasi(
+                        jenis_log, k_pilih, b_pilih, st.session_state.item,
+                        st.session_state.pilih_part, lot_pilih,
+                        keluar_pallet_eq, keluar_dus_eq, selisih_pcs_total, teks_keterangan
+                    )
+                    
+                    pesan_tele = (
+                        f"📤 <b>{judul_tele}</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"📦 <b>Item:</b> {escape_html(st.session_state.item)}\n"
+                        f"📍 <b>Rak:</b> {k_pilih}-{b_pilih} | <b>Lot:</b> <code>{escape_html(lot_pilih)}</code>\n"
+                        f"📊 <b>Keluar:</b> <b>{selisih_pcs_total:,} Pcs</b> ({keluar_pallet_eq} Pallet, {keluar_dus_eq} {satuan})\n"
+                        f"📉 <b>Stok Rak:</b> {init_p}P {init_d}{satuan} ➔ <b>{sisa_pallet_final}P {sisa_dus_final}{satuan}</b>\n"
+                        f"👤 <b>Operator:</b> {escape_html(st.session_state.operator)}\n"
+                    )
+                    if ada_koreksi_fisik:
+                        pesan_tele += f"⚠️ <i>Koreksi sisa fisik (hitungan awal: {sisa_p_hitung}P {sisa_d_hitung}{satuan})</i>\n"
+                    if catatan_operator.strip():
+                        pesan_tele += f"📝 <b>Catatan:</b> <i>{escape_html(catatan_operator.strip())}</i>\n"
+                    kirim_notif_telegram(pesan_tele)
+                    
+                    get_all_racking_data.clear()
+                    msg_sukses = f"Keluar {selisih_pcs_total:,} Pcs ({keluar_pallet_eq}P {keluar_dus_eq}{satuan}) dari Rak {k_pilih}-{b_pilih}. Sisa: {sisa_pallet_final}P {sisa_dus_final}{satuan}."
+                    simpan_undo_firestore(prefix_app, st.session_state.operator, {k_pilih: data_sebelum_update}, msg_sukses, mode_label=mode_undo_label)
+                    
+                    st.toast(msg_sukses, icon="✅")
+                    keys_clear = ['kategori', 'gramasi', 'item', 'pilih_part', 'mode_transaksi'] + list(reset_keys.values())
+                    for k in set(keys_clear):
+                        if k in st.session_state:
+                            st.session_state[k] = None
+                    st.session_state.slide = 1
+                    st.rerun()
+                    
+                except ValueError as err:
+                    st.error(f"❌ Transaksi Dibatalkan: {err}")
+                except Exception as err:
+                    st.error(f"❌ Kesalahan Sistem: {err}")
