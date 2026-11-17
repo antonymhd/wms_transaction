@@ -911,18 +911,23 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                 st.session_state.in_qty_c = in_qty_c
                 st.session_state.in_tipe_c = satuan_otomatis
                 st.session_state.in_sisi_masuk = "DEPAN" if sisi_pilihan.startswith("DEPAN") else "BELAKANG"
+                st.session_state.in_rak_skip = []
                 st.session_state.slide = 6
                 st.rerun()
 
     # --- SLIDE 6: REKOMENDASI LOKASI RAK ---
     elif st.session_state.slide == 6:
         if st.button("🔙 UBAH INPUT"):
+            st.session_state.in_rak_skip = []
             st.session_state.slide = 5
             st.rerun()
             
+        if st.session_state.get("in_rak_skip") is None:
+            st.session_state.in_rak_skip = []
+            
         sisi_masuk = st.session_state.get("in_sisi_masuk", default_sisi_masuk)
         sisi_label = "Depan" if sisi_masuk == "DEPAN" else "Belakang"
-        sisi_str = "DEPAN (Push-Back)" if sisi_masuk == "DEPAN" else "BELAKANG (Normal)"
+        sisi_color = "#3B82F6" if sisi_masuk == "DEPAN" else "#10B981"
         part_aktif = str(st.session_state.pilih_part).strip().upper()
         lot_aktif = str(st.session_state.in_lot or "").strip()
         qty_p_in = int(st.session_state.in_qty_p or 0)
@@ -934,7 +939,12 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
         teks_pec_hdr = f" + {qty_c_in} {satuan_c}" if qty_c_in > 0 else ""
         with st.container(border=True):
             st.markdown(f"📦 {format_nama_warna_bold(st.session_state.item)}")
-            st.caption(f"Lot: **{lot_aktif}**  |  Total: **{qty_p_in} Pallet{teks_pec_hdr}**  |  Masuk: **{sisi_label.upper()}**")
+            st.markdown(
+                f"<div style='font-size:13px; opacity:0.9;'>Lot: <strong>{lot_aktif}</strong>  |  "
+                f"Total: <strong>{qty_p_in} Pallet{teks_pec_hdr}</strong>  |  "
+                f"Masuk: <span style='color:{sisi_color}; font-weight:bold;'>{sisi_label.upper()}</span></div>",
+                unsafe_allow_html=True
+            )
         
         with st.spinner("📐 Mencari lorong rak terbaik..."):
             semua_data = get_all_racking_data()
@@ -953,13 +963,9 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                 if in_is_sac:
                     st.caption("🛡️ *Rak Sak sisa ≤ 1 slot otomatis dilewati (toleransi panjang fisik).*")
                     
-                rak_skip = st.multiselect(
-                    "🚫 Lewati Rak (Jika penuh / terhalang):",
-                    options=df_kandidat['Loc'].tolist(),
-                    placeholder="Pilih rak yang dilewati..."
-                )
-                if rak_skip:
-                    df_kandidat = df_kandidat[~df_kandidat['Loc'].isin(rak_skip)].reset_index(drop=True)
+                rak_skip_list = st.session_state.in_rak_skip
+                if rak_skip_list:
+                    df_kandidat = df_kandidat[~df_kandidat['Loc'].isin(rak_skip_list)].reset_index(drop=True)
                     
                 total_kapasitas_gudang = int(df_kandidat['SisaSlot'].sum()) if not df_kandidat.empty else 0
                 if total_kapasitas_gudang < total_slot_butuh:
@@ -994,6 +1000,7 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                             })
                             
                     for i_alok, al in enumerate(rencana_alokasi, 1):
+                        loc_str = f"{al['Kolom']}-{al['Baris']}"
                         teks_pec = f" + {al['qty_c']} {satuan_c}" if al['qty_c'] > 0 else ""
                         slot_dipakai = al['qty_p'] + (1 if al['qty_c'] > 0 else 0)
                         sisa_setelah = al['SisaSlot'] - slot_dipakai
@@ -1004,10 +1011,30 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                             instruksi_baris = f"Isi dari {sisi_label} ± {al['qty_p']} Pallet{teks_pec}"
                             
                         with st.container(border=True):
-                            st.markdown(f"**{i_alok}. 📍 RAK {al['Kolom']}-{al['Baris']}**")
-                            st.markdown(f"➡️ **{instruksi_baris}**")
-                            st.caption(f"Kondisi rak: {al['IsiEksisting']}")
+                            c_info, c_skip = st.columns([3.3, 1.3])
+                            with c_info:
+                                st.markdown(f"<div style='font-size:20px; font-weight:bold;'>{i_alok}. 📍 RAK {loc_str}</div>", unsafe_allow_html=True)
+                                st.markdown(f"➡️ **{instruksi_baris}**")
+                                st.caption(f"Kondisi rak: {al['IsiEksisting']}")
+                            with c_skip:
+                                st.markdown('<div class="btn-compact">', unsafe_allow_html=True)
+                                if st.button("🚫 Lewati", key=f"skip_{prefix_app}_{loc_str}_{i_alok}", use_container_width=True, help=f"Lewati Rak {loc_str} jika di lapangan penuh/terhalang"):
+                                    st.session_state.in_rak_skip.append(loc_str)
+                                    st.rerun()
+                                st.markdown('</div>', unsafe_allow_html=True)
+
+                if rak_skip_list:
+                    c_sk1, c_sk2 = st.columns([3.2, 1.4])
+                    with c_sk1:
+                        st.caption(f"🚫 Dilewati: **{', '.join(rak_skip_list)}**")
+                    with c_sk2:
+                        st.markdown('<div class="btn-compact">', unsafe_allow_html=True)
+                        if st.button("↩️ Reset", key=f"reset_skip_{prefix_app}", use_container_width=True):
+                            st.session_state.in_rak_skip = []
+                            st.rerun()
+                        st.markdown('</div>', unsafe_allow_html=True)
                             
+                if total_kapasitas_gudang >= total_slot_butuh:
                     st.write("")
                     if st.button("✅ LANJUT KE KONFIRMASI AKTUAL", type="primary", use_container_width=True):
                         st.session_state.alokasi_terpilih = rencana_alokasi
@@ -1202,7 +1229,7 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                         simpan_undo_firestore(prefix_app, st.session_state.operator, backup_kolom, msg_sukses, mode_label=mode_undo_label)
                         
                         st.toast(msg_sukses, icon="✅")
-                        keys_clear = ['kategori', 'gramasi', 'item', 'pilih_part', 'mode_transaksi', 'in_lot', 'in_qty_p', 'in_qty_c', 'in_tipe_c', 'in_sisi_masuk', 'alokasi_terpilih']
+                        keys_clear = ['kategori', 'gramasi', 'item', 'pilih_part', 'mode_transaksi', 'in_lot', 'in_qty_p', 'in_qty_c', 'in_tipe_c', 'in_sisi_masuk', 'in_rak_skip', 'alokasi_terpilih']
                         if reset_keys:
                             keys_clear.extend(reset_keys)
                         for k in set(keys_clear):
