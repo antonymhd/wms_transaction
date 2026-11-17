@@ -175,20 +175,29 @@ def parse_keterangan(ket_str):
     return pecahan, eceran
 
 def parse_fifo_key(lot_str):
+    """Kunci pengurutan FIFO (Outbound/WIP): YYMMDD + Shift (1/2/3) + teks asli."""
     s = str(lot_str).strip()
-    match = re.search(r'(\d{2})(\d{2})(\d{2})$', s)
-    if match:
-        dd, mm, yy = match.groups()
-        return f"{yy}{mm}{dd}_{s}"
-    return f"999999_{s}"
+    match_shift = re.search(r'([123])(\d{2})(\d{2})(\d{2})$', s)
+    if match_shift:
+        sh, dd, mm, yy = match_shift.groups()
+        return f"{yy}{mm}{dd}{sh}_{s}"
+    match_date = re.search(r'(\d{2})(\d{2})(\d{2})$', s)
+    if match_date:
+        dd, mm, yy = match_date.groups()
+        return f"{yy}{mm}{dd}0_{s}"
+    return f"9999999_{s}"
 
 def parse_lifo_rank(lot_str):
-    """Nilai numerik lebih besar = tanggal produksi lebih baru (untuk prioritas meneruskan lot terbaru)."""
+    """Skor numerik terbaru (Inbound): YYMMDD * 10 + Shift (1/2/3)."""
     s = str(lot_str).strip()
-    match = re.search(r'(\d{2})(\d{2})(\d{2})$', s)
-    if match:
-        dd, mm, yy = match.groups()
-        return int(f"{yy}{mm}{dd}")
+    match_shift = re.search(r'([123])(\d{2})(\d{2})(\d{2})$', s)
+    if match_shift:
+        sh, dd, mm, yy = match_shift.groups()
+        return int(f"{yy}{mm}{dd}{sh}")
+    match_date = re.search(r'(\d{2})(\d{2})(\d{2})$', s)
+    if match_date:
+        dd, mm, yy = match_date.groups()
+        return int(f"{yy}{mm}{dd}0")
     return 0
 
 def get_satuan_kemasan(part_num):
