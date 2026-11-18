@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import wms_core as core
 
-st.set_page_config(page_title="Turun ke Staging (S-1) - Rack Navigator", layout="centered", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Outbound Racking HDI", layout="centered", initial_sidebar_state="collapsed")
 core.inject_custom_css(accent_color="#2563EB", accent_border="#3B82F6", accent_bg_rgba="rgba(37, 99, 235, 0.1)")
 
 # Styling input baris besar agar nyaman di layar HP operator
@@ -45,7 +45,7 @@ if st.session_state.slide == 0:
     st.markdown("""
         <div class="db-info-box" style="text-align: center;">
             <div style="font-size: 18px; font-weight: bold; color: #2563EB;">
-                🧭 Turun ke Staging (S-1) - Rack Navigator
+                🧭 Outbound Racking HDI
             </div>
             <div style="font-size: 13px; opacity: 0.8; margin-top: 4px;">
                 Pilih Operator Forklift yang Bertugas
@@ -88,10 +88,10 @@ if st.session_state.slide == 0:
 # HEADER STATUS, NOTIFIKASI UNDO & PROGRESS BAR
 # ==========================================================
 core.render_header_dan_undo(
-    app_title="Turun ke Staging (S-1)",
+    app_title="Outbound Racking HDI",
     accent_color="#2563EB",
     prefix_app="OUT",
-    mode_badge="  |  <span style='color:#2563EB;font-weight:bold;'>⬇️ KE STAGING S-1</span>",
+    mode_badge="  |  <span style='color:#2563EB;font-weight:bold;'>📤 OUTBOUND</span>",
     reset_keys=['pilih_kolom', 'pilih_baris', 'item', 'pilih_part', 'pilih_lot', 'pilih_catatan_rak', 'max_pallet', 'max_dus']
 )
 core.render_progress_bar(st.session_state.slide, "STAGING")
@@ -100,7 +100,7 @@ core.render_progress_bar(st.session_state.slide, "STAGING")
 # SLIDE 1: INPUT NOMOR BARIS (1-28) & PILIH KOLOM (A-G) DALAM 1 LAYAR
 # ==========================================================
 if st.session_state.slide == 1:
-    st.markdown("### 1. Pilih Lokasi Rak Asal")
+    st.markdown("### 1. Pilih Lokasi Rak")
     
     with st.container(border=True):
         st.markdown("**Langkah A — Masukkan Nomor Baris (1 – 28):**")
@@ -194,7 +194,7 @@ elif st.session_state.slide == 2:
                 })
                 
     if not daftar_lot_rak:
-        st.error(f"❌ Rak {kol_aktif}-{bar_aktif} kosong! Tidak ada barang yang dapat diturunkan.")
+        st.error(f"❌ Rak {kol_aktif}-{bar_aktif} kosong! Tidak ada barang yang dapat dikeluarkan.")
     else:
         daftar_lot_rak = sorted(daftar_lot_rak, key=lambda x: x['MinPos'])
         for idx, item_rak in enumerate(daftar_lot_rak):
@@ -214,7 +214,7 @@ elif st.session_state.slide == 2:
                 pindah_slide(3); st.rerun()
 
 # ==========================================================
-# SLIDE 3: TURUNKAN KE AREA STAGING (S-1) + CEK FISIK SISA
+# SLIDE 3: KONFIRMASI OUTBOUND + CEK FISIK SISA
 # ==========================================================
 elif st.session_state.slide == 3:
     if st.button("🔙 GANTI PRODUK / LOT"):
@@ -237,17 +237,17 @@ elif st.session_state.slide == 3:
     pecahan_per_pallet = max(1, total_pcs_pallet // pcs_per_pecahan) if pcs_per_pecahan > 0 else 1
     total_pcs_init = (init_p * total_pcs_pallet) + (init_d * pcs_per_pecahan)
     
-    st.markdown("### 3. Turunkan ke Area Staging (`S-1`)")
+    st.markdown("### 3. Jumlah Outbound Barang")
     with st.container(border=True):
         st.markdown(core.format_nama_warna_bold(st.session_state.item))
-        st.markdown(f"**Rak Asal:** `{k_pilih}-{b_pilih}`  |  **Lot:** `{lot_pilih}`  ➔  **Tujuan:** `Staging S-1`")
+        st.markdown(f"**Lokasi Rak:** `{k_pilih}-{b_pilih}`  |  **Lot:** `{lot_pilih}`")
         st.info(f"📦 **Stok Tercatat di Rak {k_pilih}-{b_pilih}:** **{init_p} Pallet**, **{init_d} {satuan}** ({total_pcs_init:,} Pcs)")
         
-    st.markdown("**Berapa yang Diturunkan ke Staging (`S-1`)?**")
+    st.markdown("**Berapa yang Dikeluarkan dari Rak?**")
     
     teks_semua_pec = f", {init_d} {satuan}" if init_d > 0 else ""
     turun_semua = st.checkbox(
-        f"☑️ Turun Semua ({init_p} Pallet{teks_semua_pec})",
+        f"☑️ Keluarkan Semua ({init_p} Pallet{teks_semua_pec})",
         value=False,
         key=f"chk_turun_all_{k_pilih}_{b_pilih}_{lot_pilih}"
     )
@@ -258,12 +258,12 @@ elif st.session_state.slide == 3:
         c_t1, c_t2 = st.columns(2)
         with c_t1:
             st.number_input(
-                "Pallet Utuh Turun", min_value=0, max_value=init_p, step=1,
+                "Pallet Utuh Keluar", min_value=0, max_value=init_p, step=1,
                 value=init_p, disabled=True, key=f"tr_p_all_{k_pilih}_{b_pilih}_{lot_pilih}"
             )
         with c_t2:
             st.number_input(
-                f"Pecahan Turun ({satuan})", min_value=0, max_value=max(init_d, 1), step=1,
+                f"Pecahan Keluar ({satuan})", min_value=0, max_value=max(init_d, 1), step=1,
                 value=init_d, disabled=True, key=f"tr_d_all_{k_pilih}_{b_pilih}_{lot_pilih}"
             )
     else:
@@ -273,13 +273,13 @@ elif st.session_state.slide == 3:
         c_t1, c_t2 = st.columns(2)
         with c_t1:
             turun_p = st.number_input(
-                "Pallet Utuh Turun", min_value=0, max_value=init_p, step=1,
+                "Pallet Utuh Keluar", min_value=0, max_value=init_p, step=1,
                 value=default_turun_p, key=f"tr_p_{k_pilih}_{b_pilih}_{lot_pilih}"
             )
         with c_t2:
             max_turun_d = init_d if init_p == 0 else max(init_d, pecahan_per_pallet - 1)
             turun_d = st.number_input(
-                f"Pecahan Turun ({satuan})", min_value=0, max_value=max_turun_d, step=1,
+                f"Pecahan Keluar ({satuan})", min_value=0, max_value=max_turun_d, step=1,
                 value=default_turun_d, key=f"tr_d_{k_pilih}_{b_pilih}_{lot_pilih}"
             )
         
@@ -302,7 +302,7 @@ elif st.session_state.slide == 3:
     """, unsafe_allow_html=True)
     
     with st.expander("🛠️ Tidak aktual? Koreksi disini"):
-        st.caption("Ubah angka di bawah jika sisa fisik di lorong rak asal tidak sama dengan hitungan di atas:")
+        st.caption("Ubah angka di bawah jika sisa fisik di lorong rak tidak sama dengan hitungan di atas:")
         max_sisa_d_kor = max(init_d, pecahan_per_pallet - 1) if pecahan_per_pallet > 1 else max(init_d, 100)
         c_kor1, c_kor2 = st.columns(2)
         with c_kor1:
@@ -325,24 +325,25 @@ elif st.session_state.slide == 3:
     ada_koreksi_fisik = (sisa_pallet_final != sisa_p_hitung) or (sisa_dus_final != sisa_d_hitung)
     if ada_koreksi_fisik and selisih_pcs_total > 0:
         st.warning(
-            f"⚠️ **Koreksi Sisa Aktif:** Masuk ke Staging S-1 **{turun_pallet_eq} Pallet, {turun_dus_eq} {satuan}** "
+            f"⚠️ **Koreksi Sisa Aktif:** Tercatat keluar **{turun_pallet_eq} Pallet, {turun_dus_eq} {satuan}** "
             f"({selisih_pcs_total:,} Pcs), sisa akhir Rak {k_pilih}-{b_pilih} menjadi **{sisa_pallet_final} Pallet, {sisa_dus_final} {satuan}**."
         )
     elif pcs_turun_input > total_pcs_init:
-        st.error("❌ Jumlah diturunkan melebihi stok yang tersedia di rak!")
+        st.error("❌ Jumlah dikeluarkan melebihi stok yang tersedia di rak!")
     elif selisih_pcs_total <= 0:
-        st.warning("⚠️ Masukkan minimal 1 Pallet atau Pecahan yang diturunkan.")
+        st.warning("⚠️ Masukkan minimal 1 Pallet atau Pecahan yang dikeluarkan.")
         
-    catatan_operator = st.text_input("📝 CATATAN (Opsional)", placeholder="Cth: Persiapan muat DO / Pindah Staging")
+    catatan_operator = st.text_input("📝 CATATAN (Opsional)", placeholder="Cth: Muat DO / Kirim Customer")
     st.write("")
     
     if selisih_pcs_total > 0 and pcs_turun_input <= total_pcs_init:
-        if st.button("⬇️ TURUNKAN KE STAGING (S-1)", type="primary", use_container_width=True):
-            with st.spinner("Memindahkan stok ke Area Staging S-1..."):
+        if st.button("📤 KONFIRMASI OUTBOUND", type="primary", use_container_width=True):
+            with st.spinner("Menyimpan transaksi outbound..."):
                 doc_ref_asal = core.db.collection(core.NAMA_DATABASE).document(f"Kolom_{k_pilih}")
                 doc_ref_staging = core.db.collection(core.NAMA_DATABASE).document("Kolom_S")
                 transaction = core.db.transaction()
                 
+                # Backend tetap mencatat perpindahan ke Staging S-1 beserta asal raknya
                 catatan_staging = f"Dari Rak {k_pilih}-{b_pilih} | Op: {st.session_state.operator}"
                 if catatan_operator.strip():
                     catatan_staging += f" | {catatan_operator.strip()}"
@@ -357,6 +358,7 @@ elif st.session_state.slide == 3:
                         catatan_rak_lama, catatan_staging
                     )
                     
+                    # Log WMS & Telegram tetap mencatat turun ke Staging S-1 untuk PPIC
                     teks_keterangan = (
                         f"Op: {st.session_state.operator} | Rak {k_pilih}-{b_pilih} -> Staging S-1 | "
                         f"Turun: {turun_pallet_eq}P {turun_dus_eq}{satuan[0]} | "
@@ -390,8 +392,9 @@ elif st.session_state.slide == 3:
                     core.kirim_notif_telegram(pesan_tele)
                     
                     core.get_all_racking_data.clear()
-                    msg_sukses = f"Turun {turun_pallet_eq}P {turun_dus_eq}{satuan} ({selisih_pcs_total:,} Pcs) dari Rak {k_pilih}-{b_pilih} ke Staging S-1."
-                    core.simpan_undo_firestore("OUT", st.session_state.operator, backup_dict, msg_sukses, mode_label="TURUN STAGING")
+                    # Pesan sukses di layar operator tetap tampil sebagai Outbound tanpa menyebut Staging
+                    msg_sukses = f"Outbound {turun_pallet_eq}P {turun_dus_eq}{satuan} ({selisih_pcs_total:,} Pcs) dari Rak {k_pilih}-{b_pilih}."
+                    core.simpan_undo_firestore("OUT", st.session_state.operator, backup_dict, msg_sukses, mode_label="OUTBOUND")
                     
                     st.toast(msg_sukses, icon="✅")
                     for k in ['pilih_kolom', 'pilih_baris', 'item', 'pilih_part', 'pilih_lot', 'pilih_catatan_rak', 'max_pallet', 'max_dus']:
