@@ -5,7 +5,7 @@ import wms_core as core
 st.set_page_config(page_title="Turun ke Staging (S-1) - Rack Navigator", layout="centered", initial_sidebar_state="collapsed")
 core.inject_custom_css(accent_color="#2563EB", accent_border="#3B82F6", accent_bg_rgba="rgba(37, 99, 235, 0.1)")
 
-# Tambahan styling input baris besar agar nyaman di layar HP operator
+# Styling input baris besar agar nyaman di layar HP operator
 st.markdown("""
     <style>
         div[data-testid="stNumberInput"] input {
@@ -115,22 +115,15 @@ if st.session_state.slide == 1:
         )
         st.session_state.input_baris_temp = int(baris_input)
         
-    # Ambil pratinjau stok di baris yang sedang diketik untuk memudahkan operator memilih kolom
     semua_data = core.get_all_racking_data()
     df_all = pd.DataFrame(semua_data) if semua_data else pd.DataFrame()
     
-    info_kolom_pada_baris = {}
+    kolom_berisi = set()
     if not df_all.empty and 'Kolom' in df_all.columns and 'Baris' in df_all.columns:
         df_all['Baris_Int'] = pd.to_numeric(df_all['Baris'], errors='coerce').fillna(0).astype(int)
         df_bar = df_all[df_all['Baris_Int'] == int(baris_input)]
         if not df_bar.empty:
-            for k_str, grp in df_bar.groupby(df_bar['Kolom'].astype(str).str.strip().str.upper()):
-                if k_str in KOLOM_RAK:
-                    items_unik = grp['Nama Produk'].dropna().unique().tolist()
-                    ringkas = items_unik[0].split(',')[-1].strip() if (items_unik and ',' in items_unik[0]) else (items_unik[0][:14] if items_unik else "")
-                    if len(items_unik) > 1:
-                        ringkas += f" +{len(items_unik)-1}"
-                    info_kolom_pada_baris[k_str] = f"{len(grp)}P ({ringkas})"
+            kolom_berisi = set(df_bar['Kolom'].astype(str).str.strip().str.upper().unique())
                     
     st.markdown(f"**Langkah B — Pilih Kolom pada Baris `{int(baris_input)}`:**")
     for i in range(0, len(KOLOM_RAK), 2):
@@ -138,11 +131,11 @@ if st.session_state.slide == 1:
         for j in range(2):
             if i + j < len(KOLOM_RAK):
                 kol = KOLOM_RAK[i + j]
-                ada_isi = kol in info_kolom_pada_baris
+                ada_isi = kol in kolom_berisi
                 ikon = "📦" if ada_isi else "⚪"
-                ket_isi = info_kolom_pada_baris.get(kol, "Kosong")
+                ket_isi = f"Rak {kol}-{int(baris_input)}" if ada_isi else "Kosong"
                 with cols[j]:
-                    if st.button(f"{ikon} KOLOM {kol} (Rak {kol}-{int(baris_input)})\n{ket_isi}", key=f"kol_btn_{kol}", use_container_width=True):
+                    if st.button(f"{ikon} KOLOM {kol} ({ket_isi})", key=f"kol_btn_{kol}", use_container_width=True):
                         st.session_state.pilih_baris = int(baris_input)
                         st.session_state.pilih_kolom = kol
                         pindah_slide(2); st.rerun()
@@ -251,21 +244,44 @@ elif st.session_state.slide == 3:
         st.info(f"📦 **Stok Tercatat di Rak {k_pilih}-{b_pilih}:** **{init_p} Pallet**, **{init_d} {satuan}** ({total_pcs_init:,} Pcs)")
         
     st.markdown("**Berapa yang Diturunkan ke Staging (`S-1`)?**")
-    default_turun_p = 1 if init_p > 0 else 0
-    default_turun_d = init_d if init_p == 0 else 0
     
-    c_t1, c_t2 = st.columns(2)
-    with c_t1:
-        turun_p = st.number_input(
-            "Pallet Utuh Turun", min_value=0, max_value=init_p, step=1,
-            value=default_turun_p, key=f"tr_p_{k_pilih}_{b_pilih}_{lot_pilih}"
-        )
-    with c_t2:
-        max_turun_d = init_d if init_p == 0 else max(init_d, pecahan_per_pallet - 1)
-        turun_d = st.number_input(
-            f"Pecahan Turun ({satuan})", min_value=0, max_value=max_turun_d, step=1,
-            value=default_turun_d, key=f"tr_d_{k_pilih}_{b_pilih}_{lot_pilih}"
-        )
+    teks_semua_pec = f", {init_d} {satuan}" if init_d > 0 else ""
+    turun_semua = st.checkbox(
+        f"☑️ Turun Semua ({init_p} Pallet{teks_semua_pec})",
+        value=False,
+        key=f"chk_turun_all_{k_pilih}_{b_pilih}_{lot_pilih}"
+    )
+    
+    if turun_semua:
+        turun_p = init_p
+        turun_d = init_d
+        c_t1, c_t2 = st.columns(2)
+        with c_t1:
+            st.number_input(
+                "Pallet Utuh Turun", min_value=0, max_value=init_p, step=1,
+                value=init_p, disabled=True, key=f"tr_p_all_{k_pilih}_{b_pilih}_{lot_pilih}"
+            )
+        with c_t2:
+            st.number_input(
+                f"Pecahan Turun ({satuan})", min_value=0, max_value=max(init_d, 1), step=1,
+                value=init_d, disabled=True, key=f"tr_d_all_{k_pilih}_{b_pilih}_{lot_pilih}"
+            )
+    else:
+        default_turun_p = 1 if init_p > 0 else 0
+        default_turun_d = init_d if init_p == 0 else 0
+        
+        c_t1, c_t2 = st.columns(2)
+        with c_t1:
+            turun_p = st.number_input(
+                "Pallet Utuh Turun", min_value=0, max_value=init_p, step=1,
+                value=default_turun_p, key=f"tr_p_{k_pilih}_{b_pilih}_{lot_pilih}"
+            )
+        with c_t2:
+            max_turun_d = init_d if init_p == 0 else max(init_d, pecahan_per_pallet - 1)
+            turun_d = st.number_input(
+                f"Pecahan Turun ({satuan})", min_value=0, max_value=max_turun_d, step=1,
+                value=default_turun_d, key=f"tr_d_{k_pilih}_{b_pilih}_{lot_pilih}"
+            )
         
     pcs_turun_input = (turun_p * total_pcs_pallet) + (turun_d * pcs_per_pecahan)
     pcs_sisa_hitung = max(0, total_pcs_init - pcs_turun_input)
@@ -285,7 +301,7 @@ elif st.session_state.slide == 3:
         </div>
     """, unsafe_allow_html=True)
     
-    with st.expander("🛠️ Sisa fisik di rak berbeda? Koreksi sisa akhir di sini"):
+    with st.expander("🛠️ Tidak aktual? Koreksi disini"):
         st.caption("Ubah angka di bawah jika sisa fisik di lorong rak asal tidak sama dengan hitungan di atas:")
         max_sisa_d_kor = max(init_d, pecahan_per_pallet - 1) if pecahan_per_pallet > 1 else max(init_d, 100)
         c_kor1, c_kor2 = st.columns(2)
