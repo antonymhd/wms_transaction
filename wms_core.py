@@ -14,18 +14,57 @@ NAMA_DATABASE = 'uji_coba_rak'
 DB_LOG_MUTASI = 'log_mutasi_rak'
 DB_UNDO_STATE = 'wms_undo_state'
 
-# Item khusus yang hanya ditempatkan di rak teratas (Kolom F baris 1-16 & Kolom G baris 17-28)
+# Item khusus JDO Diamond (Utama: F1-16, Cadangan: G17-28)
 PART_KHUSUS_TOP_TIER = {'MJSCN3802703D', 'MJSCN3802901D'}
 
-def is_zona_top_tier(kolom, baris_int):
+def is_zona_jdo(kolom, baris_int):
     k = str(kolom).strip().upper()
     return (k == 'F' and 1 <= baris_int <= 16) or (k == 'G' and 17 <= baris_int <= 28)
 
 def is_rak_valid_untuk_produk(kolom, baris_int, part_num):
     p = str(part_num).strip().upper()
     if p in PART_KHUSUS_TOP_TIER:
-        return is_zona_top_tier(kolom, baris_int)
+        return is_zona_jdo(kolom, baris_int)
     return True
+
+def hitung_zone_penalty(kolom, baris_int, target_item, part_num):
+    """
+    Menentukan urutan prioritas zona beserta pelimpahan (overflow) otomatis:
+    - JDO Diamond: F1-16 (0) -> jika penuh ke G17-28 (1)
+    - PREFORM: Baris 1-16 non-F (0) -> jika penuh ke Baris 17-28 non-G (1) -> cadangan F1-16/G17-28 (2)
+    - CUP: Baris 17-28 non-G (0) -> jika penuh ke Baris 1-16 non-F (1) -> cadangan G17-28/F1-16 (2)
+    - Lainnya (CAP, dll): Non-JDO (0) -> cadangan zona JDO (1)
+    """
+    k = str(kolom).strip().upper()
+    p = str(part_num).strip().upper()
+    nama_upper = str(target_item).strip().upper()
+    
+    if p in PART_KHUSUS_TOP_TIER:
+        if k == 'F' and 1 <= baris_int <= 16:
+            return 0
+        if k == 'G' and 17 <= baris_int <= 28:
+            return 1
+        return 99
+        
+    in_jdo_zone = is_zona_jdo(k, baris_int)
+    
+    if nama_upper.startswith('PREFORM'):
+        if not in_jdo_zone and 1 <= baris_int <= 16:
+            return 0
+        elif not in_jdo_zone and 17 <= baris_int <= 28:
+            return 1
+        else:
+            return 2
+            
+    elif nama_upper.startswith('CUP'):
+        if not in_jdo_zone and 17 <= baris_int <= 28:
+            return 0
+        elif not in_jdo_zone and 1 <= baris_int <= 16:
+            return 1
+        else:
+            return 2
+            
+    return 1 if in_jdo_zone else 0
 
 if not firebase_admin._apps:
     cred = credentials.Certificate(dict(st.secrets["firebase"]))
@@ -281,7 +320,6 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="B
             
     part_clean = str(part_num).strip().upper()
     in_is_sac = part_clean.endswith('C')
-    is_produk_khusus = part_clean in PART_KHUSUS_TOP_TIER
     target_item_clean = str(target_item).strip()
     target_lot_clean = str(target_lot).strip().upper()
     
@@ -293,8 +331,7 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="B
         if not is_rak_valid_untuk_produk(k, b, part_clean):
             continue
             
-        in_top_tier = is_zona_top_tier(k, b)
-        zone_penalty = 1 if (not is_produk_khusus and in_top_tier) else 0
+        zone_penalty = hitung_zone_penalty(k, b, target_item_clean, part_clean)
         
         max_sac = 31 if b <= 16 else 44
         max_dus = 32 if b <= 16 else 46
@@ -400,7 +437,7 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="B
         return pd.DataFrame()
         
     return pd.DataFrame(kandidat_rak).sort_values(
-        by=['Priority', 'ZonePenalty', 'SubSort', 'Kolom', 'Baris'],
+        by=['ZonePenalty', 'Priority', 'SubSort', 'Kolom', 'Baris'],
         ascending=[True, True, True, True, True]
     ).reset_index(drop=True)
 
@@ -805,10 +842,6 @@ def proses_turun_ke_staging(
     turun_pallet, turun_dus, satuan_kemasan,
     catatan_rak_lama, catatan_staging
 ):
-    """
-    Memindahkan stok secara atomik dari Kolom asal (A-G) ke Area Staging (Kolom S, Baris 1)
-    dengan mempertahankan informasi rak asal pada field Catatan.
-    """
     snap_asal = doc_ref_asal.get(transaction=transaction)
     if not snap_asal.exists:
         raise ValueError(f"Data Kolom {k_pilih} tidak ditemukan di database.")
@@ -846,7 +879,6 @@ def proses_turun_ke_staging(
             f"Silakan tekan 'Sinkronkan Stok'."
         )
         
-    # 1. Perbarui sisa stok di Rak Asal
     first_target_idx = next(
         (idx for idx, d in enumerate(rak_ini)
          if str(d.get('Lot Number', '')) == lot_pilih and str(d.get('Nama Produk', '')) == item_name),
@@ -881,7 +913,6 @@ def proses_turun_ke_staging(
     for i, d in enumerate(updated_rak_asal, 1):
         d['Pallet Ke'] = float(i)
         
-    # 2. Tambahkan barang turun ke Area Staging (Kolom S, Baris 1)
     staging_s1 = sorted(
         [d.copy() for d in all_col_staging if float(d.get('Baris', 0) or 0) == 1.0],
         key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0))
@@ -995,7 +1026,7 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
         st.markdown(f"### {judul_inbound}")
         st.info(format_nama_warna_bold(st.session_state.item))
         if str(st.session_state.pilih_part).strip().upper() in PART_KHUSUS_TOP_TIER:
-            st.caption("🏗️ *Item Zona Teratas: Alokasi otomatis dikunci khusus untuk Rak F1–F16 dan G17–G28.*")
+            st.caption("🏗️ *Item Zona Khusus: Utama di Rak F1–F16, jika penuh dialihkan ke G17–G28.*")
         
         satuan_otomatis = get_satuan_kemasan(st.session_state.pilih_part)
         opsi_sisi = [
@@ -1075,7 +1106,7 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                 
             if df_kandidat.empty:
                 if part_aktif in PART_KHUSUS_TOP_TIER:
-                    st.error("❌ Seluruh rak zona teratas (F1–F16 & G17–G28) penuh atau tidak memenuhi syarat posisi item!")
+                    st.error("❌ Seluruh rak zona khusus JDO (F1–F16 & G17–G28) penuh!")
                 else:
                     st.error("❌ Seluruh rak penuh atau tidak memenuhi syarat posisi item!")
             else:
@@ -1088,7 +1119,7 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                     
                 total_kapasitas_gudang = int(df_kandidat['SisaSlot'].sum()) if not df_kandidat.empty else 0
                 if total_kapasitas_gudang < total_slot_butuh:
-                    zona_teks = "zona teratas (F1–F16 & G17–G28)" if part_aktif in PART_KHUSUS_TOP_TIER else "gudang"
+                    zona_teks = "zona khusus JDO (F1–F16 & G17–G28)" if part_aktif in PART_KHUSUS_TOP_TIER else "gudang"
                     st.error(f"❌ Total sisa kapasitas {zona_teks} ({total_kapasitas_gudang} palet) tidak mencukupi untuk menampung {total_slot_butuh} palet!")
                 else:
                     rencana_alokasi = []
@@ -1161,14 +1192,18 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                         st.rerun()
 
         st.write("")
-        with st.expander("ℹ️ Aturan Urutan Rekomendasi Rak", expanded=False):
+        with st.expander("ℹ️ Aturan Zonasi & Urutan Rekomendasi Rak", expanded=False):
             st.markdown("""
-1. **Lorong 1 Item Sejenis:** Melanjutkan lot yang sama atau lot terbaru sampai penuh.
+**Zonasi Area (Otomatis Melimpah Jika Zona Utama Penuh):**
+* **Preform:** Diutamakan **Baris 1–16**, jika penuh otomatis melimpah ke **Baris 17–28**.
+* **Cup:** Diutamakan **Baris 17–28**, jika penuh otomatis melimpah ke **Baris 1–16**.
+* **JDO Diamond:** Diutamakan **Kolom F (Baris 1–16)**, jika penuh dialihkan ke **Kolom G (Baris 17–28)**.
+
+**Urutan Pemilihan Lorong di Dalam Zona:**
+1. **Lorong 1 Item Sejenis:** Melanjutkan lot yang sama atau lot/shift terbaru sampai penuh.
 2. **Lorong Kosong:** Membuka lorong kosong baru jika lorong sejenis sudah penuh.
 3. **Lorong 2 Item:** Melanjutkan di lorong 2 item jika posisi item sejenis berada di ujung pintu masuk (`Belakang` / `Depan`).
 4. **Campur (Max 2 Item):** Menggabung ke lorong yang baru berisi 1 item lain sebagai pilihan terakhir.
-
-*Catatan: Produk JDO Diamond khusus ditempatkan di Rak F1–F16 & G17–G28.*
             """)
 
     # --- SLIDE 7: KONFIRMASI & KOREKSI AKTUAL LAPANGAN ---
