@@ -125,7 +125,10 @@ def inject_custom_css(accent_color="#10B981", accent_border="#059669", accent_bg
     """, unsafe_allow_html=True)
 
 def render_progress_bar(current_slide, mode_transaksi):
-    if mode_transaksi in ["INBOUND", "INBOUND_SISA"]:
+    if mode_transaksi == "STAGING":
+        steps = ["Pilih Rak", "Produk & Lot", "Turunkan ke S-1"]
+        idx_map = {1: 1, 2: 2, 3: 3}
+    elif mode_transaksi in ["INBOUND", "INBOUND_SISA"]:
         steps = ["Aksi", "Kategori", "Item", "Input", "Lokasi", "Selesai"]
         idx_map = {1: 1, 2: 2, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6}
     elif mode_transaksi in ["WIP", "OUTBOUND"]:
@@ -266,16 +269,6 @@ def load_master_data():
         ])
 
 def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="BELAKANG", target_lot=""):
-    """
-    Urutan Prioritas Penempatan Multi-Rak:
-    0. Zona Khusus:
-       - JDO Diamond (PART_KHUSUS_TOP_TIER) wajib di F1-16 & G17-28.
-       - Item reguler mengutamakan rak selain F1-16 & G17-28 lebih dulu (ZonePenalty = 0).
-    1. Prioritas 1: Lorong murni 1 jenis produk sejenis — diutamakan lot sama / lot terbaru, isi sampai penuh.
-    2. Prioritas 2: Lorong rak kosong (0 palet), isi sampai penuh.
-    3. Prioritas 3: Lorong isi 2 jenis produk di mana item sejenis berada di ujung pintu masuk, isi sampai penuh.
-    4. Prioritas 4: Lorong isi 1 jenis produk berbeda (campur maks 2 jenis item per lorong).
-    """
     KOLOM_LIST = ['A', 'B', 'C', 'D', 'E', 'F', 'G']
     BARIS_LIST = list(range(1, 29))
     slot_map = {f"{k}-{b}": [] for k in KOLOM_LIST for b in BARIS_LIST}
@@ -803,6 +796,123 @@ def proses_pengambilan_stok(transaction, doc_ref, k_pilih, b_pilih, lot_pilih, p
     final_data = rak_lain + updated_rak_ini
     transaction.update(doc_ref, {'data': final_data}) 
     return data_lama_sebelum_update
+
+@firestore.transactional
+def proses_turun_ke_staging(
+    transaction, doc_ref_asal, doc_ref_staging,
+    k_pilih, b_pilih, lot_pilih, part_num, item_name,
+    init_pallet, init_dus, final_pallet, final_dus,
+    turun_pallet, turun_dus, satuan_kemasan,
+    catatan_rak_lama, catatan_staging
+):
+    """
+    Memindahkan stok secara atomik dari Kolom asal (A-G) ke Area Staging (Kolom S, Baris 1)
+    dengan mempertahankan informasi rak asal pada field Catatan.
+    """
+    snap_asal = doc_ref_asal.get(transaction=transaction)
+    if not snap_asal.exists:
+        raise ValueError(f"Data Kolom {k_pilih} tidak ditemukan di database.")
+        
+    snap_staging = doc_ref_staging.get(transaction=transaction)
+    
+    all_col_asal = snap_asal.to_dict().get('data', [])
+    backup_asal = [d.copy() for d in all_col_asal]
+    
+    all_col_staging = snap_staging.to_dict().get('data', []) if snap_staging.exists else []
+    backup_staging = [d.copy() for d in all_col_staging]
+    
+    rak_ini = sorted(
+        [d for d in all_col_asal if float(d.get('Baris', 0) or 0) == float(b_pilih)],
+        key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0))
+    )
+    rak_lain = [d for d in all_col_asal if float(d.get('Baris', 0) or 0) != float(b_pilih)]
+    
+    lot_records = [
+        d for d in rak_ini
+        if str(d.get('Lot Number', '')) == lot_pilih and str(d.get('Nama Produk', '')) == item_name
+    ]
+    db_utuh = sum(
+        1 for d in lot_records
+        if 'pecahan' not in str(d.get('Keterangan', '')).lower() and 'eceran' not in str(d.get('Keterangan', '')).lower()
+    )
+    db_dus = sum(
+        parse_keterangan(d.get('Keterangan', ''))[0] for d in lot_records
+        if 'pecahan' in str(d.get('Keterangan', '')).lower() or 'eceran' in str(d.get('Keterangan', '')).lower()
+    )
+    
+    if db_utuh != init_pallet or db_dus != init_dus:
+        raise ValueError(
+            f"Stok di Rak {k_pilih}-{b_pilih} baru saja berubah ({db_utuh} Pallet, {db_dus} {satuan_kemasan}). "
+            f"Silakan tekan 'Sinkronkan Stok'."
+        )
+        
+    # 1. Perbarui sisa stok di Rak Asal
+    first_target_idx = next(
+        (idx for idx, d in enumerate(rak_ini)
+         if str(d.get('Lot Number', '')) == lot_pilih and str(d.get('Nama Produk', '')) == item_name),
+        len(rak_ini)
+    )
+    
+    sisa_records_asal = []
+    for _ in range(final_pallet):
+        sisa_records_asal.append({
+            'Kolom': k_pilih, 'Baris': float(b_pilih),
+            'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
+            'Keterangan': 'Utuh', 'Catatan': catatan_rak_lama, 'Pallet Ke': 0.0
+        })
+    if final_dus > 0:
+        sisa_records_asal.append({
+            'Kolom': k_pilih, 'Baris': float(b_pilih),
+            'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
+            'Keterangan': f"Pecahan: {final_dus} {satuan_kemasan}", 'Catatan': catatan_rak_lama, 'Pallet Ke': 0.0
+        })
+        
+    updated_rak_asal = []
+    inserted = False
+    for idx, d in enumerate(rak_ini):
+        if idx == first_target_idx and not inserted:
+            updated_rak_asal.extend(sisa_records_asal)
+            inserted = True
+        if not (str(d.get('Lot Number', '')) == lot_pilih and str(d.get('Nama Produk', '')) == item_name):
+            updated_rak_asal.append(d)
+    if not inserted:
+        updated_rak_asal.extend(sisa_records_asal)
+        
+    for i, d in enumerate(updated_rak_asal, 1):
+        d['Pallet Ke'] = float(i)
+        
+    # 2. Tambahkan barang turun ke Area Staging (Kolom S, Baris 1)
+    staging_s1 = sorted(
+        [d.copy() for d in all_col_staging if float(d.get('Baris', 0) or 0) == 1.0],
+        key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0))
+    )
+    staging_lain = [d.copy() for d in all_col_staging if float(d.get('Baris', 0) or 0) != 1.0]
+    
+    pallets_ke_staging = []
+    for _ in range(turun_pallet):
+        pallets_ke_staging.append({
+            'Kolom': 'S', 'Baris': 1.0,
+            'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
+            'Keterangan': 'Utuh', 'Catatan': catatan_staging, 'Pallet Ke': 0.0
+        })
+    if turun_dus > 0:
+        pallets_ke_staging.append({
+            'Kolom': 'S', 'Baris': 1.0,
+            'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
+            'Keterangan': f"Pecahan: {turun_dus} {satuan_kemasan}", 'Catatan': catatan_staging, 'Pallet Ke': 0.0
+        })
+        
+    gabungan_s1 = staging_s1 + pallets_ke_staging
+    for i, d in enumerate(gabungan_s1, 1):
+        d['Pallet Ke'] = float(i)
+        
+    transaction.update(doc_ref_asal, {'data': rak_lain + updated_rak_asal})
+    if snap_staging.exists:
+        transaction.update(doc_ref_staging, {'data': staging_lain + gabungan_s1})
+    else:
+        transaction.set(doc_ref_staging, {'data': staging_lain + gabungan_s1})
+        
+    return {k_pilih: backup_asal, 'S': backup_staging}
 
 # ==========================================================
 # 7. MODUL PEMILIHAN PRODUK TERPADU (SLIDE 2 -> 3 -> 4)
