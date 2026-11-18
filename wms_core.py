@@ -126,7 +126,7 @@ def inject_custom_css(accent_color="#10B981", accent_border="#059669", accent_bg
 
 def render_progress_bar(current_slide, mode_transaksi):
     if mode_transaksi == "STAGING":
-        steps = ["Pilih Rak", "Produk & Lot", "Turunkan ke S-1"]
+        steps = ["Pilih Rak", "Produk & Lot", "Outbound"]
         idx_map = {1: 1, 2: 2, 3: 3}
     elif mode_transaksi in ["INBOUND", "INBOUND_SISA"]:
         steps = ["Aksi", "Kategori", "Item", "Input", "Lokasi", "Selesai"]
