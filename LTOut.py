@@ -5,18 +5,35 @@ import wms_core as core
 st.set_page_config(page_title="Turun ke Staging (S-1) - Rack Navigator", layout="centered", initial_sidebar_state="collapsed")
 core.inject_custom_css(accent_color="#2563EB", accent_border="#3B82F6", accent_bg_rgba="rgba(37, 99, 235, 0.1)")
 
+# Tambahan styling input baris besar agar nyaman di layar HP operator
+st.markdown("""
+    <style>
+        div[data-testid="stNumberInput"] input {
+            font-size: 26px !important;
+            font-weight: 700 !important;
+            text-align: center !important;
+            min-height: 56px !important;
+        }
+    </style>
+""", unsafe_allow_html=True)
+
 OPERATOR_OUTBOUND = ["Maheswara", "Amir", "Bakir", "Danny", "Joko", "Abdul"]
 KOLOM_RAK = ["A", "B", "C", "D", "E", "F", "G"]
 df_master = core.load_master_data()
 
 keys_state = [
-    'slide', 'pilih_kolom', 'pilih_baris', 'item', 'pilih_part',
+    'slide', 'input_baris_temp', 'pilih_kolom', 'pilih_baris', 'item', 'pilih_part',
     'pilih_lot', 'pilih_catatan_rak', 'max_pallet', 'max_dus',
     'operator', 'undo_record'
 ]
 for key in keys_state:
     if key not in st.session_state:
-        st.session_state[key] = 0 if key == 'slide' else None
+        if key == 'slide':
+            st.session_state[key] = 0
+        elif key == 'input_baris_temp':
+            st.session_state[key] = 1
+        else:
+            st.session_state[key] = None
 
 def pindah_slide(tujuan):
     st.session_state.slide = tujuan
@@ -80,68 +97,55 @@ core.render_header_dan_undo(
 core.render_progress_bar(st.session_state.slide, "STAGING")
 
 # ==========================================================
-# SLIDE 1: PILIH KOLOM (A-G) & BARIS (1-28)
+# SLIDE 1: INPUT NOMOR BARIS (1-28) & PILIH KOLOM (A-G) DALAM 1 LAYAR
 # ==========================================================
 if st.session_state.slide == 1:
     st.markdown("### 1. Pilih Lokasi Rak Asal")
     
-    # Langkah 1A: Pilih Kolom A - G
-    if not st.session_state.pilih_kolom:
-        st.caption("Pilih Kolom Rak (A – G):")
-        st.markdown('<div class="btn-center">', unsafe_allow_html=True)
-        for i in range(0, len(KOLOM_RAK), 4):
-            cols = st.columns(4)
-            for j in range(4):
-                if i + j < len(KOLOM_RAK):
-                    kol = KOLOM_RAK[i + j]
-                    with cols[j]:
-                        if st.button(f"KOLOM\n{kol}", key=f"kol_{kol}", use_container_width=True):
-                            st.session_state.pilih_kolom = kol
-                            st.rerun()
-        st.markdown('</div>', unsafe_allow_html=True)
+    with st.container(border=True):
+        st.markdown("**Langkah A — Masukkan Nomor Baris (1 – 28):**")
+        baris_input = st.number_input(
+            "Nomor Baris (1 - 28)",
+            min_value=1,
+            max_value=28,
+            step=1,
+            value=int(st.session_state.input_baris_temp or 1),
+            label_visibility="collapsed",
+            key="entry_nomor_baris_out"
+        )
+        st.session_state.input_baris_temp = int(baris_input)
         
-    # Langkah 1B: Pilih Baris 1 - 28 pada Kolom terpilih
-    else:
-        kol_aktif = st.session_state.pilih_kolom
-        if st.button("🔙 GANTI KOLOM"):
-            st.session_state.pilih_kolom = None
-            st.rerun()
-            
-        st.markdown(f"**Kolom Dipilih: `KOLOM {kol_aktif}`** — Pilih Nomor Baris:")
-        
-        semua_data = core.get_all_racking_data()
-        df_all = pd.DataFrame(semua_data) if semua_data else pd.DataFrame()
-        
-        isi_per_baris = {}
-        if not df_all.empty and 'Kolom' in df_all.columns:
-            df_kol = df_all[df_all['Kolom'].astype(str).str.strip().str.upper() == kol_aktif].copy()
-            if not df_kol.empty:
-                df_kol['Baris_Int'] = pd.to_numeric(df_kol['Baris'], errors='coerce').fillna(0).astype(int)
-                for b_num, grp in df_kol.groupby('Baris_Int'):
-                    if 1 <= b_num <= 28:
-                        items_unik = grp['Nama Produk'].dropna().unique().tolist()
-                        ringkas = items_unik[0].split(',')[-1].strip() if (items_unik and ',' in items_unik[0]) else (items_unik[0][:14] if items_unik else "")
-                        if len(items_unik) > 1:
-                            ringkas += f" +{len(items_unik)-1}"
-                        isi_per_baris[b_num] = f"{len(grp)}P ({ringkas})"
-                        
-        tampilkan_semua = st.checkbox("Tampilkan semua baris 1–28 (termasuk baris kosong)", value=False)
-        baris_tampil = list(range(1, 29)) if tampilkan_semua else sorted(list(isi_per_baris.keys()))
-        
-        if not baris_tampil:
-            st.warning(f"Tidak ada stok tercatat di Kolom {kol_aktif}. Centang kotak di atas jika ingin melihat semua baris 1–28.")
-        else:
-            for i in range(0, len(baris_tampil), 2):
-                cols = st.columns(2)
-                for j in range(2):
-                    if i + j < len(baris_tampil):
-                        b_no = baris_tampil[i + j]
-                        info_b = isi_per_baris.get(b_no, "Kosong")
-                        ikon = "📦" if b_no in isi_per_baris else "⚪"
-                        with cols[j]:
-                            if st.button(f"{ikon} RAK {kol_aktif}-{b_no}\n{info_b}", key=f"bar_{kol_aktif}_{b_no}", use_container_width=True):
-                                st.session_state.pilih_baris = b_no
-                                pindah_slide(2); st.rerun()
+    # Ambil pratinjau stok di baris yang sedang diketik untuk memudahkan operator memilih kolom
+    semua_data = core.get_all_racking_data()
+    df_all = pd.DataFrame(semua_data) if semua_data else pd.DataFrame()
+    
+    info_kolom_pada_baris = {}
+    if not df_all.empty and 'Kolom' in df_all.columns and 'Baris' in df_all.columns:
+        df_all['Baris_Int'] = pd.to_numeric(df_all['Baris'], errors='coerce').fillna(0).astype(int)
+        df_bar = df_all[df_all['Baris_Int'] == int(baris_input)]
+        if not df_bar.empty:
+            for k_str, grp in df_bar.groupby(df_bar['Kolom'].astype(str).str.strip().str.upper()):
+                if k_str in KOLOM_RAK:
+                    items_unik = grp['Nama Produk'].dropna().unique().tolist()
+                    ringkas = items_unik[0].split(',')[-1].strip() if (items_unik and ',' in items_unik[0]) else (items_unik[0][:14] if items_unik else "")
+                    if len(items_unik) > 1:
+                        ringkas += f" +{len(items_unik)-1}"
+                    info_kolom_pada_baris[k_str] = f"{len(grp)}P ({ringkas})"
+                    
+    st.markdown(f"**Langkah B — Pilih Kolom pada Baris `{int(baris_input)}`:**")
+    for i in range(0, len(KOLOM_RAK), 2):
+        cols = st.columns(2)
+        for j in range(2):
+            if i + j < len(KOLOM_RAK):
+                kol = KOLOM_RAK[i + j]
+                ada_isi = kol in info_kolom_pada_baris
+                ikon = "📦" if ada_isi else "⚪"
+                ket_isi = info_kolom_pada_baris.get(kol, "Kosong")
+                with cols[j]:
+                    if st.button(f"{ikon} KOLOM {kol} (Rak {kol}-{int(baris_input)})\n{ket_isi}", key=f"kol_btn_{kol}", use_container_width=True):
+                        st.session_state.pilih_baris = int(baris_input)
+                        st.session_state.pilih_kolom = kol
+                        pindah_slide(2); st.rerun()
 
 # ==========================================================
 # SLIDE 2: PILIH NAMA PRODUK & NOMOR LOT DI RAK TERPILIH
@@ -150,7 +154,8 @@ elif st.session_state.slide == 2:
     kol_aktif = st.session_state.pilih_kolom
     bar_aktif = int(st.session_state.pilih_baris)
     
-    if st.button("🔙 GANTI BARIS RAK"):
+    if st.button("🔙 GANTI BARIS / KOLOM"):
+        st.session_state.pilih_kolom = None
         st.session_state.pilih_baris = None
         pindah_slide(1); st.rerun()
         
@@ -203,7 +208,7 @@ elif st.session_state.slide == 2:
             teks_pec = f", {item_rak['Dus']} {item_rak['Satuan']}" if item_rak['Dus'] > 0 else ""
             catatan_txt = f"\n🔖 Catatan Rak: {item_rak['Catatan']}" if item_rak['Catatan'] else ""
             btn_label = (
-                f"📦 {item_rak['Nama Produk']}\n"
+                f"☑️ {item_rak['Nama Produk']}\n"
                 f"🏷️ Lot: {item_rak['Lot Number']}  |  Stok: {item_rak['Pallet']} Pallet{teks_pec}{catatan_txt}"
             )
             if st.button(btn_label, key=f"sel_prod_lot_{idx}", use_container_width=True):
