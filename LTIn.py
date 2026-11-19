@@ -10,7 +10,7 @@ df_master = core.load_master_data()
 keys_state = [
     'slide', 'mode_transaksi', 'kategori', 'gramasi', 'item', 'pilih_part',
     'in_lot', 'in_qty_p', 'in_qty_c', 'in_tipe_c', 'in_sisi_masuk',
-    'in_rak_skip', 'alokasi_terpilih',
+    'in_rak_skip', 'alokasi_terpilih', 'ai_scan_result',
     'operator', 'undo_record'
 ]
 for key in keys_state:
@@ -80,7 +80,7 @@ core.render_header_dan_undo(
     accent_color="#10B981",
     prefix_app="IN",
     mode_badge=mode_badge,
-    reset_keys=['mode_transaksi', 'kategori', 'gramasi', 'item', 'pilih_part', 'in_lot', 'in_qty_p', 'in_qty_c', 'in_tipe_c', 'in_sisi_masuk', 'in_rak_skip', 'alokasi_terpilih']
+    reset_keys=['mode_transaksi', 'kategori', 'gramasi', 'item', 'pilih_part', 'in_lot', 'in_qty_p', 'in_qty_c', 'in_tipe_c', 'in_sisi_masuk', 'in_rak_skip', 'alokasi_terpilih', 'ai_scan_result']
 )
 
 if st.session_state.slide >= 1:
@@ -107,13 +107,13 @@ if st.session_state.slide == 1:
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ==========================================================
-# SLIDE 2, 3, 4: KATEGORI -> GRAMASI -> ITEM
+# SLIDE 2, 3, 4: SCAN/UPLOAD LABEL ATAU PILIH PRODUK MANUAL
 # ==========================================================
 elif st.session_state.slide in [2, 3, 4]:
     core.render_pemilihan_produk(df_master)
 
 # ==========================================================
-# SLIDE 5, 6, 7: INPUT LOT & QTY -> REKOMENDASI RAK -> KONFIRMASI
+# SLIDE 5, 6, 7: INPUT QTY -> REKOMENDASI RAK -> KONFIRMASI
 # ==========================================================
 elif st.session_state.slide in [5, 6, 7]:
     is_sisa = (st.session_state.mode_transaksi == "INBOUND_SISA")
