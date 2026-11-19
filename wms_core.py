@@ -14,6 +14,9 @@ NAMA_DATABASE = 'uji_coba_rak'
 DB_LOG_MUTASI = 'log_mutasi_rak'
 DB_UNDO_STATE = 'wms_undo_state'
 
+# Batas maksimal palet di sisi ujung pintu masuk untuk lorong >= 3 item (mencegah delay bongkar outbound)
+MAX_TAIL_PALLETS_MULTI_ITEM = 10
+
 # Item khusus JDO Diamond (Utama: F1-16, Cadangan: G17-28)
 PART_KHUSUS_TOP_TIER = {'MJSCN3802703D', 'MJSCN3802901D'}
 
@@ -267,6 +270,17 @@ def format_nama_warna_bold(nama_barang):
     if len(parts) == 2: return f"{parts[0]}, **{parts[1].strip()}**"
     return str(nama_barang)
 
+def hitung_blok_ujung(pallets_sorted, target_item_clean, sisi_masuk):
+    """Menghitung berapa palet berturut-turut dari sisi pintu masuk yang berisi target_item_clean."""
+    seq = pallets_sorted if sisi_masuk == "DEPAN" else list(reversed(pallets_sorted))
+    count = 0
+    for p in seq:
+        if str(p.get('Nama Produk', '')).strip() == target_item_clean:
+            count += 1
+        else:
+            break
+    return count
+
 # ==========================================================
 # 4. DATA LOADERS & ALGORITMA PENEMPATAN / PENGAMBILAN
 # ==========================================================
@@ -372,9 +386,11 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="B
         if sisa_slot_pallet <= 0:
             continue
             
+        # Lorong >= 2 item tidak boleh kemasukan item baru yang belum ada di lorong
         if len(distinct_items) >= 2 and target_item_clean not in distinct_items:
             continue
             
+        # Priority 1: Lorong 1 Item Sejenis (Murni)
         if target_item_clean in distinct_items and len(distinct_items) == 1:
             prio = 1
             lot_ujung = (
@@ -391,12 +407,7 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="B
             isi_eksisting = f"{jml_sejenis} Pallet ({info_lot})"
             sub_sort = (lot_match_pen, -newest_rank, -used_cap)
             
-        elif len(distinct_items) == 0:
-            prio = 2
-            status = "⚪ Lorong Kosong"
-            isi_eksisting = f"Kosong (Kapasitas {max_target} Pallet)"
-            sub_sort = (0, 0, 0.0)
-            
+        # Priority 2: Lorong 2 Item (Ujung Pintu Masuk Sejenis)
         elif target_item_clean in distinct_items and len(distinct_items) == 2:
             item_ujung = (
                 str(pallets_sorted[0].get('Nama Produk', '')).strip()
@@ -406,7 +417,7 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="B
             if item_ujung != target_item_clean:
                 continue
                 
-            prio = 3
+            prio = 2
             status = f"🔵 Lorong 2 Item (Sejenis di {sisi_masuk.title()})"
             sama_lot = any(l.upper() == target_lot_clean for l in sejenis_lots) if target_lot_clean else False
             newest_rank = max([parse_lifo_rank(l) for l in sejenis_lots], default=0)
@@ -415,8 +426,39 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="B
             isi_eksisting = f"{jml_sejenis}P sejenis + {len(pallets_sorted)-jml_sejenis}P {nama_ringkas}"
             sub_sort = (0 if sama_lot else 1, -newest_rank, -used_cap)
             
-        elif len(distinct_items) == 1 and target_item_clean not in distinct_items:
+        # Priority 3: Lorong Kosong
+        elif len(distinct_items) == 0:
+            prio = 3
+            status = "⚪ Lorong Kosong"
+            isi_eksisting = f"Kosong (Kapasitas {max_target} Pallet)"
+            sub_sort = (0, 0, 0.0)
+            
+        # Priority 4: Lorong >= 3 Item (Ujung Sejenis + Batas Maksimal Penumpukan Ujung)
+        elif target_item_clean in distinct_items and len(distinct_items) >= 3:
+            item_ujung = (
+                str(pallets_sorted[0].get('Nama Produk', '')).strip()
+                if sisi_masuk == "DEPAN"
+                else str(pallets_sorted[-1].get('Nama Produk', '')).strip()
+            )
+            if item_ujung != target_item_clean:
+                continue
+                
+            blok_ujung = hitung_blok_ujung(pallets_sorted, target_item_clean, sisi_masuk)
+            sisa_kuota_ujung = MAX_TAIL_PALLETS_MULTI_ITEM - blok_ujung
+            if sisa_kuota_ujung <= 0:
+                continue
+                
+            sisa_slot_pallet = min(sisa_slot_pallet, sisa_kuota_ujung)
             prio = 4
+            status = f"🟣 Lorong {len(distinct_items)} Item (Sisa Ekor Maks. {sisa_slot_pallet}P)"
+            sama_lot = any(l.upper() == target_lot_clean for l in sejenis_lots) if target_lot_clean else False
+            newest_rank = max([parse_lifo_rank(l) for l in sejenis_lots], default=0)
+            isi_eksisting = f"{len(distinct_items)} item campur | Ujung {sisi_masuk.lower()}: {blok_ujung}P sejenis"
+            sub_sort = (0 if sama_lot else 1, -newest_rank, blok_ujung)
+            
+        # Priority 5: Campur Baru (Lorong 1 Item Lain -> Menjadi Maksimal 2 Item)
+        elif len(distinct_items) == 1 and target_item_clean not in distinct_items:
+            prio = 5
             status = "🟡 Campur (Max 2 Item)"
             item_lain = list(distinct_items)[0]
             lot_str = ", ".join(sorted(list(distinct_lots))[:2])
@@ -716,7 +758,7 @@ def proses_inbound_multi_transaction(transaction, doc_refs_dict, alokasi_list, l
         existing_items = {str(p.get('Nama Produk', '')).strip() for p in rak_ini if str(p.get('Nama Produk', '')).strip()}
         if len(existing_items) >= 2:
             if target_clean not in existing_items:
-                raise ValueError(f"Rak {k_pilih}-{b_int} sudah terisi 2 jenis item lain. Maksimal 2 jenis item per lorong rak!")
+                raise ValueError(f"Rak {k_pilih}-{b_int} sudah terisi {len(existing_items)} jenis item lain. Tidak boleh menambah item baru berbeda!")
             item_ujung = (
                 str(rak_ini[0].get('Nama Produk', '')).strip()
                 if sisi_masuk == "DEPAN"
@@ -1017,7 +1059,6 @@ def render_pemilihan_produk(df_master):
 # 8. MODUL UI INBOUND MULTI-RAK TERPADU (SLIDE 5 -> 6 -> 7)
 # ==========================================================
 def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="BELAKANG", jenis_log="INBOUND (Remote)", judul_tele="INBOUND - RACK NAVIGATOR", mode_undo_label="INBOUND", reset_keys=None):
-    # --- SLIDE 5: INPUT LOT, QTY & SISI PINTU MASUK ---
     if st.session_state.slide == 5:
         if st.button("🔙 GANTI ITEM"):
             st.session_state.slide = 4
@@ -1065,7 +1106,6 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                 st.session_state.slide = 6
                 st.rerun()
 
-    # --- SLIDE 6: REKOMENDASI LOKASI RAK ---
     elif st.session_state.slide == 6:
         if st.button("🔙 UBAH INPUT"):
             st.session_state.in_rak_skip = []
@@ -1193,7 +1233,7 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
 
         st.write("")
         with st.expander("ℹ️ Aturan Zonasi & Urutan Rekomendasi Rak", expanded=False):
-            st.markdown("""
+            st.markdown(f"""
 **Zonasi Area (Otomatis Melimpah Jika Zona Utama Penuh):**
 * **Preform:** Diutamakan **Baris 1–16**, jika penuh otomatis melimpah ke **Baris 17–28**.
 * **Cup:** Diutamakan **Baris 17–28**, jika penuh otomatis melimpah ke **Baris 1–16**.
@@ -1201,12 +1241,12 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
 
 **Urutan Pemilihan Lorong di Dalam Zona:**
 1. **Lorong 1 Item Sejenis:** Melanjutkan lot yang sama atau lot/shift terbaru sampai penuh.
-2. **Lorong Kosong:** Membuka lorong kosong baru jika lorong sejenis sudah penuh.
-3. **Lorong 2 Item:** Melanjutkan di lorong 2 item jika posisi item sejenis berada di ujung pintu masuk (`Belakang` / `Depan`).
-4. **Campur (Max 2 Item):** Menggabung ke lorong yang baru berisi 1 item lain sebagai pilihan terakhir.
+2. **Lorong 2 Item:** Melanjutkan item sejenis yang berada di ujung pintu masuk (`Belakang` / `Depan`).
+3. **Lorong Kosong:** Membuka lorong kosong baru agar stok utama tetap murni 1 item.
+4. **Lorong ≥3 Item (Penampung Sisa):** Menampung sisa palet di ujung yang sejenis (maksimal **{MAX_TAIL_PALLETS_MULTI_ITEM} palet** di ujung agar bongkar *outbound* tidak terhambat).
+5. **Campur Baru (Max 2 Item):** Menggabung ke lorong yang baru berisi 1 item lain sebagai pilihan terakhir.
             """)
 
-    # --- SLIDE 7: KONFIRMASI & KOREKSI AKTUAL LAPANGAN ---
     elif st.session_state.slide == 7:
         if st.button("🔙 BATAL (UBAH ALOKASI)"):
             st.session_state.slide = 6
@@ -1462,7 +1502,7 @@ def render_alur_pengambilan_terpadu(
         </div>
     """, unsafe_allow_html=True)
     
-    with st.expander("🛠️ Sisa fisik di rak berbeda? Koreksi sisa akhir di sini"):
+    with st.expander("🛠️ Tidak aktual? Koreksi disini"):
         st.caption("Ubah angka di bawah jika setelah diambil ternyata sisa fisik di lorong tidak sama dengan hitungan di atas:")
         max_sisa_d_kor = max(init_d, pecahan_per_pallet - 1) if pecahan_per_pallet > 1 else max(init_d, 100)
         c_kor1, c_kor2 = st.columns(2)
