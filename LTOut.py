@@ -343,7 +343,6 @@ elif st.session_state.slide == 3:
                 doc_ref_staging = core.db.collection(core.NAMA_DATABASE).document("Kolom_S")
                 transaction = core.db.transaction()
                 
-                # Backend tetap mencatat perpindahan ke Staging S-1 beserta asal raknya
                 catatan_staging = f"Dari Rak {k_pilih}-{b_pilih} | Op: {st.session_state.operator}"
                 if catatan_operator.strip():
                     catatan_staging += f" | {catatan_operator.strip()}"
@@ -358,7 +357,6 @@ elif st.session_state.slide == 3:
                         catatan_rak_lama, catatan_staging
                     )
                     
-                    # Log WMS & Telegram tetap mencatat turun ke Staging S-1 untuk PPIC
                     teks_keterangan = (
                         f"Op: {st.session_state.operator} | Rak {k_pilih}-{b_pilih} -> Staging S-1 | "
                         f"Turun: {turun_pallet_eq}P {turun_dus_eq}{satuan[0]} | "
@@ -392,7 +390,6 @@ elif st.session_state.slide == 3:
                     core.kirim_notif_telegram(pesan_tele)
                     
                     core.get_all_racking_data.clear()
-                    # Pesan sukses di layar operator tetap tampil sebagai Outbound tanpa menyebut Staging
                     msg_sukses = f"Outbound {turun_pallet_eq}P {turun_dus_eq}{satuan} ({selisih_pcs_total:,} Pcs) dari Rak {k_pilih}-{b_pilih}."
                     core.simpan_undo_firestore("OUT", st.session_state.operator, backup_dict, msg_sukses, mode_label="OUTBOUND")
                     
