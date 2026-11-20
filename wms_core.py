@@ -441,13 +441,13 @@ def load_master_data():
         ])
 
 def get_df_master_terfilter(df_master):
-    """Memfilter Master_Produk.csv secara dinamis: mode WIP hanya menampilkan Preform & 4 Cup WIP."""
+    """Memfilter Master_Produk.csv secara dinamis: mode WIP menampilkan Preform, Cup Color, & 4 Cup Natural WIP."""
     if df_master.empty:
         return df_master
     if st.session_state.get("mode_transaksi") == "WIP":
         part_clean = df_master['Part Number'].astype(str).str.strip().str.upper()
         return df_master[
-            (df_master['Kategori'] == 'PREFORM') | (part_clean.isin(PART_WIP_CUP))
+            (df_master['Kategori'].isin(['PREFORM', 'CUP COLOR'])) | (part_clean.isin(PART_WIP_CUP))
         ].copy()
     return df_master
 
@@ -1206,7 +1206,7 @@ def render_pemilihan_produk(df_master):
         else:
             st.markdown("### Pilih Kategori Produk")
             if st.session_state.get("mode_transaksi") == "WIP":
-                st.caption("🏭 *Menampilkan khusus item bahan WIP (Seluruh Preform & Cup Mountea/JDB).*")
+                st.caption("🏭 *Menampilkan khusus item bahan WIP (Seluruh Preform, Cup Color, & Cup Mountea/JDB).*")
 
         urutan_kategori = ["PREFORM", "CUP NATURAL", "CUP COLOR", "CUP PRINTING", "CAP"]
         kategori_ada = [k for k in urutan_kategori if k in set(df_aktif['Kategori'].unique())]
