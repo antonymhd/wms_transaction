@@ -5,7 +5,6 @@ import wms_core as core
 st.set_page_config(page_title="Outbound Racking HDI", layout="centered", initial_sidebar_state="collapsed")
 core.inject_custom_css(accent_color="#2563EB", accent_border="#3B82F6", accent_bg_rgba="rgba(37, 99, 235, 0.1)")
 
-# Styling input baris besar agar nyaman di layar HP operator
 st.markdown("""
     <style>
         div[data-testid="stNumberInput"] input {
