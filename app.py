@@ -1,10 +1,12 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import firebase_admin
 from firebase_admin import credentials, firestore
 import io
 import copy
 import re
+import html
 from datetime import datetime, timedelta, timezone
 
 # ==========================================================
@@ -26,6 +28,8 @@ DEFAULT_SESSION_STATE = {
     'book_lokasi_dicari': False, 'book_k_pilih': "A", 'book_b_pilih': 1,
     'relok_dicari': False, 'relok_ak': "A", 'relok_ab': 1,
     'kor_dicari': False, 'kor_k': "A", 'kor_b': 1,
+    'print_rak_cache': {},
+    'print_ready': False,
 }
 for k, v in DEFAULT_SESSION_STATE.items():
     if k not in st.session_state:
@@ -57,6 +61,7 @@ NAMA_DATABASE = 'uji_coba_rak'
 DB_LOG_MUTASI = 'log_mutasi_rak'
 KOLOM_OPTIONS = ["A", "B", "C", "D", "E", "F", "G", "S (Staging)"]
 KOLOM_IDS = ["A", "B", "C", "D", "E", "F", "G", "S"]
+KOLOM_RACKING_AG = ["A", "B", "C", "D", "E", "F", "G"]
 LIMIT_DOC_BYTES = 1_048_576         # 1 MiB per dokumen Firestore
 LIMIT_SPARK_BYTES = 1_073_741_824   # 1 GiB Spark Plan
 
@@ -119,6 +124,207 @@ def format_keterangan(pecahan, eceran):
     if eceran > 0:
         parts.append(f"Eceran: {int(eceran)} pcs")
     return " | ".join(parts)
+
+def get_satuan_kemasan(part_number):
+    """Menentukan label satuan pecahan berdasarkan akhiran Part Number."""
+    pn = clean_str(part_number).upper()
+    if pn.endswith(('D', 'G')):
+        return "dus"
+    if pn.endswith('C'):
+        return "sak"
+    return "qty"
+
+def build_picking_cards(baris_num, kolom_id, baris_records):
+    """Membentuk daftar blok kartu picking list (run-length grouping) untuk 1 lokasi rak."""
+    lokasi_label = f"Baris {int(baris_num)}{kolom_id}"
+    valid_items = sorted(
+        [d for d in baris_records if is_valid_item(d)],
+        key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0))
+    )
+
+    if not valid_items:
+        return [{
+            'Lokasi': lokasi_label,
+            'Nama Item': 'RAK KOSONG',
+            'Part Number': '-',
+            'Lot Produksi': '-',
+            'Palet ke': '-',
+            'Jumlah': '-',
+            'Is_Empty': True
+        }]
+
+    # Gabungkan slot yang berurutan jika Part Number dan Lot Number sama
+    runs = []
+    for item in valid_items:
+        pn = clean_str(item.get('Part Number')).upper()
+        lot = clean_str(item.get('Lot Number'))
+        nama = clean_str(item.get('Nama Produk'))
+        p_idx = int(pd.to_numeric(item.get('Pallet Ke', 0)) or 0)
+        ket = clean_str(item.get('Keterangan'))
+
+        if runs and runs[-1]['pn'] == pn and runs[-1]['lot'] == lot:
+            runs[-1]['items'].append((p_idx, ket))
+        else:
+            runs.append({'pn': pn, 'lot': lot, 'nama': nama, 'items': [(p_idx, ket)]})
+
+    cards = []
+    for r in runs:
+        start_p = r['items'][0][0]
+        end_p = r['items'][-1][0]
+        palet_range = f"{start_p}" if start_p == end_p else f"{start_p}-{end_p}"
+
+        utuh_cnt, dus_sak_cnt, pcs_cnt = 0, 0, 0
+        for _, ket in r['items']:
+            if 'pecahan' in ket.lower() or 'eceran' in ket.lower():
+                p_val, e_val = parse_keterangan(ket)
+                dus_sak_cnt += p_val
+                pcs_cnt += e_val
+            else:
+                utuh_cnt += 1
+
+        satuan = get_satuan_kemasan(r['pn'])
+        qty_parts = []
+        if utuh_cnt > 0:
+            qty_parts.append(f"{utuh_cnt}P")
+        if dus_sak_cnt > 0:
+            qty_parts.append(f"{dus_sak_cnt} {satuan}")
+        if pcs_cnt > 0:
+            qty_parts.append(f"{pcs_cnt} pcs")
+        jumlah_str = " + ".join(qty_parts) if qty_parts else "0P"
+
+        cards.append({
+            'Lokasi': lokasi_label,
+            'Nama Item': r['nama'],
+            'Part Number': r['pn'],
+            'Lot Produksi': r['lot'] or '-',
+            'Palet ke': palet_range,
+            'Jumlah': jumlah_str,
+            'Is_Empty': False
+        })
+    return cards
+
+def render_print_html(cards_list, judul_cetak, waktu_cetak):
+    """Merender HTML siap cetak A4 dengan tombol Print langsung di browser."""
+    cards_html = []
+    for c in cards_list:
+        lok = html.escape(str(c['Lokasi']))
+        nama = html.escape(str(c['Nama Item']))
+        pn = html.escape(str(c['Part Number']))
+        lot = html.escape(str(c['Lot Produksi']))
+        palet = html.escape(str(c['Palet ke']))
+        jml = html.escape(str(c['Jumlah']))
+
+        row_class = "empty-row" if c['Is_Empty'] else "data-row"
+        cards_html.append(f"""
+        <div class="card-block">
+            <table>
+                <thead>
+                    <tr class="loc-header">
+                        <th colspan="5">{lok}</th>
+                    </tr>
+                    <tr class="col-header">
+                        <th style="width: 38%;">Nama Item</th>
+                        <th style="width: 18%;">Part Number</th>
+                        <th style="width: 16%;">Lot Produksi</th>
+                        <th style="width: 12%;">Palet ke</th>
+                        <th style="width: 16%;">Jumlah</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr class="{row_class}">
+                        <td>{nama}</td>
+                        <td>{pn}</td>
+                        <td>{lot}</td>
+                        <td class="center">{palet}</td>
+                        <td class="bold">{jml}</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        """)
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <meta charset="utf-8">
+    <style>
+        body {{
+            font-family: Arial, Helvetica, sans-serif;
+            margin: 12px;
+            color: #000;
+            background: #fff;
+        }}
+        .toolbar {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 14px;
+            margin-bottom: 14px;
+            background: #f1f5f9;
+            border: 1px solid #cbd5e1;
+            border-radius: 6px;
+        }}
+        .btn-print {{
+            background: #0f172a;
+            color: #fff;
+            border: none;
+            padding: 8px 16px;
+            font-size: 13px;
+            font-weight: bold;
+            border-radius: 4px;
+            cursor: pointer;
+        }}
+        .btn-print:hover {{ background: #334155; }}
+        .meta {{ font-size: 12px; color: #334155; }}
+        .card-block {{
+            margin-bottom: 14px;
+            page-break-inside: avoid;
+            break-inside: avoid;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+        }}
+        th, td {{
+            border: 1px solid #000;
+            padding: 5px 8px;
+            text-align: left;
+        }}
+        tr.loc-header th {{
+            background-color: #e2e8f0;
+            font-size: 13px;
+            font-weight: bold;
+        }}
+        tr.col-header th {{
+            background-color: #f8fafc;
+            font-weight: bold;
+        }}
+        tr.empty-row td {{
+            color: #64748b;
+            font-style: italic;
+        }}
+        td.center {{ text-align: center; }}
+        td.bold {{ font-weight: bold; }}
+        @media print {{
+            .toolbar {{ display: none !important; }}
+            body {{ margin: 0; }}
+            .card-block {{ margin-bottom: 12px; }}
+        }}
+    </style>
+    </head>
+    <body>
+        <div class="toolbar">
+            <div class="meta">
+                <strong>{html.escape(judul_cetak)}</strong> • Dicetak: {html.escape(waktu_cetak)} • Total Kartu: {len(cards_list)}
+            </div>
+            <button class="btn-print" onclick="window.print()">🖨️ Cetak / Simpan PDF</button>
+        </div>
+        {"".join(cards_html)}
+    </body>
+    </html>
+    """
 
 def summarize_lot_groups(baris_records):
     """Meringkas list record satu baris menjadi grup per (Lot, Produk, Catatan)."""
@@ -266,6 +472,8 @@ def clear_all_rak_caches():
     """Membersihkan seluruh cache lokal rak setiap kali ada mutasi tersimpan."""
     for k in ['cache_in_data', 'cache_out_data', 'cache_book_data', 'cache_relok_asal', 'cache_kor_data']:
         st.session_state[k] = None
+    st.session_state['print_rak_cache'] = {}
+    st.session_state['print_ready'] = False
 
 @st.cache_data(ttl=300)
 def load_master_produk():
@@ -301,6 +509,9 @@ def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh,
     try:
         db.collection(DB_LOG_MUTASI).add(log_data)
         log_fb_usage('write', 1)
+        if 'total_log_bytes' in st.session_state:
+            st.session_state['total_log_bytes'] += hitung_ukuran_dokumen(DB_LOG_MUTASI, "X" * 20, log_data)
+            st.session_state['total_log_docs'] += 1
     except Exception as e:
         st.toast(f"⚠️ Peringatan: Gagal mencatat log mutasi ({e})", icon="⚠️")
 
@@ -337,24 +548,48 @@ if st.session_state['doc_sizes']:
 else:
     st.sidebar.caption("Belum ada dokumen rak yang diakses pada sesi ini.")
 
-if st.sidebar.button("📏 Cek Total Storage Rak (8 Read)", use_container_width=True):
+if st.sidebar.button("📏 Cek Total Storage (Rak + Log)", use_container_width=True):
     docs_all = list(db.collection(NAMA_DATABASE).stream())
     log_fb_usage('read', len(docs_all))
-    total_bytes = 0
+    total_rak_b = 0
     for d in docs_all:
         d_list = (d.to_dict() or {}).get('data', [])
         record_doc_size(d.id, d_list)
-        total_bytes += st.session_state['doc_sizes'][d.id]
-    st.session_state['total_rak_bytes'] = total_bytes
+        total_rak_b += st.session_state['doc_sizes'][d.id]
+    st.session_state['total_rak_bytes'] = total_rak_b
+
+    try:
+        count_res = db.collection(DB_LOG_MUTASI).count().get()
+        jml_log = count_res[0][0].value
+        est_reads = max(1, (jml_log + 999) // 1000)
+        log_fb_usage('read', est_reads)
+
+        sample_docs = list(db.collection(DB_LOG_MUTASI).limit(1).stream())
+        if sample_docs:
+            log_fb_usage('read', 1)
+            avg_log_b = hitung_ukuran_dokumen(DB_LOG_MUTASI, sample_docs[0].id, sample_docs[0].to_dict() or {})
+        else:
+            avg_log_b = 400
+
+        st.session_state['total_log_docs'] = jml_log
+        st.session_state['total_log_bytes'] = jml_log * avg_log_b
+    except Exception:
+        st.session_state['total_log_docs'] = 0
+        st.session_state['total_log_bytes'] = 0
+
     st.rerun()
 
 if 'total_rak_bytes' in st.session_state:
-    tot_b = st.session_state['total_rak_bytes']
-    tot_mb = tot_b / (1024 * 1024)
-    persen_spark = (tot_b / LIMIT_SPARK_BYTES) * 100
+    tot_rak = st.session_state['total_rak_bytes']
+    tot_log = st.session_state.get('total_log_bytes', 0)
+    jml_log_docs = st.session_state.get('total_log_docs', 0)
+    grand_tot_b = tot_rak + tot_log
+    persen_spark = (grand_tot_b / LIMIT_SPARK_BYTES) * 100
+
     st.sidebar.info(
-        f"**Total Rak Utama:** `{tot_b:,}` Bytes ({tot_mb:.2f} MB)\n\n"
-        f"Terpakai **{persen_spark:.4f}%** dari kuota 1 GiB Spark Plan."
+        f"**1. Rak Utama (8 Dok):** `{tot_rak:,}` B ({tot_rak / (1024*1024):.2f} MB)\n\n"
+        f"**2. Log Mutasi ({jml_log_docs:,} Dok):** ~`{tot_log:,}` B ({tot_log / (1024*1024):.2f} MB)\n\n"
+        f"**Total Gabungan:** `{grand_tot_b / (1024*1024):.2f} MB` (**{persen_spark:.4f}%** dari 1 GiB Spark Plan)"
     )
 
 st.sidebar.divider()
@@ -417,9 +652,10 @@ elif st.session_state['action_status'] == 'UNDONE':
 # ==========================================================
 # 6. TABS MENU UTAMA
 # ==========================================================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     "📥 1. Inbound", "📤 2. Outbound", "⚙️ 3. Audit & Backup",
-    "📊 4. Log Mutasi", "🚀 5. Sync CSV", "📅 6. Jadwal", "🔄 7. Relokasi", "✏️ 8. Koreksi"
+    "📊 4. Log Mutasi", "🚀 5. Sync CSV", "📅 6. Jadwal", "🔄 7. Relokasi",
+    "✏️ 8. Koreksi", "🖨️ 9. Cetak Racking"
 ])
 
 # ----------------------------------------------------------
@@ -433,7 +669,7 @@ with tab1:
     with col_in1:
         st.markdown("**1. Pilih Lokasi Rak Tujuan**")
         in_kolom = st.selectbox("Lokasi Kolom", KOLOM_OPTIONS, key="in_kolom").split(" ")[0]
-        in_baris = st.number_input("Nomor Baris (Inbound)", min_value=1, max_value=28, value=1)
+        in_baris = st.number_input("Nomor Baris (Inbound)", min_value=1, max_value=29, value=1)
         if st.button("🔍 Cek Status Rak", use_container_width=True):
             st.session_state.update({'in_lokasi_dicari': True, 'in_k_pilih': in_kolom, 'in_b_pilih': in_baris})
             fetch_kolom_cached(in_kolom, 'cache_in_data', force_refresh=True)
@@ -582,7 +818,7 @@ with tab2:
     with c1:
         out_kolom = st.selectbox("Lokasi Kolom", KOLOM_OPTIONS, key="out_kolom_2").split(" ")[0]
     with c2:
-        out_baris = st.number_input("Nomor Baris", min_value=1, max_value=28, value=1, key="out_baris_2")
+        out_baris = st.number_input("Nomor Baris", min_value=1, max_value=29, value=1, key="out_baris_2")
     with c3:
         st.write("")
         st.write("")
@@ -870,7 +1106,7 @@ with tab3:
                 st.warning("Database kosong.")
 
 # ----------------------------------------------------------
-# TAB 4: LAPORAN MUTASI
+# TAB 4: LAPORAN MUTASI & PEMBERSIHAN LOG LAMA
 # ----------------------------------------------------------
 with tab4:
     st.header("📊 Laporan Riwayat Mutasi")
@@ -923,6 +1159,45 @@ with tab4:
                     st.info("Tidak ada catatan mutasi pada rentang tanggal tersebut.")
             except Exception as e:
                 st.error(f"Gagal memuat log mutasi: {e}. Pastikan Index di Firestore sudah dibuat!")
+
+    st.divider()
+    with st.expander("🗑️ Bersihkan Log Mutasi Lama (Hemat Storage Spark Plan)"):
+        st.warning("⚠️ Pastikan Anda sudah mengunduh laporan CSV di atas sebagai arsip sebelum menghapus data dari database!")
+        batas_default = hari_ini_jkt - timedelta(days=30)
+        tgl_batas_hapus = st.date_input(
+            "Hapus seluruh log SEBELUM tanggal:",
+            value=batas_default,
+            max_value=hari_ini_jkt,
+            key="tgl_batas_hapus"
+        )
+        konfirmasi_hapus = st.checkbox(f"Saya sudah backup CSV dan yakin menghapus log sebelum {tgl_batas_hapus.strftime('%d-%m-%Y')}.")
+
+        if st.button("🗑️ Hapus Log Lama (Maks. 500 Dokumen/Klik)", type="secondary", disabled=not konfirmasi_hapus):
+            with st.spinner("Menghapus log mutasi lama..."):
+                try:
+                    cutoff_utc = datetime.combine(tgl_batas_hapus, datetime.min.time(), tzinfo=timezone.utc) - timedelta(hours=7)
+                    old_docs = list(
+                        db.collection(DB_LOG_MUTASI)
+                        .where("Timestamp_System", "<", cutoff_utc)
+                        .limit(500)
+                        .stream()
+                    )
+                    log_fb_usage('read', len(old_docs))
+
+                    if old_docs:
+                        batch_del = db.batch()
+                        for d in old_docs:
+                            batch_del.delete(d.reference)
+                        batch_del.commit()
+                        log_fb_usage('delete', len(old_docs))
+
+                        st.session_state.pop('total_log_bytes', None)
+                        st.session_state.pop('total_log_docs', None)
+                        st.success(f"✅ Berhasil menghapus **{len(old_docs)}** log mutasi lama ({len(old_docs)} Read, {len(old_docs)} Delete).")
+                    else:
+                        st.info("Tidak ada log mutasi yang lebih lama dari tanggal tersebut.")
+                except Exception as e:
+                    st.error(f"Gagal menghapus log: {e}")
 
 # ----------------------------------------------------------
 # TAB 5: SYNC CSV (RESTORE)
@@ -994,7 +1269,7 @@ with tab6:
     with col_b1:
         st.markdown("**1. Pilih Lokasi Rak**")
         book_kolom = st.selectbox("Lokasi Kolom", KOLOM_OPTIONS, key="book_kolom_3").split(" ")[0]
-        book_baris = st.number_input("Nomor Baris (Booking)", min_value=1, max_value=28, value=1, key="book_baris_3")
+        book_baris = st.number_input("Nomor Baris (Booking)", min_value=1, max_value=29, value=1, key="book_baris_3")
         if st.button("🔍 Cari Data Rak (Booking)", use_container_width=True):
             st.session_state.update({'book_lokasi_dicari': True, 'book_k_pilih': book_kolom, 'book_b_pilih': book_baris})
             fetch_kolom_cached(book_kolom, 'cache_book_data', force_refresh=True)
@@ -1087,11 +1362,11 @@ with tab7:
     with col_r1:
         st.markdown("**Rak ASAL (Sumber)**")
         r_asal_k = st.selectbox("Kolom Asal", KOLOM_OPTIONS, key="r_ak").split(" ")[0]
-        r_asal_b = st.number_input("Baris Asal", min_value=1, max_value=28, value=1, key="r_ab")
+        r_asal_b = st.number_input("Baris Asal", min_value=1, max_value=29, value=1, key="r_ab")
     with col_r2:
         st.markdown("**Rak TUJUAN (Destinasi)**")
         r_tuj_k = st.selectbox("Kolom Tujuan", KOLOM_OPTIONS, key="r_tk").split(" ")[0]
-        r_tuj_b = st.number_input("Baris Tujuan", min_value=1, max_value=28, value=1, key="r_tb")
+        r_tuj_b = st.number_input("Baris Tujuan", min_value=1, max_value=29, value=1, key="r_tb")
 
     if st.button("🔍 Cari Data Rak Asal", type="primary", use_container_width=True):
         st.session_state.update({'relok_dicari': True, 'relok_ak': r_asal_k, 'relok_ab': r_asal_b})
@@ -1327,7 +1602,7 @@ with tab8:
     with c_kor1:
         kor_kolom = st.selectbox("Lokasi Kolom", KOLOM_OPTIONS, key="kor_kolom").split(" ")[0]
     with c_kor2:
-        kor_baris = st.number_input("Nomor Baris", min_value=1, max_value=28, value=1, key="kor_baris")
+        kor_baris = st.number_input("Nomor Baris", min_value=1, max_value=29, value=1, key="kor_baris")
     with c_kor3:
         st.write("")
         st.write("")
@@ -1413,3 +1688,149 @@ with tab8:
                     st.info("Tidak ada perubahan yang dilakukan pada tabel.")
         else:
             st.info("Rak Kosong, tidak ada yang bisa dikoreksi.")
+
+# ----------------------------------------------------------
+# TAB 9: CETAK RACKING / PICKING LIST (1A - 29G)
+# ----------------------------------------------------------
+with tab9:
+    st.header("🖨️ Cetak Kartu Racking / Petunjuk Pengambilan (1A – 29G)")
+    st.caption("Hemat kuota: sistem hanya membaca dokumen kolom dari lokasi yang dipilih dan menyimpannya di cache sesi.")
+
+    mode_cetak = st.radio(
+        "Pilih Mode Cetak:",
+        ["🎯 Lokasi Spesifik (Pilih / Ketik Bebas)", "📑 Rentang Massal (Per Kolom & Baris)"],
+        horizontal=True,
+        key="print_mode_radio"
+    )
+
+    daftar_semua_lokasi = [f"{b}{k}" for b in range(1, 30) for k in KOLOM_RACKING_AG]
+    target_lokasi_list = []
+
+    if mode_cetak.startswith("🎯"):
+        sp_c1, sp_c2 = st.columns([2, 1])
+        with sp_c1:
+            pilih_lokasi_multi = st.multiselect(
+                "Pilih Satu atau Beberapa Lokasi Rak (1A – 29G):",
+                options=daftar_semua_lokasi,
+                placeholder="Contoh: 1A, 2B, 17C...",
+                key="print_multi_loc"
+            )
+        with sp_c2:
+            ketik_lokasi_manual = st.text_input(
+                "Atau Ketik Cepat (pisah koma/spasi):",
+                placeholder="Cth: 1A, 5C, 12G",
+                key="print_manual_loc"
+            )
+
+        # Gabungkan pilihan dropdown + ketik manual tanpa duplikat, pertahankan urutan input
+        seen_loc = set()
+        for loc in pilih_lokasi_multi:
+            if loc not in seen_loc:
+                target_lokasi_list.append(loc)
+                seen_loc.add(loc)
+
+        if clean_str(ketik_lokasi_manual):
+            tokens = re.split(r'[\s,;]+', clean_str(ketik_lokasi_manual).upper())
+            for tok in tokens:
+                if not tok:
+                    continue
+                m = re.fullmatch(r'(\d{1,2})([A-G])', tok)
+                if m and 1 <= int(m.group(1)) <= 29:
+                    norm_loc = f"{int(m.group(1))}{m.group(2)}"
+                    if norm_loc not in seen_loc:
+                        target_lokasi_list.append(norm_loc)
+                        seen_loc.add(norm_loc)
+                else:
+                    st.warning(f"⚠️ Format lokasi '{tok}' diabaikan (gunakan format 1A s/d 29G).")
+
+    else:
+        p_col1, p_col2, p_col3, p_col4 = st.columns([2, 1, 1, 2])
+        with p_col1:
+            pilih_kolom_cetak = st.multiselect(
+                "Pilih Kolom Racking",
+                options=KOLOM_RACKING_AG,
+                default=KOLOM_RACKING_AG,
+                key="print_kolom_sel"
+            )
+        with p_col2:
+            baris_awal_cetak = st.number_input("Dari Baris", min_value=1, max_value=29, value=1, key="print_b_start")
+        with p_col3:
+            baris_akhir_cetak = st.number_input("Sampai Baris", min_value=1, max_value=29, value=29, key="print_b_end")
+        with p_col4:
+            mode_urutan = st.selectbox(
+                "Urutan Cetak",
+                ["Per Baris (1A, 1B ... 29G)", "Per Kolom (1A, 2A ... 29G)"],
+                key="print_sort_mode"
+            )
+
+        if pilih_kolom_cetak and baris_awal_cetak <= baris_akhir_cetak:
+            kolom_terurut = [k for k in KOLOM_RACKING_AG if k in pilih_kolom_cetak]
+            rentang_baris = range(int(baris_awal_cetak), int(baris_akhir_cetak) + 1)
+            if mode_urutan.startswith("Per Baris"):
+                target_lokasi_list = [f"{b}{k}" for b in rentang_baris for k in kolom_terurut]
+            else:
+                target_lokasi_list = [f"{b}{k}" for k in kolom_terurut for b in rentang_baris]
+        elif baris_awal_cetak > baris_akhir_cetak:
+            st.error("❌ 'Dari Baris' tidak boleh lebih besar dari 'Sampai Baris'.")
+
+    btn_c1, btn_c2 = st.columns([2, 1])
+    with btn_c1:
+        if st.button("📋 Susun Kartu Racking Sekarang", type="primary", use_container_width=True):
+            if not target_lokasi_list:
+                st.warning("Pilih atau ketik minimal 1 lokasi rak (contoh: 1A) terlebih dahulu.")
+            else:
+                # Identifikasi kolom unik yang benar-benar dibutuhkan saja agar kuota Read minimal
+                kolom_dibutuhkan = sorted({re.sub(r'\d+', '', loc) for loc in target_lokasi_list})
+                with st.spinner(f"Mengambil data untuk {len(kolom_dibutuhkan)} kolom terkait..."):
+                    for kol in kolom_dibutuhkan:
+                        if kol not in st.session_state['print_rak_cache']:
+                            doc_name = f"Kolom_{kol}"
+                            doc = db.collection(NAMA_DATABASE).document(doc_name).get()
+                            log_fb_usage('read', 1)
+                            d_list = doc.to_dict().get('data', []) if doc.exists else []
+                            record_doc_size(doc_name, d_list)
+                            st.session_state['print_rak_cache'][kol] = d_list
+                    st.session_state['print_ready'] = True
+    with btn_c2:
+        if st.button("🔄 Tarik Ulang Data Terbaru", use_container_width=True):
+            st.session_state['print_rak_cache'] = {}
+            st.session_state['print_ready'] = False
+            st.toast("Cache cetak dibersihkan. Klik 'Susun Kartu Racking Sekarang' untuk menarik data terbaru.", icon="🔄")
+
+    if st.session_state.get('print_ready') and target_lokasi_list:
+        kolom_dibutuhkan = {re.sub(r'\d+', '', loc) for loc in target_lokasi_list}
+        # Pastikan jika user menambah pilihan lokasi dari kolom baru setelah tombol diklik, tetap terambil aman
+        if not kolom_dibutuhkan.issubset(st.session_state['print_rak_cache'].keys()):
+            st.info("ℹ️ Anda menambahkan lokasi dari kolom baru. Klik **'Susun Kartu Racking Sekarang'** untuk memuat data kolom tersebut.")
+        else:
+            semua_kartu = []
+            for loc in target_lokasi_list:
+                m = re.fullmatch(r'(\d{1,2})([A-G])', loc)
+                b_num, k_id = int(m.group(1)), m.group(2)
+                raw_kol = st.session_state['print_rak_cache'].get(k_id, [])
+                baris_recs = get_baris_records(raw_kol, b_num, only_valid=True)
+                semua_kartu.extend(build_picking_cards(b_num, k_id, baris_recs))
+
+            st.divider()
+            info_c1, info_c2 = st.columns([2, 1])
+            with info_c1:
+                jml_isi = sum(1 for c in semua_kartu if not c['Is_Empty'])
+                jml_kosong = sum(1 for c in semua_kartu if c['Is_Empty'])
+                st.success(f"✅ Siap Cetak: **{len(semua_kartu)} Kartu** dari **{len(target_lokasi_list)} Lokasi** ({jml_isi} Terisi, {jml_kosong} Kosong).")
+            with info_c2:
+                df_print_csv = pd.DataFrame(semua_kartu).drop(columns=['Is_Empty'])
+                csv_print_buf = io.StringIO()
+                df_print_csv.to_csv(csv_print_buf, index=False, sep=";")
+                st.download_button(
+                    label="⬇️ Unduh Data Picking List (CSV)",
+                    data=csv_print_buf.getvalue(),
+                    file_name=f"Picking_List_Racking_{get_waktu_jkt().strftime('%Y%m%d_%H%M')}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+
+            ringkasan_judul = ", ".join(target_lokasi_list[:6]) + (f" (+{len(target_lokasi_list)-6} lainnya)" if len(target_lokasi_list) > 6 else "")
+            judul_dok = f"Petunjuk Pengambilan Racking: {ringkasan_judul}"
+            waktu_skrg = get_waktu_jkt().strftime("%d-%m-%Y %H:%M WIB")
+            html_cetak = render_print_html(semua_kartu, judul_dok, waktu_skrg)
+            components.html(html_cetak, height=650, scrolling=True)
