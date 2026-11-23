@@ -11,7 +11,7 @@ keys_state = [
     'slide', 'mode_transaksi', 'kategori', 'gramasi', 'item', 'pilih_part',
     'in_lot', 'in_qty_p', 'in_qty_c', 'in_tipe_c', 'in_sisi_masuk', 'in_rak_skip', 'alokasi_terpilih',
     'wip_kolom', 'wip_baris', 'wip_lot', 'wip_catatan_rak', 'wip_max_pallet', 'wip_max_dus',
-    'operator', 'undo_record'
+    'operator', 'undo_record', 'inbound_draft'
 ]
 for key in keys_state:
     if key not in st.session_state:
@@ -19,6 +19,21 @@ for key in keys_state:
 
 def pindah_slide(tujuan):
     st.session_state.slide = tujuan
+
+def pulihkan_draft_ke_session(draft):
+    st.session_state.mode_transaksi = "INBOUND"
+    st.session_state.kategori = draft.get("kategori") or ""
+    st.session_state.gramasi = draft.get("gramasi") or ""
+    st.session_state.item = draft.get("item") or ""
+    st.session_state.pilih_part = draft.get("pilih_part") or ""
+    st.session_state.in_lot = draft.get("in_lot") or ""
+    st.session_state.in_qty_p = int(draft.get("in_qty_p") or 0)
+    st.session_state.in_qty_c = int(draft.get("in_qty_c") or 0)
+    st.session_state.in_tipe_c = draft.get("in_tipe_c") or "Dus"
+    st.session_state.in_sisi_masuk = draft.get("in_sisi_masuk") or "BELAKANG"
+    st.session_state.in_rak_skip = []
+    st.session_state.alokasi_terpilih = draft.get("alokasi_terpilih") or []
+    st.session_state.slide = 7
 
 # ==========================================================
 # SLIDE 0: PILIH OPERATOR BERTUGAS
@@ -43,6 +58,7 @@ if st.session_state.slide == 0:
             if st.button(f"👤 {op1}", key=f"op_{op1}", use_container_width=True):
                 st.session_state.operator = op1
                 core.muat_undo_firestore("IN", op1)
+                core.muat_draft_inbound("IN", op1)
                 pindah_slide(1); st.rerun()
         if i + 1 < len(OPERATOR_INBOUND):
             with cols[1]:
@@ -50,6 +66,7 @@ if st.session_state.slide == 0:
                 if st.button(f"👤 {op2}", key=f"op_{op2}", use_container_width=True):
                     st.session_state.operator = op2
                     core.muat_undo_firestore("IN", op2)
+                    core.muat_draft_inbound("IN", op2)
                     pindah_slide(1); st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
     
@@ -61,6 +78,7 @@ if st.session_state.slide == 0:
                 nama_fix = op_manual.strip().title()
                 st.session_state.operator = nama_fix
                 core.muat_undo_firestore("IN", nama_fix)
+                core.muat_draft_inbound("IN", nama_fix)
                 pindah_slide(1); st.rerun()
             else:
                 st.warning("Nama operator tidak boleh kosong.")
@@ -80,15 +98,41 @@ core.render_header_dan_undo(
     accent_color="#10B981",
     prefix_app="IN",
     mode_badge=mode_badge,
-    reset_keys=['mode_transaksi']
+    reset_keys=['mode_transaksi', 'inbound_draft']
 )
 core.render_progress_bar(st.session_state.slide, st.session_state.mode_transaksi)
 
 # ==========================================================
-# SLIDE 1: PILIH AKSI UTAMA (TASK-FIRST)
+# SLIDE 1: PILIH AKSI UTAMA (TASK-FIRST) + BANNER DRAFT INBOUND
 # ==========================================================
 if st.session_state.slide == 1:
     st.session_state.mode_transaksi = None
+    
+    draft = st.session_state.get("inbound_draft")
+    if draft and draft.get("item"):
+        alok_draft = draft.get("alokasi_terpilih") or []
+        ringkas_rak = ", ".join(f"{a['Kolom']}-{a['Baris']}" for a in alok_draft) or "-"
+        pec_draft = f" + {draft.get('in_qty_c', 0)} {draft.get('in_tipe_c', '')}" if int(draft.get("in_qty_c") or 0) > 0 else ""
+        with st.container(border=True):
+            st.warning(
+                f"📋 **DRAFT INBOUND BELUM SELESAI** *(Disimpan {draft.get('saved_at', '')[-8:]} WIB)*\n\n"
+                f"📦 **{draft.get('item')}** | Lot: `{draft.get('in_lot')}`\n\n"
+                f"📊 Total: **{draft.get('in_qty_p', 0)} Pallet{pec_draft}** ➔ Rak **{ringkas_rak}**"
+            )
+            c_dr1, c_dr2 = st.columns([2.6, 1.4])
+            with c_dr1:
+                if st.button("➡️ LANJUT KONFIRMASI AKTUAL", type="primary", use_container_width=True, key="btn_resume_draft"):
+                    pulihkan_draft_ke_session(draft)
+                    st.rerun()
+            with c_dr2:
+                st.markdown('<div class="btn-compact">', unsafe_allow_html=True)
+                if st.button("🗑️ Hapus Draft", use_container_width=True, key="btn_del_draft"):
+                    core.hapus_draft_inbound("IN", st.session_state.operator)
+                    st.session_state.pop("_last_draft_sig", None)
+                    st.rerun()
+                st.markdown('</div>', unsafe_allow_html=True)
+        st.write("")
+
     st.markdown("### Pilih Jenis Aktivitas")
     
     st.write("")
