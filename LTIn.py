@@ -10,7 +10,6 @@ df_master = core.load_master_data()
 keys_state = [
     'slide', 'mode_transaksi', 'kategori', 'gramasi', 'item', 'pilih_part',
     'in_lot', 'in_qty_p', 'in_qty_c', 'in_tipe_c', 'in_sisi_masuk', 'in_rak_skip', 'alokasi_terpilih',
-    'ai_scan_result',
     'wip_kolom', 'wip_baris', 'wip_lot', 'wip_catatan_rak', 'wip_max_pallet', 'wip_max_dus',
     'operator', 'undo_record'
 ]
@@ -81,7 +80,7 @@ core.render_header_dan_undo(
     accent_color="#10B981",
     prefix_app="IN",
     mode_badge=mode_badge,
-    reset_keys=['mode_transaksi', 'ai_scan_result']
+    reset_keys=['mode_transaksi']
 )
 core.render_progress_bar(st.session_state.slide, st.session_state.mode_transaksi)
 
@@ -90,7 +89,6 @@ core.render_progress_bar(st.session_state.slide, st.session_state.mode_transaksi
 # ==========================================================
 if st.session_state.slide == 1:
     st.session_state.mode_transaksi = None
-    st.session_state.ai_scan_result = None
     st.markdown("### Pilih Jenis Aktivitas")
     
     st.write("")
@@ -104,7 +102,7 @@ if st.session_state.slide == 1:
         pindah_slide(2); st.rerun()
 
 # ==========================================================
-# SLIDE 2 - 4: PEMILIHAN PRODUK (SCAN AI UNTUK INBOUND / MANUAL)
+# SLIDE 2 - 4: PEMILIHAN PRODUK (KATEGORI -> GRAMASI -> ITEM)
 # ==========================================================
 elif st.session_state.slide in [2, 3, 4]:
     core.render_pemilihan_produk(df_master)
