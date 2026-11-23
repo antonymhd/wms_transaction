@@ -1339,6 +1339,7 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                             "in_qty_c": qty_c_in,
                             "in_tipe_c": satuan_c,
                             "in_sisi_masuk": sisi_masuk,
+                            "in_rak_skip": rak_skip_list,
                             "alokasi_terpilih": rencana_alokasi
                         })
                         st.session_state["_last_draft_sig"] = draft_sig
