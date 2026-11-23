@@ -223,17 +223,17 @@ def parse_keterangan(ket_str):
     return pecahan, eceran
 
 def parse_fifo_key(lot_str):
-    """Kunci pengurutan FIFO (Outbound/WIP): YYMMDD + Shift (1/2/3) + teks asli."""
+    """Kunci pengurutan kronologis FIFO murni: YYMMDD + Shift (1/2/3) agar lot tanggal & shift sama diadu berdasarkan stok terkecil."""
     s = str(lot_str).strip()
     match_shift = re.search(r'([123])(\d{2})(\d{2})(\d{2})$', s)
     if match_shift:
         sh, dd, mm, yy = match_shift.groups()
-        return f"{yy}{mm}{dd}{sh}_{s}"
+        return f"{yy}{mm}{dd}{sh}"
     match_date = re.search(r'(\d{2})(\d{2})(\d{2})$', s)
     if match_date:
         dd, mm, yy = match_date.groups()
-        return f"{yy}{mm}{dd}0_{s}"
-    return f"9999999_{s}"
+        return f"{yy}{mm}{dd}0"
+    return "9999999"
 
 def parse_lifo_rank(lot_str):
     """Skor numerik terbaru (Inbound): YYMMDD * 10 + Shift (1/2/3)."""
@@ -593,8 +593,8 @@ def cari_lokasi_stok_hibrida(semua_data, target_item):
         })
         
     df_rekap = pd.DataFrame(rekap_lokasi).sort_values(
-        by=['AksesRank', 'MinPenghalang', 'FIFO_Key'],
-        ascending=[True, True, True]
+        by=['MinPenghalang', 'FIFO_Key', 'Pallet', 'Dus', 'AksesRank', 'Lot Number', 'Kolom', 'Baris'],
+        ascending=[True, True, True, True, True, True, True, True]
     ).reset_index(drop=True)
     
     return df_rekap
