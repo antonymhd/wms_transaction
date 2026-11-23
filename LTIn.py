@@ -31,9 +31,9 @@ def pulihkan_draft_ke_session(draft):
     st.session_state.in_qty_c = int(draft.get("in_qty_c") or 0)
     st.session_state.in_tipe_c = draft.get("in_tipe_c") or "Dus"
     st.session_state.in_sisi_masuk = draft.get("in_sisi_masuk") or "BELAKANG"
-    st.session_state.in_rak_skip = []
+    st.session_state.in_rak_skip = draft.get("in_rak_skip") or []
     st.session_state.alokasi_terpilih = draft.get("alokasi_terpilih") or []
-    st.session_state.slide = 7
+    st.session_state.slide = 6
 
 # ==========================================================
 # SLIDE 0: PILIH OPERATOR BERTUGAS
