@@ -2,14 +2,8 @@ import streamlit as st
 import pandas as pd
 import math
 import re
-import io
-import difflib
 import requests
 from datetime import datetime, timedelta
-from PIL import Image
-from google import genai
-from google.genai import types
-from pydantic import BaseModel
 import firebase_admin
 from firebase_admin import credentials, firestore
 
@@ -26,8 +20,8 @@ MAX_TAIL_PALLETS_MULTI_ITEM = 10
 # Item khusus JDO Diamond (Utama: F1-16, Cadangan: G17-28)
 PART_KHUSUS_TOP_TIER = {'MJSCN3802703D', 'MJSCN3802901D'}
 
-# Item Cup khusus yang boleh diambil untuk Suplai WIP (selain seluruh Preform)
-PART_WIP_CUP = {'MJSCN3902902G', 'MJSCN3903101D', 'MJSCN3204303D', 'MJSCN3205004D'}
+# Item Cup Natural khusus yang boleh diambil untuk Suplai WIP (selain seluruh Preform & Cup Color)
+PART_WIP_CUP_NATURAL = {'MJSCN3902902G', 'MJSCN3903101D', 'MJSCN3204303D', 'MJSCN3205004D'}
 
 def is_zona_jdo(kolom, baris_int):
     k = str(kolom).strip().upper()
@@ -85,112 +79,6 @@ db = firestore.client()
 
 def get_waktu_jkt():
     return datetime.utcnow() + timedelta(hours=7)
-
-# ==========================================================
-# 1B. MODUL AI VISION: SCAN / UPLOAD FOTO LABEL PALET
-# ==========================================================
-class DataLabelInbound(BaseModel):
-    part_number: str
-    nama_produk: str
-    nomor_lot: str
-    confidence: str
-
-def kompres_gambar_label(image_bytes, max_width=1000, quality=82):
-    """Memperkecil dimensi & ukuran file foto di RAM sebelum dikirim ke Gemini API."""
-    img = Image.open(io.BytesIO(image_bytes))
-    if img.mode in ("RGBA", "P"):
-        img = img.convert("RGB")
-    w, h = img.size
-    if w > max_width:
-        new_h = int(h * (max_width / float(w)))
-        img = img.resize((max_width, new_h), Image.Resampling.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=quality, optimize=True)
-    return buf.getvalue()
-
-def baca_label_pallet_ai(image_bytes, df_master):
-    """
-    Membaca Part Number, Nama Produk, dan Nomor Lot dari foto label palet menggunakan Gemini Vision,
-    lalu mencocokkannya dengan Master_Produk.csv. Foto hanya diproses di RAM (0 byte masuk Firebase).
-    """
-    if "gemini" not in st.secrets or "api_key" not in st.secrets["gemini"]:
-        raise ValueError("Konfigurasi secrets [gemini] api_key belum dipasang di Streamlit.")
-        
-    compressed_bytes = kompres_gambar_label(image_bytes)
-    client = genai.Client(api_key=st.secrets["gemini"]["api_key"])
-    
-    prompt = """
-    Baca informasi pada label identitas palet produk manufaktur plastik/kemasan ini secara teliti:
-    1. part_number: Kode Part Number / Item Code (hilangkan spasi berlebih, huruf kapital semua). Jika tidak tercantum, isi "".
-    2. nama_produk: Nama produk lengkap beserta gramasi dan warna/varian jika tertera.
-    3. nomor_lot: Nomor Lot / Batch produksi (perhatikan dengan sangat teliti perbedaan angka 0 dan huruf O, angka 1 dan huruf I, atau angka 5 dan huruf S).
-    4. confidence: Tingkat kejelasan teks pada foto ("TINGGI", "SEDANG", atau "RENDAH").
-    """
-    
-    kandidat_model = ["gemini-3.8-flash", "gemini-2.5-flash"]
-    response = None
-    last_err = None
-    
-    for nama_model in kandidat_model:
-        try:
-            response = client.models.generate_content(
-                model=nama_model,
-                contents=[
-                    types.Part.from_bytes(data=compressed_bytes, mime_type="image/jpeg"),
-                    prompt
-                ],
-                config={
-                    "response_mime_type": "application/json",
-                    "response_schema": DataLabelInbound,
-                },
-            )
-            break
-        except Exception as e:
-            last_err = e
-            if "404" in str(e) or "NOT_FOUND" in str(e):
-                continue
-            raise e
-            
-    if response is None:
-        raise last_err
-        
-    hasil = response.parsed
-    
-    part_clean = re.sub(r'[^A-Z0-9]', '', str(hasil.part_number or "").upper())
-    nama_ai_clean = str(hasil.nama_produk or "").strip()
-    lot_clean = str(hasil.nomor_lot or "").strip().upper()
-    
-    matched_row = None
-    metode_cocok = ""
-    
-    if not df_master.empty:
-        if part_clean:
-            df_master_part = df_master['Part Number'].astype(str).apply(lambda x: re.sub(r'[^A-Z0-9]', '', x.upper()))
-            exact_matches = df_master[df_master_part == part_clean]
-            if not exact_matches.empty:
-                matched_row = exact_matches.iloc[0]
-                metode_cocok = "Part Number"
-                
-        if matched_row is None and nama_ai_clean:
-            daftar_nama = df_master['Nama Barang'].astype(str).tolist()
-            kandidat = difflib.get_close_matches(nama_ai_clean.upper(), [n.upper() for n in daftar_nama], n=1, cutoff=0.55)
-            if kandidat:
-                idx_match = [n.upper() for n in daftar_nama].index(kandidat[0])
-                matched_row = df_master.iloc[idx_match]
-                metode_cocok = "Nama Produk"
-                
-    return {
-        "matched": matched_row is not None,
-        "metode_cocok": metode_cocok,
-        "nama_barang": str(matched_row['Nama Barang']).strip() if matched_row is not None else nama_ai_clean,
-        "part_number": str(matched_row['Part Number']).strip().upper() if matched_row is not None else part_clean,
-        "kategori": str(matched_row['Kategori']).strip() if matched_row is not None else "",
-        "gramasi": str(matched_row['Gramasi']).strip() if matched_row is not None else "",
-        "nomor_lot": lot_clean,
-        "raw_part_ai": part_clean,
-        "raw_nama_ai": nama_ai_clean,
-        "confidence": str(hasil.confidence or "SEDANG").upper()
-    }
 
 # ==========================================================
 # 2. CSS ADAPTIF & KOMPONEN HEADER + PROGRESS BAR
@@ -286,7 +174,7 @@ def render_progress_bar(current_slide, mode_transaksi):
         steps = ["Pilih Rak", "Produk & Lot", "Outbound"]
         idx_map = {1: 1, 2: 2, 3: 3}
     elif mode_transaksi in ["INBOUND", "INBOUND_SISA"]:
-        steps = ["Aksi", "Kategori/Scan", "Item", "Input", "Lokasi", "Selesai"]
+        steps = ["Aksi", "Kategori", "Item", "Input", "Lokasi", "Selesai"]
         idx_map = {1: 1, 2: 2, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6}
     elif mode_transaksi in ["WIP", "OUTBOUND"]:
         steps = ["Aksi", "Kategori", "Item", "Lokasi", "Selesai"]
@@ -447,7 +335,7 @@ def get_df_master_terfilter(df_master):
     if st.session_state.get("mode_transaksi") == "WIP":
         part_clean = df_master['Part Number'].astype(str).str.strip().str.upper()
         return df_master[
-            (df_master['Kategori'].isin(['PREFORM', 'CUP COLOR'])) | (part_clean.isin(PART_WIP_CUP))
+            (df_master['Kategori'].isin(['PREFORM', 'CUP COLOR'])) | (part_clean.isin(PART_WIP_CUP_NATURAL))
         ].copy()
     return df_master
 
@@ -1125,88 +1013,12 @@ def render_pemilihan_produk(df_master):
     if st.session_state.slide == 2:
         if st.button("🔙 GANTI AKSI"):
             st.session_state.mode_transaksi = None
-            st.session_state.ai_scan_result = None
             st.session_state.slide = 1
             st.rerun()
 
-        # --- FITUR SCAN / UPLOAD FOTO LABEL PALET (KHUSUS INBOUND) ---
-        if st.session_state.get("mode_transaksi") == "INBOUND":
-            with st.container(border=True):
-                st.markdown("#### 📷 Scan / Upload Label Palet (Otomatis)")
-                st.caption("Foto atau upload gambar label palet untuk mengisi Produk & Nomor Lot secara otomatis.")
-                
-                tab_up, tab_cam = st.tabs(["📁 Upload Foto / Galeri", "📸 Jepret Kamera Langsung"])
-                foto_input = None
-                with tab_up:
-                    up_file = st.file_uploader(
-                        "Pilih file foto label (JPG/PNG)",
-                        type=["jpg", "jpeg", "png", "webp"],
-                        key="uploader_label_inbound",
-                        label_visibility="collapsed"
-                    )
-                    if up_file is not None:
-                        foto_input = up_file
-                with tab_cam:
-                    cam_file = st.camera_input(
-                        "Arahkan kamera ke label palet",
-                        key="camera_label_inbound",
-                        label_visibility="collapsed"
-                    )
-                    if cam_file is not None:
-                        foto_input = cam_file
-                        
-                if foto_input is not None:
-                    if st.button("🤖 BACA LABEL SEKARANG", type="primary", use_container_width=True, key="btn_proses_foto_ai"):
-                        with st.spinner("🔍 AI sedang membaca teks label & mencocokkan Master Data..."):
-                            try:
-                                hasil_scan = baca_label_pallet_ai(foto_input.getvalue(), df_master)
-                                st.session_state.ai_scan_result = hasil_scan
-                                st.rerun()
-                            except Exception as err:
-                                st.error(f"❌ Gagal membaca label: {err}")
-
-                scan_res = st.session_state.get("ai_scan_result")
-                if scan_res:
-                    st.divider()
-                    conf_badge = "🟢 Jelas" if scan_res["confidence"] == "TINGGI" else ("🟡 Sedang" if scan_res["confidence"] == "SEDANG" else "🔴 Kurang Jelas")
-                    if scan_res["matched"]:
-                        st.success(f"✅ **Label Terbaca ({conf_badge}):** Cocok via *{scan_res['metode_cocok']}*")
-                        st.markdown(f"📦 **Produk:** {format_nama_warna_bold(scan_res['nama_barang'])}")
-                        st.markdown(f"🔖 **Part Number:** `{scan_res['part_number']}`  |  🏷️ **No. Lot:** `{scan_res['nomor_lot'] or '-'}`")
-                        
-                        c_sc1, c_sc2 = st.columns([2.6, 1.4])
-                        with c_sc1:
-                            if st.button("➡️ LANJUT INPUT JUMLAH PALET", type="primary", use_container_width=True, key="btn_terima_scan"):
-                                st.session_state.kategori = scan_res["kategori"]
-                                st.session_state.gramasi = scan_res["gramasi"]
-                                st.session_state.item = scan_res["nama_barang"]
-                                st.session_state.pilih_part = scan_res["part_number"]
-                                if scan_res["nomor_lot"]:
-                                    st.session_state.in_lot = scan_res["nomor_lot"]
-                                st.session_state.ai_scan_result = None
-                                st.session_state.slide = 5
-                                st.rerun()
-                        with c_sc2:
-                            st.markdown('<div class="btn-compact">', unsafe_allow_html=True)
-                            if st.button("🗑️ Hapus", use_container_width=True, key="btn_reset_scan"):
-                                st.session_state.ai_scan_result = None
-                                st.rerun()
-                            st.markdown('</div>', unsafe_allow_html=True)
-                    else:
-                        st.warning(
-                            f"⚠️ **Produk belum cocok otomatis di Master Data.**\n\n"
-                            f"Hasil bacaan AI: Nama = `{scan_res['raw_nama_ai']}`, Part = `{scan_res['raw_part_ai']}`, Lot = `{scan_res['nomor_lot']}`. "
-                            f"Silakan pilih produk secara manual di bawah."
-                        )
-                        if scan_res["nomor_lot"]:
-                            st.session_state.in_lot = scan_res["nomor_lot"]
-
-            st.write("")
-            st.markdown("### Atau Pilih Kategori Produk Manual")
-        else:
-            st.markdown("### Pilih Kategori Produk")
-            if st.session_state.get("mode_transaksi") == "WIP":
-                st.caption("🏭 *Menampilkan khusus item bahan WIP (Seluruh Preform, Cup Color, & Cup Mountea/JDB).*")
+        st.markdown("### Pilih Kategori Produk")
+        if st.session_state.get("mode_transaksi") == "WIP":
+            st.caption("🏭 *Menampilkan khusus item bahan WIP (Seluruh Preform, Cup Color, & Cup Mountea/JDB).*")
 
         urutan_kategori = ["PREFORM", "CUP NATURAL", "CUP COLOR", "CUP PRINTING", "CAP"]
         kategori_ada = [k for k in urutan_kategori if k in set(df_aktif['Kategori'].unique())]
@@ -1285,8 +1097,8 @@ def render_pemilihan_produk(df_master):
 # ==========================================================
 def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="BELAKANG", jenis_log="INBOUND (Remote)", judul_tele="INBOUND - RACK NAVIGATOR", mode_undo_label="INBOUND", reset_keys=None):
     if st.session_state.slide == 5:
-        if st.button("🔙 GANTI ITEM / SCAN ULANG"):
-            st.session_state.slide = 2 if not st.session_state.get("gramasi") else 4
+        if st.button("🔙 GANTI ITEM"):
+            st.session_state.slide = 4 if st.session_state.get("gramasi") else 2
             st.rerun()
             
         st.markdown(f"### {judul_inbound}")
@@ -1301,8 +1113,65 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
         ]
         idx_default_sisi = 1 if st.session_state.get("in_sisi_masuk", default_sisi_masuk) == "DEPAN" else 0
         
+        # --- KARTU 1: SUSUN NOMOR LOT TERSTRUKTUR ---
         with st.container(border=True):
-            in_lot = st.text_input("Nomor Lot", value=st.session_state.get("in_lot") or "", placeholder="Cth: 3D3121126")
+            st.markdown("**🏷️ Susun Nomor Lot Produksi:**")
+            mode_lot_manual = st.checkbox(
+                "✏️ Input Manual (Jika format lot non-standar)",
+                value=False,
+                key=f"chk_lot_man_{prefix_app}"
+            )
+            
+            if mode_lot_manual:
+                in_lot = st.text_input(
+                    "Nomor Lot Manual",
+                    value=st.session_state.get("in_lot") or "",
+                    placeholder="Cth: 1A1231126"
+                ).strip().upper()
+            else:
+                lot_awal = str(st.session_state.get("in_lot") or "").strip().upper()
+                opsi_mesin = ["1", "2", "3", "4", "5"]
+                opsi_grup = ["A", "B", "C", "D"]
+                opsi_shift = ["1", "2", "3"]
+                
+                idx_m, idx_g, idx_s = 0, 0, 0
+                tgl_default = get_waktu_jkt().date()
+                
+                if len(lot_awal) == 9:
+                    if lot_awal[0] in opsi_mesin: idx_m = opsi_mesin.index(lot_awal[0])
+                    if lot_awal[1] in opsi_grup: idx_g = opsi_grup.index(lot_awal[1])
+                    if lot_awal[2] in opsi_shift: idx_s = opsi_shift.index(lot_awal[2])
+                    try:
+                        tgl_default = datetime.strptime(lot_awal[3:], "%d%m%y").date()
+                    except Exception:
+                        pass
+
+                c_l1, c_l2, c_l3, c_l4 = st.columns([1, 1, 1, 1.8])
+                with c_l1:
+                    sel_mesin = st.selectbox("Mesin", opsi_mesin, index=idx_m, key=f"lot_m_{prefix_app}")
+                with c_l2:
+                    sel_grup = st.selectbox("Grup", opsi_grup, index=idx_g, key=f"lot_g_{prefix_app}")
+                with c_l3:
+                    sel_shift = st.selectbox("Shift", opsi_shift, index=idx_s, key=f"lot_s_{prefix_app}")
+                with c_l4:
+                    sel_tgl = st.date_input(
+                        "Tanggal",
+                        value=tgl_default,
+                        format="DD/MM/YYYY",
+                        key=f"lot_d_{prefix_app}"
+                    )
+                    
+                in_lot = f"{sel_mesin}{sel_grup}{sel_shift}{sel_tgl.strftime('%d%m%y')}"
+                st.markdown(
+                    f"<div style='background:rgba(16,185,129,0.12); border:1px solid #10B981; "
+                    f"padding:8px 12px; border-radius:8px; text-align:center; margin-top:4px;'>"
+                    f"Hasil Nomor Lot: <span style='font-size:20px; font-weight:bold; letter-spacing:1.5px;'>{in_lot}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+
+        # --- KARTU 2: KUANTITAS & PINTU MASUK ---
+        with st.container(border=True):
             c_q1, c_q2 = st.columns(2)
             with c_q1:
                 in_qty_p = st.number_input("Berapa Pallet Utuh?", min_value=0, value=st.session_state.get("in_qty_p") if st.session_state.get("in_qty_p") is not None else 1)
@@ -1648,7 +1517,7 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                         simpan_undo_firestore(prefix_app, st.session_state.operator, backup_kolom, msg_sukses, mode_label=mode_undo_label)
                         
                         st.toast(msg_sukses, icon="✅")
-                        keys_clear = ['kategori', 'gramasi', 'item', 'pilih_part', 'mode_transaksi', 'in_lot', 'in_qty_p', 'in_qty_c', 'in_tipe_c', 'in_sisi_masuk', 'in_rak_skip', 'alokasi_terpilih', 'ai_scan_result']
+                        keys_clear = ['kategori', 'gramasi', 'item', 'pilih_part', 'mode_transaksi', 'in_lot', 'in_qty_p', 'in_qty_c', 'in_tipe_c', 'in_sisi_masuk', 'in_rak_skip', 'alokasi_terpilih']
                         if reset_keys:
                             keys_clear.extend(reset_keys)
                         for k in set(keys_clear):
