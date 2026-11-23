@@ -13,6 +13,7 @@ from firebase_admin import credentials, firestore
 NAMA_DATABASE = 'uji_coba_rak'
 DB_LOG_MUTASI = 'log_mutasi_rak'
 DB_UNDO_STATE = 'wms_undo_state'
+DB_DRAFT_INBOUND = 'wms_inbound_drafts'
 
 # Batas maksimal palet di sisi ujung pintu masuk untuk lorong >= 3 item (mencegah delay bongkar outbound)
 MAX_TAIL_PALLETS_MULTI_ITEM = 10
@@ -600,7 +601,7 @@ def cari_lokasi_stok_hibrida(semua_data, target_item):
     return df_rekap
 
 # ==========================================================
-# 5. AUDIT LOG & PERSISTENT UNDO (30 MENIT)
+# 5. AUDIT LOG, PERSISTENT UNDO & AUTO-SAVE DRAFT INBOUND
 # ==========================================================
 def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh, pecahan, eceran, keterangan=""):
     waktu_sekarang = get_waktu_jkt().strftime("%Y-%m-%d %H:%M:%S")
@@ -613,6 +614,45 @@ def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh,
     }
     try: db.collection(DB_LOG_MUTASI).add(log_data)
     except Exception: pass 
+
+def simpan_draft_inbound(prefix_app, operator_name, draft_payload):
+    """Menyimpan draft inbound ke 1 dokumen tunggal per operator agar tahan saat HP mati/terkunci."""
+    if not operator_name:
+        return
+    draft_payload["saved_at"] = get_waktu_jkt().strftime("%Y-%m-%d %H:%M:%S")
+    st.session_state.inbound_draft = draft_payload
+    try:
+        db.collection(DB_DRAFT_INBOUND).document(f"{prefix_app}_{operator_name}").set(draft_payload)
+    except Exception:
+        pass
+
+def muat_draft_inbound(prefix_app, operator_name):
+    """Memuat draft inbound terakhir milik operator (berlaku maksimal 12 jam)."""
+    if not operator_name:
+        st.session_state.inbound_draft = None
+        return
+    try:
+        doc = db.collection(DB_DRAFT_INBOUND).document(f"{prefix_app}_{operator_name}").get()
+        if doc.exists:
+            data = doc.to_dict()
+            if data and data.get("saved_at"):
+                saved_dt = datetime.strptime(data["saved_at"], "%Y-%m-%d %H:%M:%S")
+                if (get_waktu_jkt() - saved_dt) <= timedelta(hours=12):
+                    st.session_state.inbound_draft = data
+                    return
+    except Exception:
+        pass
+    st.session_state.inbound_draft = None
+
+def hapus_draft_inbound(prefix_app, operator_name):
+    """Menghapus draft inbound setelah transaksi final tersimpan atau dibatalkan operator."""
+    st.session_state.inbound_draft = None
+    if not operator_name:
+        return
+    try:
+        db.collection(DB_DRAFT_INBOUND).document(f"{prefix_app}_{operator_name}").delete()
+    except Exception:
+        pass
 
 def simpan_undo_firestore(prefix_app, operator_name, undo_dict, action_msg, mode_label):
     now_str = get_waktu_jkt().strftime("%Y-%m-%d %H:%M:%S")
@@ -675,6 +715,7 @@ def render_header_dan_undo(app_title, accent_color, prefix_app, mode_badge="", r
         if st.button("👤 Ganti\nOperator", use_container_width=True):
             st.session_state.operator = None
             st.session_state.undo_record = None
+            st.session_state.inbound_draft = None
             if reset_keys:
                 for rk in reset_keys:
                     st.session_state[rk] = None
@@ -1093,7 +1134,7 @@ def render_pemilihan_produk(df_master):
                 st.rerun()
 
 # ==========================================================
-# 8. MODUL UI INBOUND MULTI-RAK TERPADU (SLIDE 5 -> 6 -> 7)
+# 8. MODUL UI INBOUND MULTI-RAK TERPADU + AUTO-SAVE DRAFT
 # ==========================================================
 def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="BELAKANG", jenis_log="INBOUND (Remote)", judul_tele="INBOUND - RACK NAVIGATOR", mode_undo_label="INBOUND", reset_keys=None):
     if st.session_state.slide == 5:
@@ -1283,6 +1324,27 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                                 'SisaSlot': int(row['SisaSlot'])
                             })
                             
+                    # --- AUTO-SAVE DRAFT OTOMATIS (HEMAT KUOTA: HANYA TULIS SAAT ISI BERUBAH) ---
+                    draft_sig = f"{st.session_state.item}|{lot_aktif}|{qty_p_in}|{qty_c_in}|{sisi_masuk}|" + ",".join(
+                        f"{x['Kolom']}-{x['Baris']}:{x['qty_p']}:{x['qty_c']}" for x in rencana_alokasi
+                    )
+                    if st.session_state.get("_last_draft_sig") != draft_sig:
+                        simpan_draft_inbound(prefix_app, st.session_state.operator, {
+                            "kategori": st.session_state.get("kategori") or "",
+                            "gramasi": st.session_state.get("gramasi") or "",
+                            "item": st.session_state.item,
+                            "pilih_part": part_aktif,
+                            "in_lot": lot_aktif,
+                            "in_qty_p": qty_p_in,
+                            "in_qty_c": qty_c_in,
+                            "in_tipe_c": satuan_c,
+                            "in_sisi_masuk": sisi_masuk,
+                            "alokasi_terpilih": rencana_alokasi
+                        })
+                        st.session_state["_last_draft_sig"] = draft_sig
+
+                    st.info("💾 **Draft tersimpan otomatis.** Layar HP/tablet aman dimatikan selama proses muat ke rak.")
+
                     for i_alok, al in enumerate(rencana_alokasi, 1):
                         loc_str = f"{al['Kolom']}-{al['Baris']}"
                         teks_pec = f" + {al['qty_c']} {satuan_c}" if al['qty_c'] > 0 else ""
@@ -1511,6 +1573,10 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                         if catatan_operator.strip():
                             pesan_tele += f"📝 <b>Catatan:</b> <i>{escape_html(catatan_operator.strip())}</i>\n"
                         kirim_notif_telegram(pesan_tele)
+                        
+                        # Hapus draft aktif dari Firestore karena sudah selesai diinput
+                        hapus_draft_inbound(prefix_app, st.session_state.operator)
+                        st.session_state.pop("_last_draft_sig", None)
                         
                         get_all_racking_data.clear()
                         msg_sukses = f"{total_p_aktual} Pallet{pecahan_tele} masuk ke {lokasi_gabungan} ({sisi_str})."
