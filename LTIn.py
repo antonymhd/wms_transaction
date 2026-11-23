@@ -121,7 +121,7 @@ if st.session_state.slide == 1:
             )
             c_dr1, c_dr2 = st.columns([2.6, 1.4])
             with c_dr1:
-                if st.button("➡️ LANJUT KONFIRMASI AKTUAL", type="primary", use_container_width=True, key="btn_resume_draft"):
+                if st.button("➡️ LANJUTKAN DRAFT INBOUND", type="primary", use_container_width=True, key="btn_resume_draft"):
                     pulihkan_draft_ke_session(draft)
                     st.rerun()
             with c_dr2:
