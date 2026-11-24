@@ -173,6 +173,38 @@ def hitung_konversi_mutasi_pcs(df_master, part_num, awal_p, awal_d, awal_pcs, si
         return None, None, None, -1
     return diff_p, diff_d, diff_ec, 0
 
+def hitung_ulang_pcs_log(df_log, df_master):
+    """Menghitung ulang Total Pcs mutasi secara dinamis berdasarkan Master_Produk.csv terbaru."""
+    if df_log.empty:
+        return df_log
+
+    pcs_recalc_list = []
+    selisih_info_list = []
+
+    for _, row in df_log.iterrows():
+        pn = clean_str(row.get('Part Number')).upper()
+        m_pallet = float(pd.to_numeric(row.get('Mutasi Pallet', 0), errors='coerce') or 0)
+        m_pecahan = float(pd.to_numeric(row.get('Mutasi Pecahan (Dus/Sak)', 0), errors='coerce') or 0)
+        m_eceran_lama = float(pd.to_numeric(row.get('Mutasi Eceran (Pcs)', 0), errors='coerce') or 0)
+
+        isi_pallet, pcs_per_satuan = get_master_konversi(df_master, pn)
+
+        if isi_pallet > 0 and (m_pallet != 0 or m_pecahan != 0):
+            pcs_baru = int(round((m_pallet * isi_pallet) + (m_pecahan * pcs_per_satuan)))
+            pcs_recalc_list.append(pcs_baru)
+
+            if m_eceran_lama > 0 and int(round(m_eceran_lama)) != pcs_baru:
+                selisih_info_list.append(f"Master Baru (Lama: {int(round(m_eceran_lama)):,})")
+            else:
+                selisih_info_list.append("Sesuai Master")
+        else:
+            pcs_recalc_list.append(int(round(m_eceran_lama)))
+            selisih_info_list.append("Eceran / Non-Master")
+
+    df_log['Total Pcs (Master Terbaru)'] = pcs_recalc_list
+    df_log['Status Konversi'] = selisih_info_list
+    return df_log
+
 def tentukan_arus_log(jenis_transaksi):
     """Menentukan kategori arus stok standar (MASUK / KELUAR / PINDAH / KOREKSI)."""
     jt = clean_str(jenis_transaksi).upper()
@@ -841,11 +873,14 @@ with tab1:
                         fresh_snapshot, total_inbound_slots, final_data_in = tx_inbound(db.transaction(), doc_ref_in)
                         record_doc_size(doc_name_in, final_data_in)
 
+                        isi_p, pcs_s = get_master_konversi(df_master, in_part_clean)
+                        tot_in_pcs = ((in_qty * isi_p) + (in_pecahan * pcs_s) + in_eceran) if isi_p > 0 else in_eceran
+
                         sisi_lbl = "Push-Back (Depan)" if in_dari_depan else "Normal (Belakang)"
                         det_in = f"Masuk Rak {k_pilih}-{b_pilih} | Sisi: {sisi_lbl}" + (f" | Catatan: {in_cat_final}" if in_cat_final else "")
                         catat_log_mutasi(
                             "INBOUND (Admin)", k_pilih, b_pilih, in_produk_clean, in_part_clean, in_lot_final,
-                            in_qty, in_pecahan, in_eceran,
+                            in_qty, in_pecahan, tot_in_pcs,
                             keterangan=det_in,
                             tujuan_kategori="INBOUND PRODUKSI",
                             detail_sistem=det_in
@@ -1195,11 +1230,11 @@ with tab3:
                 st.warning("Database kosong.")
 
 # ----------------------------------------------------------
-# TAB 4: LAPORAN MUTASI & PEMBERSIHAN LOG LAMA
+# TAB 4: LAPORAN MUTASI (DINAMIS MASTER TERBARU) & BERSIH LOG
 # ----------------------------------------------------------
 with tab4:
     st.header("📊 Laporan Riwayat Mutasi")
-    st.caption("Pilih rentang tanggal agar penarikan log tetap ringan dan hemat kuota Firebase Read.")
+    st.caption("Total Pcs otomatis dihitung ulang mengikuti Master_Produk.csv terbaru tanpa membebani kuota Write Firebase.")
 
     hari_ini_jkt = get_waktu_jkt().date()
     c_tgl1, c_tgl2 = st.columns(2)
@@ -1208,8 +1243,23 @@ with tab4:
     with c_tgl2:
         tgl_selesai = st.date_input("Sampai Tanggal", value=hari_ini_jkt, min_value=tgl_mulai, max_value=hari_ini_jkt)
 
+    c_opt1, c_opt2 = st.columns(2)
+    with c_opt1:
+        tampilkan_ket_gabungan = st.checkbox(
+            "Tampilkan kolom 'Keterangan' gabungan (untuk arsip lama)",
+            value=False,
+            key="chk_show_ket_gabungan"
+        )
+    with c_opt2:
+        filter_arus = st.multiselect(
+            "Filter Arus Transaksi (Opsional):",
+            options=["MASUK", "KELUAR", "PINDAH", "KOREKSI"],
+            default=[],
+            key="filter_arus_log"
+        )
+
     if st.button("Racik Laporan Mutasi Sekarang", type="primary"):
-        with st.spinner("Menarik data log mutasi..."):
+        with st.spinner("Menarik data log mutasi & menyesuaikan konversi Master..."):
             try:
                 start_utc = datetime.combine(tgl_mulai, datetime.min.time(), tzinfo=timezone.utc) - timedelta(hours=7)
                 end_utc = datetime.combine(tgl_selesai, datetime.max.time(), tzinfo=timezone.utc) - timedelta(hours=7)
@@ -1226,16 +1276,20 @@ with tab4:
 
                 if log_list:
                     df_log = pd.DataFrame(log_list)
-                    # Lengkapi kolom baru secara otomatis untuk data log lama yang belum memilikinya
+                    df_master_log = load_master_produk()
+                    df_log = hitung_ulang_pcs_log(df_log, df_master_log)
+
+                    # Lengkapi kolom baru secara otomatis untuk data log lama
                     if 'Arus' not in df_log.columns and 'Jenis Transaksi' in df_log.columns:
                         df_log['Arus'] = df_log['Jenis Transaksi'].apply(tentukan_arus_log)
                     else:
-                        df_log['Arus'] = df_log['Arus'].fillna('').apply(
-                            lambda x: x if clean_str(x) else ""
-                        )
+                        df_log['Arus'] = df_log['Arus'].fillna('').apply(clean_str)
                         mask_empty_arus = df_log['Arus'] == ""
                         if mask_empty_arus.any() and 'Jenis Transaksi' in df_log.columns:
                             df_log.loc[mask_empty_arus, 'Arus'] = df_log.loc[mask_empty_arus, 'Jenis Transaksi'].apply(tentukan_arus_log)
+
+                    if filter_arus:
+                        df_log = df_log[df_log['Arus'].isin(filter_arus)]
 
                     if 'Tujuan / Kategori' not in df_log.columns:
                         df_log['Tujuan / Kategori'] = df_log.get('Keterangan', '').apply(clean_str)
@@ -1247,20 +1301,26 @@ with tab4:
                     else:
                         df_log['Detail Sistem'] = df_log['Detail Sistem'].apply(clean_str)
 
-                    avail_cols = [
-                        c for c in [
-                            "Waktu Transaksi", "Arus", "Jenis Transaksi", "Lokasi Rak",
-                            "Part Number", "Nama Produk", "No Lot",
-                            "Mutasi Pallet", "Mutasi Pecahan (Dus/Sak)", "Mutasi Eceran (Pcs)",
-                            "Tujuan / Kategori", "Detail Sistem", "Keterangan"
-                        ] if c in df_log.columns
+                    target_cols = [
+                        "Waktu Transaksi", "Arus", "Jenis Transaksi", "Lokasi Rak",
+                        "Part Number", "Nama Produk", "No Lot",
+                        "Mutasi Pallet", "Mutasi Pecahan (Dus/Sak)",
+                        "Total Pcs (Master Terbaru)", "Status Konversi",
+                        "Tujuan / Kategori", "Detail Sistem"
                     ]
+                    if tampilkan_ket_gabungan:
+                        target_cols.append("Keterangan")
+
+                    avail_cols = [c for c in target_cols if c in df_log.columns]
                     df_log = df_log[avail_cols]
 
-                    st.dataframe(df_log, hide_index=True, use_container_width=True, height=280)
+                    jml_recalc = int((df_log['Status Konversi'].str.startswith("Master Baru")).sum()) if 'Status Konversi' in df_log.columns else 0
+                    st.dataframe(df_log, hide_index=True, use_container_width=True, height=300)
+
                     csv_log_buffer = io.StringIO()
                     df_log.to_csv(csv_log_buffer, index=False, sep=";")
-                    st.success(f"✅ Ditemukan {len(df_log)} catatan mutasi ({len(log_docs)} Reads).")
+                    info_recalc = f" | **{jml_recalc} baris** disesuaikan dengan Master terbaru" if jml_recalc > 0 else ""
+                    st.success(f"✅ Ditemukan **{len(df_log)}** catatan mutasi ({len(log_docs)} Reads){info_recalc}.")
                     st.download_button(
                         label="⬇️ Unduh Laporan Mutasi",
                         data=csv_log_buffer.getvalue(),
@@ -1499,6 +1559,7 @@ with tab7:
         baris_asal_data = get_baris_records(all_asal_data, ab, only_valid=True)
 
         if baris_asal_data:
+            df_master_relok = load_master_produk()
             rekap_relok = [
                 {
                     'Group_Key': g['Group_Key'],
@@ -1642,11 +1703,14 @@ with tab7:
                                     'Catatan': catatan_baru, 'Approval QC': qc_awal
                                 })
 
+                            isi_p, pcs_s = get_master_konversi(df_master_relok, part_num)
+                            tot_pindah_pcs = ((pindah_utuh * isi_p) + (pindah_dus * pcs_s) + pindah_pcs) if isi_p > 0 else pindah_pcs
+
                             jenis_log = f"RELOKASI{' (Push-Back)' if relok_dari_depan else ''}"
                             rute_relok = f"{ak}-{ab} -> {tk}-{tb}"
                             logs_to_write.append((
                                 jenis_log, rute_relok, "NONE", nama_prod, part_num, l,
-                                pindah_utuh, pindah_dus, pindah_pcs,
+                                pindah_utuh, pindah_dus, tot_pindah_pcs,
                                 f"Pindah ke {tk}-{tb}", f"Pindah ke {tk}-{tb}",
                                 f"Asal: {ak}-{ab} | Tujuan: {tk}-{tb}"
                             ))
