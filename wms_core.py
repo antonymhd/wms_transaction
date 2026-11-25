@@ -14,6 +14,7 @@ NAMA_DATABASE = 'uji_coba_rak'
 DB_LOG_MUTASI = 'log_mutasi_rak'
 DB_UNDO_STATE = 'wms_undo_state'
 DB_DRAFT_INBOUND = 'wms_inbound_drafts'
+DB_QC_APPROVAL = 'wms_qc_approval'
 
 # Batas maksimal palet di sisi ujung pintu masuk untuk lorong >= 3 item (mencegah delay bongkar outbound)
 MAX_TAIL_PALLETS_MULTI_ITEM = 10
@@ -174,6 +175,12 @@ def render_progress_bar(current_slide, mode_transaksi):
     if mode_transaksi == "STAGING":
         steps = ["Pilih Rak", "Produk & Lot", "Outbound"]
         idx_map = {1: 1, 2: 2, 3: 3}
+    elif mode_transaksi == "QC":
+        steps = ["Kategori", "Gramasi", "Item", "Approval Lot"]
+        idx_map = {2: 1, 3: 2, 4: 3, 5: 4}
+    elif mode_transaksi == "OUTBOUND_QC":
+        steps = ["Kategori", "Gramasi", "Item", "Rak Approved", "Staging"]
+        idx_map = {2: 1, 3: 2, 4: 3, 5: 4, 6: 5}
     elif mode_transaksi in ["INBOUND", "INBOUND_SISA"]:
         steps = ["Aksi", "Kategori", "Item", "Input", "Lokasi", "Selesai"]
         idx_map = {1: 1, 2: 2, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6}
@@ -286,7 +293,7 @@ def hitung_blok_ujung(pallets_sorted, target_item_clean, sisi_masuk):
     return count
 
 # ==========================================================
-# 4. DATA LOADERS & ALGORITMA PENEMPATAN / PENGAMBILAN
+# 4. DATA LOADERS, APPROVAL QC & ALGORITMA PENEMPATAN / PENGAMBILAN
 # ==========================================================
 @st.cache_data(ttl=300)
 def get_all_racking_data():
@@ -296,6 +303,92 @@ def get_all_racking_data():
         doc_data = doc.to_dict()
         if 'data' in doc_data: semua_data.extend(doc_data['data'])
     return semua_data
+
+@st.cache_data(ttl=120)
+def get_qc_approval_map():
+    """Membaca peta master Approval QC per Part_Lot dari 1 dokumen tunggal (super hemat kuota)."""
+    try:
+        doc = db.collection(DB_QC_APPROVAL).document("status_lot").get()
+        if doc.exists:
+            return doc.to_dict().get("lots", {})
+    except Exception:
+        pass
+    return {}
+
+def make_qc_lot_key(part_num, lot_num):
+    return f"{str(part_num).strip().upper()}_{str(lot_num).strip().upper()}"
+
+def get_status_qc_lot(qc_map, part_num, lot_num, fallback_col_val=""):
+    """Mengambil dict info QC untuk kombinasi Part Number + Lot Number."""
+    key = make_qc_lot_key(part_num, lot_num)
+    if key in qc_map:
+        return qc_map[key]
+    fb = str(fallback_col_val or "").strip().upper()
+    if fb.startswith("APPROVED"):
+        return {"status": "APPROVED", "qc_by": "-", "waktu": "-", "catatan": ""}
+    elif fb.startswith("HOLD"):
+        return {"status": "HOLD", "qc_by": "-", "waktu": "-", "catatan": ""}
+    return {"status": "PENDING", "qc_by": "-", "waktu": "-", "catatan": ""}
+
+def simpan_approval_qc_lot(part_num, item_name, lot_num, status_baru, qc_by, catatan_qc=""):
+    """
+    Menyimpan status approval QC ke dokumen master 'wms_qc_approval/status_lot'
+    sekaligus memperbarui kolom baru 'Approval QC' di seluruh dokumen rak terkait.
+    """
+    part_clean = str(part_num).strip().upper()
+    lot_clean = str(lot_num).strip().upper()
+    key = make_qc_lot_key(part_clean, lot_clean)
+    waktu_str = get_waktu_jkt().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # 1. Update Peta Master Approval QC (1 Dokumen Tunggal)
+    doc_qc_ref = db.collection(DB_QC_APPROVAL).document("status_lot")
+    snap_qc = doc_qc_ref.get()
+    lots_dict = snap_qc.to_dict().get("lots", {}) if snap_qc.exists else {}
+    
+    if status_baru == "PENDING":
+        lots_dict.pop(key, None)
+        label_kolom_rak = ""
+    else:
+        lots_dict[key] = {
+            "status": status_baru,
+            "part_num": part_clean,
+            "item_name": str(item_name).strip(),
+            "lot_num": lot_clean,
+            "qc_by": qc_by,
+            "waktu": waktu_str,
+            "catatan": str(catatan_qc).strip()
+        }
+        label_kolom_rak = f"{status_baru} ({qc_by} | {waktu_str[5:16]})"
+        if str(catatan_qc).strip():
+            label_kolom_rak += f" - {str(catatan_qc).strip()}"
+            
+    doc_qc_ref.set({"lots": lots_dict, "updated_at": waktu_str})
+    
+    # 2. Sinkronkan kolom 'Approval QC' ke dokumen rak (Kolom_A s.d. Kolom_G & Kolom_S) yang memiliki lot ini
+    batch = db.batch()
+    kolom_terupdate = []
+    docs_rak = db.collection(NAMA_DATABASE).stream()
+    for doc in docs_rak:
+        d_dict = doc.to_dict()
+        arr = d_dict.get("data", [])
+        changed = False
+        for row in arr:
+            r_part = str(row.get("Part Number", "")).strip().upper()
+            r_lot = str(row.get("Lot Number", "")).strip().upper()
+            if r_part == part_clean and r_lot == lot_clean:
+                if row.get("Approval QC", "") != label_kolom_rak:
+                    row["Approval QC"] = label_kolom_rak
+                    changed = True
+        if changed:
+            batch.update(doc.reference, {"data": arr})
+            kolom_terupdate.append(doc.id.replace("Kolom_", ""))
+            
+    if kolom_terupdate:
+        batch.commit()
+        
+    get_qc_approval_map.clear()
+    get_all_racking_data.clear()
+    return kolom_terupdate, label_kolom_rak
 
 @st.cache_data(ttl=3600)
 def load_master_data():
@@ -408,7 +501,6 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="B
         if len(distinct_items) >= 2 and target_item_clean not in distinct_items:
             continue
             
-        # Priority 1: Lorong 1 Item Sejenis (Murni)
         if target_item_clean in distinct_items and len(distinct_items) == 1:
             prio = 1
             lot_ujung = (
@@ -425,7 +517,6 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="B
             isi_eksisting = f"{jml_sejenis} Pallet ({info_lot})"
             sub_sort = (lot_match_pen, -newest_rank, -used_cap)
             
-        # Priority 2: Lorong 2 Item (Ujung Pintu Masuk Sejenis)
         elif target_item_clean in distinct_items and len(distinct_items) == 2:
             item_ujung = (
                 str(pallets_sorted[0].get('Nama Produk', '')).strip()
@@ -444,14 +535,12 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="B
             isi_eksisting = f"{jml_sejenis}P sejenis + {len(pallets_sorted)-jml_sejenis}P {nama_ringkas}"
             sub_sort = (0 if sama_lot else 1, -newest_rank, -used_cap)
             
-        # Priority 3: Lorong Kosong
         elif len(distinct_items) == 0:
             prio = 3
             status = "⚪ Lorong Kosong"
             isi_eksisting = f"Kosong (Kapasitas {max_target} Pallet)"
             sub_sort = (0, 0, 0.0)
             
-        # Priority 4: Lorong >= 3 Item (Ujung Sejenis + Batas Maksimal Penumpukan Ujung)
         elif target_item_clean in distinct_items and len(distinct_items) >= 3:
             item_ujung = (
                 str(pallets_sorted[0].get('Nama Produk', '')).strip()
@@ -474,7 +563,6 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="B
             isi_eksisting = f"{len(distinct_items)} item campur | Ujung {sisi_masuk.lower()}: {blok_ujung}P sejenis"
             sub_sort = (0 if sama_lot else 1, -newest_rank, blok_ujung)
             
-        # Priority 5: Campur Baru (Lorong 1 Item Lain -> Menjadi Maksimal 2 Item)
         elif len(distinct_items) == 1 and target_item_clean not in distinct_items:
             prio = 5
             status = "🟡 Campur (Max 2 Item)"
@@ -501,14 +589,20 @@ def hitung_kandidat_rak_inbound(semua_data, target_item, part_num, sisi_masuk="B
         ascending=[True, True, True, True, True]
     ).reset_index(drop=True)
 
-def cari_lokasi_stok_hibrida(semua_data, target_item):
+def cari_lokasi_stok_hibrida(semua_data, target_item, exclude_staging=False):
     if not semua_data:
         return pd.DataFrame()
         
     df_all = pd.DataFrame(semua_data)
+    if exclude_staging:
+        df_all = df_all[df_all['Kolom'].astype(str).str.strip().str.upper() != 'S'].copy()
+        
     df_all['Baris_Int'] = pd.to_numeric(df_all['Baris'], errors='coerce').fillna(0).astype(int)
     df_all['Pallet_Ke_Num'] = pd.to_numeric(df_all['Pallet Ke'], errors='coerce').fillna(0)
     df_all['Catatan'] = df_all['Catatan'].fillna("").astype(str).replace('nan', '')
+    if 'Approval QC' not in df_all.columns:
+        df_all['Approval QC'] = ""
+    df_all['Approval QC'] = df_all['Approval QC'].fillna("").astype(str).replace('nan', '')
     
     df_target = df_all[
         (df_all['Nama Produk'] == target_item) & 
@@ -530,6 +624,7 @@ def cari_lokasi_stok_hibrida(semua_data, target_item):
         bar = int(df_group.iloc[0]['Baris_Int'])
         lot = str(df_group.iloc[0]['Lot Number'])
         catatan = str(df_group.iloc[0]['Catatan'])
+        app_qc_col = str(df_group.iloc[0]['Approval QC'])
         part_num = str(df_group.iloc[0]['Part Number'])
         satuan_str = get_satuan_kemasan(part_num)
         
@@ -586,6 +681,7 @@ def cari_lokasi_stok_hibrida(semua_data, target_item):
             'Dus': jml_dus,
             'Satuan': satuan_str,
             'Catatan': catatan,
+            'Approval QC': app_qc_col,
             'Part': part_num,
             'AksesRank': akses_rank,
             'MinPenghalang': min_penghalang,
@@ -599,6 +695,32 @@ def cari_lokasi_stok_hibrida(semua_data, target_item):
     ).reset_index(drop=True)
     
     return df_rekap
+
+def cari_lokasi_stok_outbound_qc(semua_data, target_item, qc_map):
+    """
+    Khusus LTOut2: menyaring lokasi stok di rak (A-G) dan melampirkan status Approval QC per Lot.
+    Mengembalikan tuple: (df_approved, df_locked)
+    """
+    df_all_loc = cari_lokasi_stok_hibrida(semua_data, target_item, exclude_staging=True)
+    if df_all_loc.empty:
+        return pd.DataFrame(), pd.DataFrame()
+        
+    qc_statuses = []
+    qc_bys = []
+    qc_notes = []
+    for _, row in df_all_loc.iterrows():
+        info = get_status_qc_lot(qc_map, row['Part'], row['Lot Number'], row.get('Approval QC', ''))
+        qc_statuses.append(info.get("status", "PENDING"))
+        qc_bys.append(info.get("qc_by", "-"))
+        qc_notes.append(info.get("catatan", ""))
+        
+    df_all_loc['QC_Status'] = qc_statuses
+    df_all_loc['QC_By'] = qc_bys
+    df_all_loc['QC_Catatan'] = qc_notes
+    
+    df_approved = df_all_loc[df_all_loc['QC_Status'] == 'APPROVED'].reset_index(drop=True)
+    df_locked = df_all_loc[df_all_loc['QC_Status'] != 'APPROVED'].reset_index(drop=True)
+    return df_approved, df_locked
 
 # ==========================================================
 # 5. AUDIT LOG, PERSISTENT UNDO & AUTO-SAVE DRAFT INBOUND
@@ -616,7 +738,6 @@ def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh,
     except Exception: pass 
 
 def simpan_draft_inbound(prefix_app, operator_name, draft_payload):
-    """Menyimpan draft inbound ke 1 dokumen tunggal per operator agar tahan saat HP mati/terkunci."""
     if not operator_name:
         return
     draft_payload["saved_at"] = get_waktu_jkt().strftime("%Y-%m-%d %H:%M:%S")
@@ -627,7 +748,6 @@ def simpan_draft_inbound(prefix_app, operator_name, draft_payload):
         pass
 
 def muat_draft_inbound(prefix_app, operator_name):
-    """Memuat draft inbound terakhir milik operator (berlaku maksimal 12 jam)."""
     if not operator_name:
         st.session_state.inbound_draft = None
         return
@@ -645,7 +765,6 @@ def muat_draft_inbound(prefix_app, operator_name):
     st.session_state.inbound_draft = None
 
 def hapus_draft_inbound(prefix_app, operator_name):
-    """Menghapus draft inbound setelah transaksi final tersimpan atau dibatalkan operator."""
     st.session_state.inbound_draft = None
     if not operator_name:
         return
@@ -690,7 +809,7 @@ def tutup_undo_firestore(prefix_app, operator_name, new_status="CLOSED"):
     except Exception:
         pass
 
-def render_header_dan_undo(app_title, accent_color, prefix_app, mode_badge="", reset_keys=None):
+def render_header_dan_undo(app_title, accent_color, prefix_app, mode_badge="", reset_keys=None, show_undo=True):
     col_hdr, col_sync, col_op = st.columns([2.6, 1.2, 1.2])
     with col_hdr:
         st.markdown(f"""
@@ -705,9 +824,10 @@ def render_header_dan_undo(app_title, accent_color, prefix_app, mode_badge="", r
         """, unsafe_allow_html=True)
     with col_sync:
         st.markdown('<div class="btn-header-action">', unsafe_allow_html=True)
-        if st.button("🔄 Sinkronkan\nStok", use_container_width=True, help="Muat ulang data rak terbaru dari server"):
+        if st.button("🔄 Sinkronkan\nStok", use_container_width=True, help="Muat ulang data rak & status QC terbaru"):
             get_all_racking_data.clear()
-            st.toast("Data stok rak berhasil disinkronkan!", icon="🔄")
+            get_qc_approval_map.clear()
+            st.toast("Data rak & QC berhasil disinkronkan!", icon="🔄")
             st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
     with col_op:
@@ -722,6 +842,9 @@ def render_header_dan_undo(app_title, accent_color, prefix_app, mode_badge="", r
             st.session_state.slide = 0
             st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
+
+    if not show_undo:
+        return
 
     undo_rec = st.session_state.get("undo_record")
     if undo_rec and undo_rec.get("status") == "DONE":
@@ -780,7 +903,7 @@ def render_header_dan_undo(app_title, accent_color, prefix_app, mode_badge="", r
 # 6. TRANSAKSI ATOMIK FIREBASE (INBOUND, WIP & OUTBOUND STAGING)
 # ==========================================================
 @firestore.transactional
-def proses_inbound_multi_transaction(transaction, doc_refs_dict, alokasi_list, lot_pilih, part_num, item_name, tipe_pecahan, catatan, sisi_masuk="BELAKANG"):
+def proses_inbound_multi_transaction(transaction, doc_refs_dict, alokasi_list, lot_pilih, part_num, item_name, tipe_pecahan, catatan, sisi_masuk="BELAKANG", approval_qc=""):
     snapshots = {kol: ref.get(transaction=transaction) for kol, ref in doc_refs_dict.items()}
     backup_kolom = {}
     data_per_kolom = {}
@@ -844,7 +967,7 @@ def proses_inbound_multi_transaction(transaction, doc_refs_dict, alokasi_list, l
             pallets_baru.append({
                 'Kolom': k_pilih, 'Baris': b_pilih,
                 'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
-                'Keterangan': 'Utuh', 'Catatan': catatan,
+                'Keterangan': 'Utuh', 'Catatan': catatan, 'Approval QC': approval_qc,
                 'Pallet Ke': float(i + 1)
             })
             
@@ -852,7 +975,7 @@ def proses_inbound_multi_transaction(transaction, doc_refs_dict, alokasi_list, l
             pallets_baru.append({
                 'Kolom': k_pilih, 'Baris': b_pilih,
                 'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
-                'Keterangan': f"Pecahan: {qty_c} {tipe_pecahan}", 'Catatan': catatan,
+                'Keterangan': f"Pecahan: {qty_c} {tipe_pecahan}", 'Catatan': catatan, 'Approval QC': approval_qc,
                 'Pallet Ke': float(qty_p + 1)
             })
             
@@ -892,6 +1015,7 @@ def proses_pengambilan_stok(transaction, doc_ref, k_pilih, b_pilih, lot_pilih, p
     lot_records = [d for d in rak_ini if str(d.get('Lot Number', '')) == lot_pilih and str(d.get('Nama Produk', '')) == item_name]
     db_utuh = sum(1 for d in lot_records if 'pecahan' not in str(d.get('Keterangan', '')).lower() and 'eceran' not in str(d.get('Keterangan', '')).lower())
     db_dus = sum(parse_keterangan(d.get('Keterangan', ''))[0] for d in lot_records if 'pecahan' in str(d.get('Keterangan', '')).lower() or 'eceran' in str(d.get('Keterangan', '')).lower())
+    app_qc_lama = str(lot_records[0].get('Approval QC', '')) if lot_records else ""
     
     if db_utuh != init_pallet or db_dus != init_dus:
         raise ValueError(f"Stok di database baru saja berubah ({db_utuh} Pallet, {db_dus} {satuan_kemasan}). Silakan tekan 'Sinkronkan Stok'.")
@@ -906,14 +1030,14 @@ def proses_pengambilan_stok(transaction, doc_ref, k_pilih, b_pilih, lot_pilih, p
         records_baru.append({
             'Kolom': k_pilih, 'Baris': float(b_pilih),
             'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
-            'Keterangan': 'Utuh', 'Catatan': catatan_lama, 'Pallet Ke': 0.0
+            'Keterangan': 'Utuh', 'Catatan': catatan_lama, 'Approval QC': app_qc_lama, 'Pallet Ke': 0.0
         })
         
     if final_dus > 0:
         records_baru.append({
             'Kolom': k_pilih, 'Baris': float(b_pilih),
             'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
-            'Keterangan': f"Pecahan: {final_dus} {satuan_kemasan}", 'Catatan': catatan_lama, 'Pallet Ke': 0.0
+            'Keterangan': f"Pecahan: {final_dus} {satuan_kemasan}", 'Catatan': catatan_lama, 'Approval QC': app_qc_lama, 'Pallet Ke': 0.0
         })
         
     updated_rak_ini = []
@@ -972,6 +1096,7 @@ def proses_turun_ke_staging(
         parse_keterangan(d.get('Keterangan', ''))[0] for d in lot_records
         if 'pecahan' in str(d.get('Keterangan', '')).lower() or 'eceran' in str(d.get('Keterangan', '')).lower()
     )
+    app_qc_lama = str(lot_records[0].get('Approval QC', '')) if lot_records else ""
     
     if db_utuh != init_pallet or db_dus != init_dus:
         raise ValueError(
@@ -990,13 +1115,13 @@ def proses_turun_ke_staging(
         sisa_records_asal.append({
             'Kolom': k_pilih, 'Baris': float(b_pilih),
             'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
-            'Keterangan': 'Utuh', 'Catatan': catatan_rak_lama, 'Pallet Ke': 0.0
+            'Keterangan': 'Utuh', 'Catatan': catatan_rak_lama, 'Approval QC': app_qc_lama, 'Pallet Ke': 0.0
         })
     if final_dus > 0:
         sisa_records_asal.append({
             'Kolom': k_pilih, 'Baris': float(b_pilih),
             'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
-            'Keterangan': f"Pecahan: {final_dus} {satuan_kemasan}", 'Catatan': catatan_rak_lama, 'Pallet Ke': 0.0
+            'Keterangan': f"Pecahan: {final_dus} {satuan_kemasan}", 'Catatan': catatan_rak_lama, 'Approval QC': app_qc_lama, 'Pallet Ke': 0.0
         })
         
     updated_rak_asal = []
@@ -1024,13 +1149,13 @@ def proses_turun_ke_staging(
         pallets_ke_staging.append({
             'Kolom': 'S', 'Baris': 1.0,
             'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
-            'Keterangan': 'Utuh', 'Catatan': catatan_staging, 'Pallet Ke': 0.0
+            'Keterangan': 'Utuh', 'Catatan': catatan_staging, 'Approval QC': app_qc_lama, 'Pallet Ke': 0.0
         })
     if turun_dus > 0:
         pallets_ke_staging.append({
             'Kolom': 'S', 'Baris': 1.0,
             'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
-            'Keterangan': f"Pecahan: {turun_dus} {satuan_kemasan}", 'Catatan': catatan_staging, 'Pallet Ke': 0.0
+            'Keterangan': f"Pecahan: {turun_dus} {satuan_kemasan}", 'Catatan': catatan_staging, 'Approval QC': app_qc_lama, 'Pallet Ke': 0.0
         })
         
     gabungan_s1 = staging_s1 + pallets_ke_staging
@@ -1048,14 +1173,15 @@ def proses_turun_ke_staging(
 # ==========================================================
 # 7. MODUL PEMILIHAN PRODUK TERPADU (SLIDE 2 -> 3 -> 4)
 # ==========================================================
-def render_pemilihan_produk(df_master):
+def render_pemilihan_produk(df_master, allow_back_to_slide1=True):
     df_aktif = get_df_master_terfilter(df_master)
     
     if st.session_state.slide == 2:
-        if st.button("🔙 GANTI AKSI"):
-            st.session_state.mode_transaksi = None
-            st.session_state.slide = 1
-            st.rerun()
+        if allow_back_to_slide1:
+            if st.button("🔙 GANTI AKSI"):
+                st.session_state.mode_transaksi = None
+                st.session_state.slide = 1
+                st.rerun()
 
         st.markdown("### Pilih Kategori Produk")
         if st.session_state.get("mode_transaksi") == "WIP":
@@ -1154,7 +1280,6 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
         ]
         idx_default_sisi = 1 if st.session_state.get("in_sisi_masuk", default_sisi_masuk) == "DEPAN" else 0
         
-        # --- KARTU 1: SUSUN NOMOR LOT TERSTRUKTUR ---
         with st.container(border=True):
             st.markdown("**🏷️ Susun Nomor Lot Produksi:**")
             mode_lot_manual = st.checkbox(
@@ -1211,7 +1336,6 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                     unsafe_allow_html=True
                 )
 
-        # --- KARTU 2: KUANTITAS & PINTU MASUK ---
         with st.container(border=True):
             c_q1, c_q2 = st.columns(2)
             with c_q1:
@@ -1324,7 +1448,6 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                                 'SisaSlot': int(row['SisaSlot'])
                             })
                             
-                    # --- AUTO-SAVE DRAFT OTOMATIS (HEMAT KUOTA: HANYA TULIS SAAT ISI BERUBAH) ---
                     draft_sig = f"{st.session_state.item}|{lot_aktif}|{qty_p_in}|{qty_c_in}|{sisi_masuk}|" + ",".join(
                         f"{x['Kolom']}-{x['Baris']}:{x['qty_p']}:{x['qty_c']}" for x in rencana_alokasi
                     )
@@ -1387,22 +1510,6 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                         st.session_state.alokasi_terpilih = rencana_alokasi
                         st.session_state.slide = 7
                         st.rerun()
-
-        st.write("")
-        with st.expander("ℹ️ Aturan Zonasi & Urutan Rekomendasi Rak", expanded=False):
-            st.markdown(f"""
-**Zonasi Area (Otomatis Melimpah Jika Zona Utama Penuh):**
-* **Preform:** Diutamakan **Baris 1–16**, jika penuh otomatis melimpah ke **Baris 17–28**.
-* **Cup:** Diutamakan **Baris 17–28**, jika penuh otomatis melimpah ke **Baris 1–16**.
-* **JDO Diamond:** Diutamakan **Kolom F (Baris 1–16)**, jika penuh dialihkan ke **Kolom G (Baris 17–28)**.
-
-**Urutan Pemilihan Lorong di Dalam Zona:**
-1. **Lorong 1 Item Sejenis:** Melanjutkan lot yang sama atau lot/shift terbaru sampai penuh.
-2. **Lorong 2 Item:** Melanjutkan item sejenis yang berada di ujung pintu masuk (`Belakang` / `Depan`).
-3. **Lorong Kosong:** Membuka lorong kosong baru agar stok utama tetap murni 1 item.
-4. **Lorong ≥3 Item (Penampung Sisa):** Menampung sisa palet di ujung yang sejenis (maksimal **{MAX_TAIL_PALLETS_MULTI_ITEM} palet** di ujung agar bongkar *outbound* tidak terhambat).
-5. **Campur Baru (Max 2 Item):** Menggabung ke lorong yang baru berisi 1 item lain sebagai pilihan terakhir.
-            """)
 
     elif st.session_state.slide == 7:
         if st.button("🔙 BATAL (UBAH ALOKASI)"):
@@ -1532,6 +1639,13 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
         else:
             if st.button("📥 MASUKKAN KE DATABASE SEKARANG", type="primary", use_container_width=True):
                 with st.spinner("Memasukkan data aktual ke rak..."):
+                    # Cek otomatis apakah lot ini sudah pernah di-approve QC sebelumnya
+                    qc_map = get_qc_approval_map()
+                    qc_info_lot = get_status_qc_lot(qc_map, st.session_state.pilih_part, lot_aktif)
+                    label_qc_awal = ""
+                    if qc_info_lot.get("status") in ["APPROVED", "HOLD"]:
+                        label_qc_awal = f"{qc_info_lot['status']} ({qc_info_lot.get('qc_by', '-')})"
+
                     kolom_unik = sorted(list(set(al['Kolom'] for al in alokasi_valid)))
                     doc_refs_dict = {kol: db.collection(NAMA_DATABASE).document(f"Kolom_{kol}") for kol in kolom_unik}
                     transaction = db.transaction()
@@ -1540,7 +1654,7 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                         backup_kolom = proses_inbound_multi_transaction(
                             transaction, doc_refs_dict, alokasi_valid,
                             lot_aktif, st.session_state.pilih_part, st.session_state.item,
-                            satuan_c, catatan_operator, sisi_masuk=sisi_masuk
+                            satuan_c, catatan_operator, sisi_masuk=sisi_masuk, approval_qc=label_qc_awal
                         )
                         
                         teks_keterangan = f"Op: {st.session_state.operator} | Sisi: {sisi_str}"
@@ -1575,7 +1689,6 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                             pesan_tele += f"📝 <b>Catatan:</b> <i>{escape_html(catatan_operator.strip())}</i>\n"
                         kirim_notif_telegram(pesan_tele)
                         
-                        # Hapus draft aktif dari Firestore karena sudah selesai diinput
                         hapus_draft_inbound(prefix_app, st.session_state.operator)
                         st.session_state.pop("_last_draft_sig", None)
                         
