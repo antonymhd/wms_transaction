@@ -25,7 +25,6 @@ DEFAULT_SESSION_STATE = {
     'form_reset_counter': 0,
     'in_lokasi_dicari': False, 'in_k_pilih': "A", 'in_b_pilih': 1,
     'out_lokasi_dicari': False, 'out_k_pilih': "A", 'out_b_pilih': 1,
-    'book_lokasi_dicari': False, 'book_k_pilih': "A", 'book_b_pilih': 1,
     'relok_dicari': False, 'relok_ak': "A", 'relok_ab': 1,
     'kor_dicari': False, 'kor_k': "A", 'kor_b': 1,
     'print_rak_cache': {},
@@ -103,9 +102,9 @@ def is_same_baris(d, baris_num):
     return float(d.get('Baris', 0) or 0) == float(baris_num)
 
 def get_baris_records(data_list, baris_num, only_valid=True):
-    """Menyaring record pada satu nomor baris tertentu."""
+    """Menyaring salinan record pada satu nomor baris tertentu secara aman."""
     return [
-        d for d in data_list
+        copy.deepcopy(d) for d in data_list
         if is_same_baris(d, baris_num) and (not only_valid or is_valid_item(d))
     ]
 
@@ -421,7 +420,10 @@ def summarize_lot_groups(baris_records):
     return groups
 
 def apply_slot_reduction(records_list, baris_num, g_key, sisa_utuh, sisa_dus, sisa_pcs, catatan_tambahan=""):
-    """Mengurangi slot dari baris rak (untuk Outbound maupun Relokasi) dan memperbarui pecahan/catatan."""
+    """
+    Mengurangi slot dari baris rak secara immutable (tanpa mutasi in-place)
+    dan memperbarui pecahan serta catatan hanya pada palet yang tersisa.
+    """
     df_lot = pd.DataFrame([
         d for d in records_list
         if match_g_key(d, g_key) and is_same_baris(d, baris_num) and is_valid_item(d)
@@ -443,7 +445,8 @@ def apply_slot_reduction(records_list, baris_num, g_key, sisa_utuh, sisa_dus, si
     max_sisa_pallet = sisa_pallets['Pallet Ke'].max() if not sisa_pallets.empty else None
 
     updated_records = []
-    for d in records_list:
+    for orig_d in records_list:
+        d = copy.deepcopy(orig_d)
         if match_g_key(d, g_key) and is_same_baris(d, baris_num):
             p_val = pd.to_numeric(d.get('Pallet Ke', 0))
             if p_val in pallets_to_remove:
@@ -480,7 +483,9 @@ def get_max_slot(kolom_id, baris_num, records_baris, extra_part=""):
 def update_bayangan_baris(records_baris, kolom_id, baris_num):
     """Mengevaluasi ulang indeks Pallet Ke (1..N), sanitasi string, dan tag [BAYANGAN - OVERCAPACITY]."""
     max_slot = get_max_slot(kolom_id, baris_num, records_baris)
-    for idx, item in enumerate(records_baris, start=1):
+    result = []
+    for idx, orig_item in enumerate(records_baris, start=1):
+        item = copy.deepcopy(orig_item)
         item['Pallet Ke'] = float(idx)
         item['Keterangan'] = clean_str(item.get('Keterangan'))
         item['Approval QC'] = clean_str(item.get('Approval QC'))
@@ -491,7 +496,8 @@ def update_bayangan_baris(records_baris, kolom_id, baris_num):
             item['Catatan'] = cat_lama.replace("[BAYANGAN - OVERCAPACITY]", "").strip()
         else:
             item['Catatan'] = cat_lama
-    return records_baris
+        result.append(item)
+    return result
 
 def hitung_ukuran_firestore(val):
     """Menghitung estimasi ukuran byte sesuai aturan resmi penyimpanan Cloud Firestore."""
@@ -524,14 +530,14 @@ def fetch_kolom_cached(kolom_id, state_key, force_refresh=False):
         doc_name = f"Kolom_{kolom_id}"
         doc = db.collection(NAMA_DATABASE).document(doc_name).get()
         log_fb_usage('read', 1)
-        data_list = doc.to_dict().get('data', []) if doc.exists else []
+        data_list = copy.deepcopy(doc.to_dict().get('data', [])) if doc.exists else []
         record_doc_size(doc_name, data_list)
         st.session_state[state_key] = data_list
     return st.session_state[state_key]
 
 def clear_all_rak_caches():
     """Membersihkan seluruh cache lokal rak setiap kali ada mutasi tersimpan."""
-    for k in ['cache_in_data', 'cache_out_data', 'cache_book_data', 'cache_relok_asal', 'cache_kor_data']:
+    for k in ['cache_in_data', 'cache_out_data', 'cache_relok_asal', 'cache_kor_data']:
         st.session_state[k] = None
     st.session_state['print_rak_cache'] = {}
     st.session_state['print_ready'] = False
@@ -678,18 +684,19 @@ st.caption(f"Alat khusus PPIC. Terhubung ke database: {NAMA_DATABASE}")
 if st.session_state['action_status'] in ['DONE', 'DONE_NO_UNDO']:
     st.toast(f"Berhasil: {st.session_state['action_msg']}", icon="✅")
 
-if st.session_state['action_status'] == 'DONE':
+if st.session_state['action_status'] == 'DONE' and st.session_state.get('undo_dict'):
     with st.container(border=True):
         st.success(f"✅ **Sukses:** {st.session_state['action_msg']}")
         c1, c2, c3 = st.columns([2, 1, 1])
         with c1:
-            st.caption("Jika terjadi kesalahan input, Anda bisa membatalkan aksi terakhir ini.")
+            st.caption("Jika terjadi kesalahan input, Anda bisa mengembalikan stok dan atribut rak ke kondisi persis sebelum aksi ini.")
         with c2:
             if st.button("🔙 UNDO AKSI INI", type="primary", use_container_width=True):
-                with st.spinner("Memulihkan data..."):
+                with st.spinner("Memulihkan data ke kondisi semula..."):
+                    snapshot_restore = copy.deepcopy(st.session_state['undo_dict'])
                     batch_undo = db.batch()
                     kolom_terdampak = []
-                    for kol, dat in st.session_state['undo_dict'].items():
+                    for kol, dat in snapshot_restore.items():
                         doc_name = f"Kolom_{kol}"
                         batch_undo.set(db.collection(NAMA_DATABASE).document(doc_name), {'data': dat})
                         record_doc_size(doc_name, dat)
@@ -697,6 +704,7 @@ if st.session_state['action_status'] == 'DONE':
                     batch_undo.commit()
                     log_fb_usage('write', len(kolom_terdampak))
                     clear_all_rak_caches()
+                    st.session_state['undo_dict'] = {}
                     st.session_state['action_status'] = 'UNDONE'
                     catat_log_mutasi(
                         "PEMBATALAN (UNDO)", ",".join(kolom_terdampak), "ALL",
@@ -708,6 +716,7 @@ if st.session_state['action_status'] == 'DONE':
                     st.rerun()
         with c3:
             if st.button("Tutup & Lanjut Input", use_container_width=True):
+                st.session_state['undo_dict'] = {}
                 st.session_state['action_status'] = None
                 st.rerun()
 
@@ -720,18 +729,18 @@ elif st.session_state['action_status'] == 'DONE_NO_UNDO':
 
 elif st.session_state['action_status'] == 'UNDONE':
     with st.container(border=True):
-        st.warning("⏪ **Berhasil dibatalkan.** Data telah kembali seperti semula.")
+        st.warning("⏪ **Berhasil dibatalkan.** Stok, pecahan dus/sak, dan catatan telah kembali persis seperti semula.")
         if st.button("Tutup Pesan", use_container_width=True):
             st.session_state['action_status'] = None
             st.rerun()
 
 # ==========================================================
-# 8. TABS MENU UTAMA
+# 8. TABS MENU UTAMA (8 TAB OPERASIONAL)
 # ==========================================================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "📥 1. Inbound", "📤 2. Outbound", "⚙️ 3. Audit & Backup",
-    "📊 4. Log Mutasi", "🚀 5. Sync CSV", "📅 6. Jadwal", "🔄 7. Relokasi",
-    "✏️ 8. Koreksi", "🖨️ 9. Cetak Racking"
+    "📊 4. Log Mutasi", "🚀 5. Sync CSV", "🔄 6. Relokasi",
+    "✏️ 7. Koreksi", "🖨️ 8. Cetak Racking"
 ])
 
 # ----------------------------------------------------------
@@ -819,10 +828,11 @@ with tab1:
                         def tx_inbound(transaction, doc_ref):
                             snap = doc_ref.get(transaction=transaction)
                             log_fb_usage('read', 1)
-                            fresh_raw = snap.to_dict().get('data', []) if snap.exists else []
+                            fresh_raw = copy.deepcopy(snap.to_dict().get('data', [])) if snap.exists else []
+                            working_raw = copy.deepcopy(fresh_raw)
 
                             all_data = [
-                                d for d in fresh_raw
+                                d for d in working_raw
                                 if not (is_same_baris(d, b_pilih) and not is_valid_item(d))
                             ]
                             baris_data_actual = get_baris_records(all_data, b_pilih, only_valid=False)
@@ -888,7 +898,7 @@ with tab1:
                         clear_all_rak_caches()
 
                         st.session_state.update({
-                            'undo_dict': {k_pilih: fresh_snapshot},
+                            'undo_dict': {k_pilih: copy.deepcopy(fresh_snapshot)},
                             'action_msg': f"Inbound {total_inbound_slots} Slot '{in_produk_clean}' ke Rak {k_pilih}-{b_pilih} {'(Push-back)' if in_dari_depan else ''}",
                             'action_status': 'DONE',
                             'kor_dicari': False,
@@ -898,7 +908,7 @@ with tab1:
                         st.rerun()
 
 # ----------------------------------------------------------
-# TAB 2: OUTBOUND MULTI-LOT (ANTI-MINUS + TUJUAN TERSTRUKTUR)
+# TAB 2: OUTBOUND MULTI-LOT (ANTI-MINUS + UNDO SNAPSHOT AMAN)
 # ----------------------------------------------------------
 with tab2:
     st.header("Penyesuaian Sisa Stok (Outbound Massal)")
@@ -982,14 +992,15 @@ with tab2:
                 def tx_outbound(transaction, doc_ref):
                     snap = doc_ref.get(transaction=transaction)
                     log_fb_usage('read', 1)
-                    fresh_out_data = snap.to_dict().get('data', []) if snap.exists else []
+                    fresh_out_data = copy.deepcopy(snap.to_dict().get('data', [])) if snap.exists else []
+                    working_out_data = copy.deepcopy(fresh_out_data)
 
                     has_changes = False
                     error_msg = ""
                     logs_to_write = []
 
-                    data_rak_ini = get_baris_records(fresh_out_data, b_pilih, only_valid=True)
-                    data_rak_lain = [d for d in fresh_out_data if not is_same_baris(d, b_pilih)]
+                    data_rak_ini = get_baris_records(working_out_data, b_pilih, only_valid=True)
+                    data_rak_lain = [d for d in working_out_data if not is_same_baris(d, b_pilih)]
 
                     for _, row in edited_df.iterrows():
                         g_key = str(row['Group_Key'])
@@ -1000,12 +1011,20 @@ with tab2:
                         kat_keluar = clean_str(row['Kategori']) or "OUT"
                         teks_tujuan = clean_str(row['Tujuan / Alasan'])
 
-                        if sisa_utuh != awal_utuh or sisa_dus != awal_dus or sisa_pcs != awal_pcs or teks_tujuan != "":
+                        angka_berubah = (sisa_utuh != awal_utuh or sisa_dus != awal_dus or sisa_pcs != awal_pcs)
+                        if not angka_berubah and teks_tujuan != "":
+                            error_msg = f"⚠️ Lot {l}: Anda mengisi tujuan '{teks_tujuan}' tetapi angka sisa stok belum diubah."
+                            break
+
+                        if angka_berubah:
                             kel_p, kel_d, kel_pcs, diff_pcs = hitung_konversi_mutasi_pcs(
                                 df_master_out, pn, awal_utuh, awal_dus, awal_pcs, sisa_utuh, sisa_dus, sisa_pcs
                             )
                             if diff_pcs == -1:
                                 error_msg = f"❌ Total stok sisa Lot {l} lebih besar dari stok awal! Gunakan Tab Inbound untuk menambah stok."
+                                break
+                            if kel_p == 0 and kel_d == 0 and kel_pcs == 0:
+                                error_msg = f"⚠️ Lot {l}: Nilai akhir setara dengan stok awal (selisih 0 Pcs)."
                                 break
 
                             has_changes = True
@@ -1070,7 +1089,7 @@ with tab2:
                         catat_log_mutasi(*lg)
                     clear_all_rak_caches()
                     st.session_state.update({
-                        'undo_dict': {k_pilih: fresh_snapshot},
+                        'undo_dict': {k_pilih: copy.deepcopy(fresh_snapshot)},
                         'action_msg': f"Penyesuaian Outbound Massal di Rak {k_pilih}-{b_pilih}",
                         'action_status': 'DONE',
                         'kor_dicari': False,
@@ -1279,7 +1298,6 @@ with tab4:
                     df_master_log = load_master_produk()
                     df_log = hitung_ulang_pcs_log(df_log, df_master_log)
 
-                    # Lengkapi kolom baru secara otomatis untuk data log lama
                     if 'Arus' not in df_log.columns and 'Jenis Transaksi' in df_log.columns:
                         df_log['Arus'] = df_log['Jenis Transaksi'].apply(tentukan_arus_log)
                     else:
@@ -1438,101 +1456,9 @@ with tab5:
                     st.error(f"Terjadi kesalahan saat memproses CSV: {e}")
 
 # ----------------------------------------------------------
-# TAB 6: PENJADWALAN KIRIM (BOOKING)
+# TAB 6: RELOKASI RAK (PUSH-BACK & ROTASI LORONG SAMA)
 # ----------------------------------------------------------
 with tab6:
-    st.header("📅 Penjadwalan Pengiriman (Booking Pallet)")
-
-    col_b1, col_b2 = st.columns([1, 2])
-    with col_b1:
-        st.markdown("**1. Pilih Lokasi Rak**")
-        book_kolom = st.selectbox("Lokasi Kolom", KOLOM_OPTIONS, key="book_kolom_3").split(" ")[0]
-        book_baris = st.number_input("Nomor Baris (Booking)", min_value=1, max_value=29, value=1, key="book_baris_3")
-        if st.button("🔍 Cari Data Rak (Booking)", use_container_width=True):
-            st.session_state.update({'book_lokasi_dicari': True, 'book_k_pilih': book_kolom, 'book_b_pilih': book_baris})
-            fetch_kolom_cached(book_kolom, 'cache_book_data', force_refresh=True)
-
-    with col_b2:
-        if st.session_state['book_lokasi_dicari']:
-            k_pilih, b_pilih = st.session_state['book_k_pilih'], st.session_state['book_b_pilih']
-            all_book_data = fetch_kolom_cached(k_pilih, 'cache_book_data', force_refresh=False)
-            baris_book_data = get_baris_records(all_book_data, b_pilih, only_valid=True)
-
-            if baris_book_data:
-                df_book = pd.DataFrame(baris_book_data)
-                df_book['Pallet Ke'] = pd.to_numeric(df_book['Pallet Ke'], errors='coerce')
-                df_book['Catatan'] = df_book['Catatan'].apply(clean_str) if 'Catatan' in df_book.columns else ""
-                df_book['Lot Number'] = df_book['Lot Number'].apply(clean_str)
-                df_book['Nama Produk'] = df_book['Nama Produk'].apply(clean_str)
-
-                tersedia_lot = []
-                mapping_lot = {}
-                for _, row in df_book.drop_duplicates(subset=['Lot Number', 'Nama Produk', 'Catatan']).iterrows():
-                    l, c = row['Lot Number'], row['Catatan']
-                    lb = f"{row['Nama Produk']} (Lot: {l})" + (f" - {c}" if c else "")
-                    tersedia_lot.append(lb)
-                    mapping_lot[lb] = (l, c)
-
-                st.markdown(f"**2. Pilih Produk & Lot untuk di-Booking di {k_pilih}-{b_pilih}**")
-                pilihan_label = st.selectbox("🎯 Pilih Produk:", tersedia_lot, key="book_lot")
-                pilih_lot, pilih_cat = mapping_lot[pilihan_label]
-
-                df_lot = df_book[(df_book['Lot Number'] == pilih_lot) & (df_book['Catatan'] == pilih_cat)].sort_values('Pallet Ke', ascending=True)
-                df_belum_book = df_lot[~df_lot['Catatan'].str.contains('BOOKED', case=False, na=False)]
-                qty_tersedia = len(df_belum_book)
-
-                st.markdown(f"**📦 Tersedia untuk di-Booking: `{qty_tersedia}` Slot Fisik**")
-                kolom_tersedia = [c for c in ['Pallet Ke', 'Part Number', 'Lot Number', 'Catatan', 'Approval QC'] if c in df_lot.columns]
-                st.dataframe(df_lot[kolom_tersedia], hide_index=True, height=150)
-
-                if qty_tersedia > 0:
-                    book_qty = st.number_input("Jumlah Pallet UTUH yang akan di-Booking", min_value=1, max_value=qty_tersedia, step=1, value=qty_tersedia)
-                    book_do = st.text_input("📝 Terjadwal Untuk (Cth: DO-123 / Tgl 28)")
-
-                    if st.button("🔒 Kunci / Booking Pallet Sekarang", type="primary", use_container_width=True):
-                        if not clean_str(book_do):
-                            st.error("❌ Keterangan jadwal wajib diisi!")
-                        else:
-                            with st.spinner("Menyematkan label booking (Transactional Lock)..."):
-                                doc_name_book = f"Kolom_{k_pilih}"
-                                doc_ref_book = db.collection(NAMA_DATABASE).document(doc_name_book)
-                                pallets_to_book = df_belum_book['Pallet Ke'].head(book_qty).tolist()
-
-                                @firestore.transactional
-                                def tx_booking(transaction, doc_ref):
-                                    snap = doc_ref.get(transaction=transaction)
-                                    log_fb_usage('read', 1)
-                                    fresh_book = snap.to_dict().get('data', []) if snap.exists else []
-                                    new_all_book_data = []
-                                    for d in fresh_book:
-                                        p_val = pd.to_numeric(d.get('Pallet Ke', 0))
-                                        if is_same_baris(d, b_pilih) and p_val in pallets_to_book:
-                                            cat_lama = clean_str(d.get('Catatan'))
-                                            if 'BOOKED' not in cat_lama.upper():
-                                                d['Catatan'] = f"[BOOKED: {clean_str(book_do)}] {cat_lama}".strip()
-                                        new_all_book_data.append(d)
-                                    transaction.set(doc_ref, {'data': new_all_book_data})
-                                    log_fb_usage('write', 1)
-                                    return fresh_book, new_all_book_data
-
-                                fresh_snapshot, final_data_book = tx_booking(db.transaction(), doc_ref_book)
-                                record_doc_size(doc_name_book, final_data_book)
-                                clear_all_rak_caches()
-                                st.session_state.update({
-                                    'undo_dict': {k_pilih: fresh_snapshot},
-                                    'action_msg': f"Booking {book_qty} Pallet Lot '{pilih_lot}' untuk '{clean_str(book_do)}'",
-                                    'action_status': 'DONE'
-                                })
-                                st.rerun()
-                else:
-                    st.warning("⚠️ Semua pallet pada Lot ini sudah ter-booking.")
-            else:
-                st.info("Rak Kosong.")
-
-# ----------------------------------------------------------
-# TAB 7: RELOKASI RAK (PUSH-BACK & ROTASI LORONG SAMA)
-# ----------------------------------------------------------
-with tab7:
     st.header("🔄 Relokasi Pallet (Pindah Rak / Rotasi Push-Back)")
     st.caption("Pindahkan item antar rak secara presisi (Pallet, Dus, Pcs), atau tarik Lot ke posisi terdepan (Pallet Ke-1) dengan mode Push-Back.")
 
@@ -1624,14 +1550,14 @@ with tab7:
                     def tx_relokasi(transaction):
                         snap_asal = doc_ref_asal.get(transaction=transaction)
                         log_fb_usage('read', 1)
-                        fresh_asal = snap_asal.to_dict().get('data', []) if snap_asal.exists else []
+                        fresh_asal = copy.deepcopy(snap_asal.to_dict().get('data', [])) if snap_asal.exists else []
 
                         if ak != tk:
                             snap_tuj = doc_ref_tuj.get(transaction=transaction)
                             log_fb_usage('read', 1)
-                            fresh_tuj = snap_tuj.to_dict().get('data', []) if snap_tuj.exists else []
+                            fresh_tuj = copy.deepcopy(snap_tuj.to_dict().get('data', [])) if snap_tuj.exists else []
                         else:
-                            fresh_tuj = fresh_asal
+                            fresh_tuj = copy.deepcopy(fresh_asal)
 
                         has_changes = False
                         error_msg = ""
@@ -1640,9 +1566,9 @@ with tab7:
                         data_rak_asal = copy.deepcopy(fresh_asal)
                         data_rak_tujuan = data_rak_asal if ak == tk else copy.deepcopy(fresh_tuj)
 
-                        undo_dict_setup = {ak: fresh_asal}
+                        undo_dict_setup = {ak: copy.deepcopy(fresh_asal)}
                         if ak != tk:
-                            undo_dict_setup[tk] = fresh_tuj
+                            undo_dict_setup[tk] = copy.deepcopy(fresh_tuj)
 
                         all_moved_records = []
 
@@ -1769,7 +1695,7 @@ with tab7:
                         clear_all_rak_caches()
                         mode_txt = " (Push-Back ke Depan)" if relok_dari_depan else ""
                         st.session_state.update({
-                            'undo_dict': undo_dict_setup,
+                            'undo_dict': copy.deepcopy(undo_dict_setup),
                             'action_msg': f"Berhasil memindahkan item dari Rak {ak}-{ab} ke {tk}-{tb}{mode_txt}",
                             'action_status': 'DONE',
                             'relok_dicari': False,
@@ -1783,9 +1709,9 @@ with tab7:
             st.session_state['relok_dicari'] = False
 
 # ----------------------------------------------------------
-# TAB 8: KOREKSI DATA (EDIT LANGSUNG + AUDIT DETAIL PER SLOT)
+# TAB 7: KOREKSI DATA (EDIT LANGSUNG + AUDIT DETAIL PER SLOT)
 # ----------------------------------------------------------
-with tab8:
+with tab7:
     st.header("✏️ Koreksi Data Rak (Manual Edit)")
     st.caption("Gunakan tab ini untuk memperbaiki kesalahan input seperti salah Tipe Produk, salah No Lot, salah Part Number, atau tag Catatan secara instan.")
 
@@ -1825,7 +1751,7 @@ with tab8:
                 'Lot Number': st.column_config.TextColumn("Lot Number", required=True),
                 'Nama Produk': st.column_config.TextColumn("Nama Produk", required=True),
                 'Keterangan': st.column_config.TextColumn("Keterangan (Dus/Pcs)"),
-                'Catatan': st.column_config.TextColumn("Catatan / Booking Tag"),
+                'Catatan': st.column_config.TextColumn("Catatan / Tag"),
                 'Approval QC': st.column_config.TextColumn("Approval QC")
             }
 
@@ -1859,7 +1785,7 @@ with tab8:
                         def tx_koreksi(transaction, doc_ref):
                             snap = doc_ref.get(transaction=transaction)
                             log_fb_usage('read', 1)
-                            fresh_kor = snap.to_dict().get('data', []) if snap.exists else []
+                            fresh_kor = copy.deepcopy(snap.to_dict().get('data', [])) if snap.exists else []
                             lain_kor_fresh = [d for d in fresh_kor if not is_same_baris(d, kb)]
                             final_kolom_data = lain_kor_fresh + new_baris_data
                             transaction.set(doc_ref, {'data': final_kolom_data})
@@ -1903,7 +1829,7 @@ with tab8:
 
                         clear_all_rak_caches()
                         st.session_state.update({
-                            'undo_dict': {kk: fresh_snapshot},
+                            'undo_dict': {kk: copy.deepcopy(fresh_snapshot)},
                             'action_msg': f"Koreksi data di Rak {kk}-{kb} berhasil disimpan.",
                             'action_status': 'DONE'
                         })
@@ -1914,9 +1840,9 @@ with tab8:
             st.info("Rak Kosong, tidak ada yang bisa dikoreksi.")
 
 # ----------------------------------------------------------
-# TAB 9: CETAK RACKING / PICKING LIST (1A - 29G)
+# TAB 8: CETAK RACKING / PICKING LIST (1A - 29G)
 # ----------------------------------------------------------
-with tab9:
+with tab8:
     st.header("🖨️ Cetak Kartu Racking / Petunjuk Pengambilan (1A – 29G)")
     st.caption("Hemat kuota: sistem hanya membaca dokumen kolom dari lokasi yang dipilih dan menyimpannya di cache sesi.")
 
