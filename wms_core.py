@@ -14,6 +14,7 @@ NAMA_DATABASE = 'uji_coba_rak'
 DB_LOG_MUTASI = 'log_mutasi_rak'
 DB_UNDO_STATE = 'wms_undo_state'
 DB_DRAFT_INBOUND = 'wms_inbound_drafts'
+DB_DRAFT_OUTBOUND = 'wms_outbound_drafts'
 DB_QC_APPROVAL = 'wms_qc_approval'
 
 # Batas maksimal palet di sisi ujung pintu masuk untuk lorong >= 3 item (mencegah delay bongkar outbound)
@@ -81,6 +82,12 @@ db = firestore.client()
 
 def get_waktu_jkt():
     return datetime.utcnow() + timedelta(hours=7)
+
+def clean_str(val):
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return ""
+    s = str(val).strip()
+    return "" if s.lower() in ["nan", "none", "<na>"] else s
 
 # ==========================================================
 # 2. CSS ADAPTIF & KOMPONEN HEADER + PROGRESS BAR
@@ -176,8 +183,11 @@ def render_progress_bar(current_slide, mode_transaksi):
         steps = ["Pilih Rak", "Produk & Lot", "Outbound"]
         idx_map = {1: 1, 2: 2, 3: 3}
     elif mode_transaksi == "QC":
-        steps = ["Kategori", "Gramasi", "Item", "Approval Lot"]
-        idx_map = {2: 1, 3: 2, 4: 3, 5: 4}
+        steps = ["Jadwal & Customer", "Approval Lot"]
+        idx_map = {1: 1, 2: 2}
+    elif mode_transaksi == "OUTBOUND_PLOT":
+        steps = ["Jadwal & Customer", "Turun ke Staging", "Selesai"]
+        idx_map = {1: 1, 2: 2, 3: 3}
     elif mode_transaksi == "OUTBOUND_QC":
         steps = ["Kategori", "Gramasi", "Item", "Rak Approved", "Staging"]
         idx_map = {2: 1, 3: 2, 4: 3, 5: 4, 6: 5}
@@ -231,7 +241,7 @@ def parse_keterangan(ket_str):
     return pecahan, eceran
 
 def parse_fifo_key(lot_str):
-    """Kunci pengurutan kronologis FIFO murni: YYMMDD + Shift (1/2/3) agar lot tanggal & shift sama diadu berdasarkan stok terkecil."""
+    """Kunci pengurutan kronologis FIFO murni: YYMMDD + Shift (1/2/3)."""
     s = str(lot_str).strip()
     match_shift = re.search(r'([123])(\d{2})(\d{2})(\d{2})$', s)
     if match_shift:
@@ -255,6 +265,12 @@ def parse_lifo_rank(lot_str):
         dd, mm, yy = match_date.groups()
         return int(f"{yy}{mm}{dd}0")
     return 0
+
+def parse_tgl_kirim_sort(tgl_str):
+    try:
+        return datetime.strptime(clean_str(tgl_str), "%d-%m-%Y")
+    except Exception:
+        return datetime(2099, 12, 31)
 
 def get_satuan_kemasan(part_num):
     p = str(part_num).strip().upper()
@@ -319,28 +335,28 @@ def make_qc_lot_key(part_num, lot_num):
     return f"{str(part_num).strip().upper()}_{str(lot_num).strip().upper()}"
 
 def get_status_qc_lot(qc_map, part_num, lot_num, fallback_col_val=""):
-    """Mengambil dict info QC untuk kombinasi Part Number + Lot Number."""
+    """Mengambil dict info QC untuk kombinasi Part Number + Lot Number (prioritas kolom slot jika ada)."""
+    fb = clean_str(fallback_col_val).upper()
+    if fb.startswith("APPROVED"):
+        return {"status": "APPROVED", "qc_by": "-", "waktu": "-", "catatan": fallback_col_val}
+    elif fb.startswith("HOLD"):
+        return {"status": "HOLD", "qc_by": "-", "waktu": "-", "catatan": fallback_col_val}
+
     key = make_qc_lot_key(part_num, lot_num)
     if key in qc_map:
         return qc_map[key]
-    fb = str(fallback_col_val or "").strip().upper()
-    if fb.startswith("APPROVED"):
-        return {"status": "APPROVED", "qc_by": "-", "waktu": "-", "catatan": ""}
-    elif fb.startswith("HOLD"):
-        return {"status": "HOLD", "qc_by": "-", "waktu": "-", "catatan": ""}
     return {"status": "PENDING", "qc_by": "-", "waktu": "-", "catatan": ""}
 
 def simpan_approval_qc_lot(part_num, item_name, lot_num, status_baru, qc_by, catatan_qc=""):
     """
     Menyimpan status approval QC ke dokumen master 'wms_qc_approval/status_lot'
-    sekaligus memperbarui kolom baru 'Approval QC' di seluruh dokumen rak terkait.
+    sekaligus memperbarui kolom 'Approval QC' di seluruh dokumen rak terkait.
     """
     part_clean = str(part_num).strip().upper()
     lot_clean = str(lot_num).strip().upper()
     key = make_qc_lot_key(part_clean, lot_clean)
     waktu_str = get_waktu_jkt().strftime("%Y-%m-%d %H:%M:%S")
     
-    # 1. Update Peta Master Approval QC (1 Dokumen Tunggal)
     doc_qc_ref = db.collection(DB_QC_APPROVAL).document("status_lot")
     snap_qc = doc_qc_ref.get()
     lots_dict = snap_qc.to_dict().get("lots", {}) if snap_qc.exists else {}
@@ -364,7 +380,6 @@ def simpan_approval_qc_lot(part_num, item_name, lot_num, status_baru, qc_by, cat
             
     doc_qc_ref.set({"lots": lots_dict, "updated_at": waktu_str})
     
-    # 2. Sinkronkan kolom 'Approval QC' ke dokumen rak (Kolom_A s.d. Kolom_G & Kolom_S) yang memiliki lot ini
     batch = db.batch()
     kolom_terupdate = []
     docs_rak = db.collection(NAMA_DATABASE).stream()
@@ -389,6 +404,83 @@ def simpan_approval_qc_lot(part_num, item_name, lot_num, status_baru, qc_by, cat
     get_qc_approval_map.clear()
     get_all_racking_data.clear()
     return kolom_terupdate, label_kolom_rak
+
+def update_qc_slot_terplot(jadwal_kirim, target_penerima, part_num, lot_num, status_qc, operator_qc, catatan_qc=""):
+    """
+    Memperbarui atribut Approval QC khusus pada slot-slot yang ter-plot untuk
+    (Jadwal Kirim, Target Penerima, Part Number, Lot Number) sekaligus menyinkronkan
+    status QC ke collection master wms_qc_approval.
+    """
+    jk_target = clean_str(jadwal_kirim)
+    tp_target = clean_str(target_penerima)
+    pn_target = clean_str(part_num).upper()
+    lot_target = clean_str(lot_num)
+    cat_clean = clean_str(catatan_qc)
+    waktu_str = get_waktu_jkt().strftime("%Y-%m-%d %H:%M:%S")
+
+    if status_qc == "APPROVED":
+        label_qc = f"APPROVED ({operator_qc} | {waktu_str[5:16]})" + (f" - {cat_clean}" if cat_clean else "")
+    elif status_qc == "HOLD":
+        label_qc = f"HOLD ({operator_qc} | {waktu_str[5:16]})" + (f" - {cat_clean}" if cat_clean else "")
+    else:
+        label_qc = ""
+
+    docs = list(db.collection(NAMA_DATABASE).stream())
+    batch = db.batch()
+    kolom_terdampak = []
+    nama_item_found = ""
+
+    for doc in docs:
+        if doc.id == "Kolom_S":
+            continue
+        doc_dict = doc.to_dict() or {}
+        arr = doc_dict.get('data', [])
+        if not arr:
+            continue
+
+        changed = False
+        for item in arr:
+            if (clean_str(item.get('Jadwal Kirim')) == jk_target
+                    and clean_str(item.get('Target Penerima')) == tp_target
+                    and clean_str(item.get('Part Number')).upper() == pn_target
+                    and clean_str(item.get('Lot Number')) == lot_target):
+                item['Approval QC'] = label_qc
+                if not nama_item_found:
+                    nama_item_found = clean_str(item.get('Nama Produk'))
+                changed = True
+
+        if changed:
+            batch.set(db.collection(NAMA_DATABASE).document(doc.id), {'data': arr})
+            kolom_terdampak.append(doc.id.replace("Kolom_", ""))
+
+    if kolom_terdampak:
+        batch.commit()
+
+    # Sinkronkan juga ke master wms_qc_approval/status_lot
+    try:
+        key = make_qc_lot_key(pn_target, lot_target)
+        doc_qc_ref = db.collection(DB_QC_APPROVAL).document("status_lot")
+        snap_qc = doc_qc_ref.get()
+        lots_dict = snap_qc.to_dict().get("lots", {}) if snap_qc.exists else {}
+        if status_qc == "PENDING":
+            lots_dict.pop(key, None)
+        else:
+            lots_dict[key] = {
+                "status": status_qc,
+                "part_num": pn_target,
+                "item_name": nama_item_found,
+                "lot_num": lot_target,
+                "qc_by": operator_qc,
+                "waktu": waktu_str,
+                "catatan": cat_clean
+            }
+        doc_qc_ref.set({"lots": lots_dict, "updated_at": waktu_str})
+    except Exception:
+        pass
+
+    get_qc_approval_map.clear()
+    get_all_racking_data.clear()
+    return kolom_terdampak
 
 @st.cache_data(ttl=3600)
 def load_master_data():
@@ -698,7 +790,7 @@ def cari_lokasi_stok_hibrida(semua_data, target_item, exclude_staging=False):
 
 def cari_lokasi_stok_outbound_qc(semua_data, target_item, qc_map):
     """
-    Khusus LTOut2: menyaring lokasi stok di rak (A-G) dan melampirkan status Approval QC per Lot.
+    Menyaring lokasi stok di rak (A-G) dan melampirkan status Approval QC per Lot.
     Mengembalikan tuple: (df_approved, df_locked)
     """
     df_all_loc = cari_lokasi_stok_hibrida(semua_data, target_item, exclude_staging=True)
@@ -723,7 +815,133 @@ def cari_lokasi_stok_outbound_qc(semua_data, target_item, qc_map):
     return df_approved, df_locked
 
 # ==========================================================
-# 5. AUDIT LOG, PERSISTENT UNDO & AUTO-SAVE DRAFT INBOUND
+# 4B. HELPER PLOTTING OUTBOUND (UNTUK LTOutb.py)
+# ==========================================================
+def scan_plotting_untuk_outbound(semua_data, jadwal_kirim, target_penerima, qc_map=None):
+    """
+    Memindai seluruh slot rak (A-G) yang telah di-plot PPIC untuk (jadwal_kirim, target_penerima).
+    Memisahkan daftar yang SUDAH APPROVED QC (siap diturunkan forklift) dan yang BELUM APPROVED (Pending/Hold).
+    Sekaligus mengevaluasi akses pintu dinamis (penghalang yang sama-sama ter-plot untuk customer ini tidak dihitung blok).
+    Mengembalikan tuple: (df_ready_approved, df_blocked_qc)
+    """
+    if not semua_data:
+        return pd.DataFrame(), pd.DataFrame()
+
+    jk_target = clean_str(jadwal_kirim)
+    tp_target = clean_str(target_penerima)
+    qc_map = qc_map or {}
+
+    df_all = pd.DataFrame(semua_data)
+    for col_opt in ['Jadwal Kirim', 'Target Penerima', 'Approval QC', 'Keterangan', 'Catatan']:
+        df_all[col_opt] = df_all[col_opt].apply(clean_str) if col_opt in df_all.columns else ""
+
+    df_all['Kolom_Clean'] = df_all['Kolom'].apply(clean_str).str.upper()
+    df_all['Baris_Int'] = pd.to_numeric(df_all['Baris'], errors='coerce').fillna(0).astype(int)
+    df_all['Pallet_Ke_Num'] = pd.to_numeric(df_all['Pallet Ke'], errors='coerce').fillna(0)
+
+    df_rak = df_all[df_all['Kolom_Clean'] != 'S'].copy()
+    df_plot = df_rak[
+        (df_rak['Jadwal Kirim'] == jk_target) &
+        (df_rak['Target Penerima'] == tp_target)
+    ].copy()
+
+    if df_plot.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    df_plot['Group_Key'] = (
+        df_plot['Kolom_Clean'] + "_" +
+        df_plot['Baris_Int'].astype(str) + "_" +
+        df_plot['Part Number'].apply(clean_str).str.upper() + "_" +
+        df_plot['Lot Number'].apply(clean_str)
+    )
+
+    rekap_rows = []
+    for _, grp in df_plot.groupby('Group_Key'):
+        kol = clean_str(grp.iloc[0]['Kolom_Clean'])
+        bar = int(grp.iloc[0]['Baris_Int'])
+        pn = clean_str(grp.iloc[0]['Part Number']).upper()
+        nama = clean_str(grp.iloc[0]['Nama Produk'])
+        lot = clean_str(grp.iloc[0]['Lot Number'])
+        cat_rak = clean_str(grp.iloc[0]['Catatan'])
+        raw_qc = clean_str(grp.iloc[0]['Approval QC'])
+        satuan_str = get_satuan_kemasan(pn)
+
+        info_qc = get_status_qc_lot(qc_map, pn, lot, raw_qc)
+        st_qc = info_qc.get("status", "PENDING")
+
+        is_pec_mask = grp['Keterangan'].str.contains('Pecahan|Eceran', case=False, na=False)
+        jml_utuh = int((~is_pec_mask).sum())
+        jml_dus = sum(parse_keterangan(k)[0] for k in grp.loc[is_pec_mask, 'Keterangan'])
+
+        min_pos = grp['Pallet_Ke_Num'].min()
+        max_pos = grp['Pallet_Ke_Num'].max()
+
+        df_aisle = df_rak[(df_rak['Kolom_Clean'] == kol) & (df_rak['Baris_Int'] == bar)].sort_values('Pallet_Ke_Num')
+        # Palet di depan/belakang yang BUKAN bagian dari rombongan plot customer ini
+        is_penghalang_fisik = ~(
+            (df_aisle['Jadwal Kirim'] == jk_target) &
+            (df_aisle['Target Penerima'] == tp_target)
+        )
+        # Cek juga apakah ada slot plot milik customer ini di depan/belakang (rombongan antrean)
+        is_rombongan_depan = (
+            (~is_penghalang_fisik) &
+            (df_aisle['Pallet_Ke_Num'] < min_pos)
+        )
+
+        depan_blk = int((is_penghalang_fisik & (df_aisle['Pallet_Ke_Num'] < min_pos)).sum())
+        belakang_blk = int((is_penghalang_fisik & (df_aisle['Pallet_Ke_Num'] > max_pos)).sum())
+
+        if depan_blk == 0:
+            akses_rank = 0
+            min_blk = 0
+            if int(is_rombongan_depan.sum()) > 0:
+                sisi_akses = "DEPAN (FIFO - Lanjut Antrean)"
+            else:
+                sisi_akses = "DEPAN (FIFO)"
+        elif belakang_blk == 0:
+            akses_rank = 1
+            min_blk = 0
+            sisi_akses = "BELAKANG (LIFO)"
+        else:
+            akses_rank = 2
+            if depan_blk <= belakang_blk:
+                min_blk = depan_blk
+                sisi_akses = f"TERHALANG DEPAN ({depan_blk}P)"
+            else:
+                min_blk = belakang_blk
+                sisi_akses = f"TERHALANG BELAKANG ({belakang_blk}P)"
+
+        rekap_rows.append({
+            'Kolom': kol,
+            'Baris': bar,
+            'Lokasi': f"{kol}-{bar}",
+            'Part Number': pn,
+            'Nama Produk': nama,
+            'Lot Number': lot,
+            'FIFO_Key': parse_fifo_key(lot),
+            'Pallet': jml_utuh,
+            'Dus': jml_dus,
+            'Satuan': satuan_str,
+            'AksesPintu': sisi_akses,
+            'AksesRank': akses_rank,
+            'MinPenghalang': min_blk,
+            'Catatan': cat_rak,
+            'RawQC': raw_qc,
+            'QC_Status': st_qc,
+            'QC_Catatan': info_qc.get("catatan", "")
+        })
+
+    df_res = pd.DataFrame(rekap_rows).sort_values(
+        by=['FIFO_Key', 'Part Number', 'Kolom', 'Baris', 'Lot Number'],
+        ascending=[True, True, True, True, True]
+    ).reset_index(drop=True)
+
+    df_approved = df_res[df_res['QC_Status'] == 'APPROVED'].reset_index(drop=True)
+    df_blocked = df_res[df_res['QC_Status'] != 'APPROVED'].reset_index(drop=True)
+    return df_approved, df_blocked
+
+# ==========================================================
+# 5. AUDIT LOG, PERSISTENT UNDO & AUTO-SAVE DRAFT (INBOUND & OUTBOUND)
 # ==========================================================
 def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh, pecahan, eceran, keterangan=""):
     waktu_sekarang = get_waktu_jkt().strftime("%Y-%m-%d %H:%M:%S")
@@ -770,6 +988,43 @@ def hapus_draft_inbound(prefix_app, operator_name):
         return
     try:
         db.collection(DB_DRAFT_INBOUND).document(f"{prefix_app}_{operator_name}").delete()
+    except Exception:
+        pass
+
+def simpan_draft_outbound(prefix_app, operator_name, draft_payload):
+    """Menyimpan draft progress penurunan barang Outbound di Firestore selama lead time forklift."""
+    if not operator_name:
+        return
+    draft_payload["saved_at"] = get_waktu_jkt().strftime("%Y-%m-%d %H:%M:%S")
+    st.session_state.outbound_draft = draft_payload
+    try:
+        db.collection(DB_DRAFT_OUTBOUND).document(f"{prefix_app}_{operator_name}").set(draft_payload)
+    except Exception:
+        pass
+
+def muat_draft_outbound(prefix_app, operator_name):
+    if not operator_name:
+        st.session_state.outbound_draft = None
+        return
+    try:
+        doc = db.collection(DB_DRAFT_OUTBOUND).document(f"{prefix_app}_{operator_name}").get()
+        if doc.exists:
+            data = doc.to_dict()
+            if data and data.get("saved_at"):
+                saved_dt = datetime.strptime(data["saved_at"], "%Y-%m-%d %H:%M:%S")
+                if (get_waktu_jkt() - saved_dt) <= timedelta(hours=12):
+                    st.session_state.outbound_draft = data
+                    return
+    except Exception:
+        pass
+    st.session_state.outbound_draft = None
+
+def hapus_draft_outbound(prefix_app, operator_name):
+    st.session_state.outbound_draft = None
+    if not operator_name:
+        return
+    try:
+        db.collection(DB_DRAFT_OUTBOUND).document(f"{prefix_app}_{operator_name}").delete()
     except Exception:
         pass
 
@@ -836,6 +1091,7 @@ def render_header_dan_undo(app_title, accent_color, prefix_app, mode_badge="", r
             st.session_state.operator = None
             st.session_state.undo_record = None
             st.session_state.inbound_draft = None
+            st.session_state.outbound_draft = None
             if reset_keys:
                 for rk in reset_keys:
                     st.session_state[rk] = None
@@ -968,6 +1224,7 @@ def proses_inbound_multi_transaction(transaction, doc_refs_dict, alokasi_list, l
                 'Kolom': k_pilih, 'Baris': b_pilih,
                 'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
                 'Keterangan': 'Utuh', 'Catatan': catatan, 'Approval QC': approval_qc,
+                'Jadwal Kirim': '', 'Target Penerima': '',
                 'Pallet Ke': float(i + 1)
             })
             
@@ -976,6 +1233,7 @@ def proses_inbound_multi_transaction(transaction, doc_refs_dict, alokasi_list, l
                 'Kolom': k_pilih, 'Baris': b_pilih,
                 'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
                 'Keterangan': f"Pecahan: {qty_c} {tipe_pecahan}", 'Catatan': catatan, 'Approval QC': approval_qc,
+                'Jadwal Kirim': '', 'Target Penerima': '',
                 'Pallet Ke': float(qty_p + 1)
             })
             
@@ -1016,6 +1274,8 @@ def proses_pengambilan_stok(transaction, doc_ref, k_pilih, b_pilih, lot_pilih, p
     db_utuh = sum(1 for d in lot_records if 'pecahan' not in str(d.get('Keterangan', '')).lower() and 'eceran' not in str(d.get('Keterangan', '')).lower())
     db_dus = sum(parse_keterangan(d.get('Keterangan', ''))[0] for d in lot_records if 'pecahan' in str(d.get('Keterangan', '')).lower() or 'eceran' in str(d.get('Keterangan', '')).lower())
     app_qc_lama = str(lot_records[0].get('Approval QC', '')) if lot_records else ""
+    jk_lama = clean_str(lot_records[0].get('Jadwal Kirim', '')) if lot_records else ""
+    tp_lama = clean_str(lot_records[0].get('Target Penerima', '')) if lot_records else ""
     
     if db_utuh != init_pallet or db_dus != init_dus:
         raise ValueError(f"Stok di database baru saja berubah ({db_utuh} Pallet, {db_dus} {satuan_kemasan}). Silakan tekan 'Sinkronkan Stok'.")
@@ -1030,14 +1290,16 @@ def proses_pengambilan_stok(transaction, doc_ref, k_pilih, b_pilih, lot_pilih, p
         records_baru.append({
             'Kolom': k_pilih, 'Baris': float(b_pilih),
             'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
-            'Keterangan': 'Utuh', 'Catatan': catatan_lama, 'Approval QC': app_qc_lama, 'Pallet Ke': 0.0
+            'Keterangan': 'Utuh', 'Catatan': catatan_lama, 'Approval QC': app_qc_lama,
+            'Jadwal Kirim': jk_lama, 'Target Penerima': tp_lama, 'Pallet Ke': 0.0
         })
         
     if final_dus > 0:
         records_baru.append({
             'Kolom': k_pilih, 'Baris': float(b_pilih),
             'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
-            'Keterangan': f"Pecahan: {final_dus} {satuan_kemasan}", 'Catatan': catatan_lama, 'Approval QC': app_qc_lama, 'Pallet Ke': 0.0
+            'Keterangan': f"Pecahan: {final_dus} {satuan_kemasan}", 'Catatan': catatan_lama, 'Approval QC': app_qc_lama,
+            'Jadwal Kirim': jk_lama, 'Target Penerima': tp_lama, 'Pallet Ke': 0.0
         })
         
     updated_rak_ini = []
@@ -1115,13 +1377,15 @@ def proses_turun_ke_staging(
         sisa_records_asal.append({
             'Kolom': k_pilih, 'Baris': float(b_pilih),
             'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
-            'Keterangan': 'Utuh', 'Catatan': catatan_rak_lama, 'Approval QC': app_qc_lama, 'Pallet Ke': 0.0
+            'Keterangan': 'Utuh', 'Catatan': catatan_rak_lama, 'Approval QC': app_qc_lama,
+            'Jadwal Kirim': '', 'Target Penerima': '', 'Pallet Ke': 0.0
         })
     if final_dus > 0:
         sisa_records_asal.append({
             'Kolom': k_pilih, 'Baris': float(b_pilih),
             'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
-            'Keterangan': f"Pecahan: {final_dus} {satuan_kemasan}", 'Catatan': catatan_rak_lama, 'Approval QC': app_qc_lama, 'Pallet Ke': 0.0
+            'Keterangan': f"Pecahan: {final_dus} {satuan_kemasan}", 'Catatan': catatan_rak_lama, 'Approval QC': app_qc_lama,
+            'Jadwal Kirim': '', 'Target Penerima': '', 'Pallet Ke': 0.0
         })
         
     updated_rak_asal = []
@@ -1149,13 +1413,15 @@ def proses_turun_ke_staging(
         pallets_ke_staging.append({
             'Kolom': 'S', 'Baris': 1.0,
             'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
-            'Keterangan': 'Utuh', 'Catatan': catatan_staging, 'Approval QC': app_qc_lama, 'Pallet Ke': 0.0
+            'Keterangan': 'Utuh', 'Catatan': catatan_staging, 'Approval QC': app_qc_lama,
+            'Jadwal Kirim': '', 'Target Penerima': '', 'Pallet Ke': 0.0
         })
     if turun_dus > 0:
         pallets_ke_staging.append({
             'Kolom': 'S', 'Baris': 1.0,
             'Nama Produk': item_name, 'Part Number': part_num, 'Lot Number': lot_pilih,
-            'Keterangan': f"Pecahan: {turun_dus} {satuan_kemasan}", 'Catatan': catatan_staging, 'Approval QC': app_qc_lama, 'Pallet Ke': 0.0
+            'Keterangan': f"Pecahan: {turun_dus} {satuan_kemasan}", 'Catatan': catatan_staging, 'Approval QC': app_qc_lama,
+            'Jadwal Kirim': '', 'Target Penerima': '', 'Pallet Ke': 0.0
         })
         
     gabungan_s1 = staging_s1 + pallets_ke_staging
@@ -1169,6 +1435,170 @@ def proses_turun_ke_staging(
         transaction.set(doc_ref_staging, {'data': staging_lain + gabungan_s1})
         
     return {k_pilih: backup_asal, 'S': backup_staging}
+
+@firestore.transactional
+def proses_turun_plotting_ke_staging_multi(
+    transaction, doc_refs_asal_dict, doc_ref_staging,
+    item_turun_list, jadwal_kirim, target_penerima, operator_name, catatan_umum=""
+):
+    """
+    Memindahkan batch item ter-plot (Approved QC) dari beberapa rak A-G ke Staging (Kolom_S Baris 1)
+    secara atomik dalam 1 transaksi Firestore.
+    Setiap elemen pada `item_turun_list` berbentuk dict:
+      {
+        'Kolom': str, 'Baris': int, 'Part Number': str, 'Nama Produk': str,
+        'Lot Number': str, 'Satuan': str, 'AksesPintu': str,
+        'Plot_P': int, 'Plot_D': int, 'Turun_P': int, 'Turun_D': int
+      }
+    """
+    jk_target = clean_str(jadwal_kirim)
+    tp_target = clean_str(target_penerima)
+
+    snaps_asal = {k: ref.get(transaction=transaction) for k, ref in doc_refs_asal_dict.items()}
+    snap_staging = doc_ref_staging.get(transaction=transaction)
+
+    backup_dict = {}
+    work_asal = {}
+    for k, sp in snaps_asal.items():
+        if not sp.exists:
+            raise ValueError(f"Dokumen Kolom_{k} tidak ditemukan.")
+        arr = sp.to_dict().get('data', [])
+        backup_dict[k] = [d.copy() for d in arr]
+        work_asal[k] = [d.copy() for d in arr]
+
+    all_staging = snap_staging.to_dict().get('data', []) if snap_staging.exists else []
+    backup_dict['S'] = [d.copy() for d in all_staging]
+
+    staging_s1 = sorted(
+        [d.copy() for d in all_staging if float(d.get('Baris', 0) or 0) == 1.0],
+        key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0))
+    )
+    staging_lain = [d.copy() for d in all_staging if float(d.get('Baris', 0) or 0) != 1.0]
+
+    pallets_ke_staging = []
+    ringkasan_eksekusi = []
+
+    for it in item_turun_list:
+        k_id = clean_str(it['Kolom']).upper()
+        b_num = int(it['Baris'])
+        pn = clean_str(it['Part Number']).upper()
+        nama = clean_str(it['Nama Produk'])
+        lot = clean_str(it['Lot Number'])
+        satuan = clean_str(it['Satuan'])
+        turun_p = int(it['Turun_P'])
+        turun_d = int(it['Turun_D'])
+        dari_belakang = "BELAKANG" in clean_str(it.get('AksesPintu', '')).upper()
+
+        if turun_p <= 0 and turun_d <= 0:
+            continue
+
+        all_col = work_asal[k_id]
+        rak_ini = sorted(
+            [d for d in all_col if int(float(d.get('Baris', 0) or 0)) == b_num],
+            key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0))
+        )
+        rak_lain = [d for d in all_col if int(float(d.get('Baris', 0) or 0)) != b_num]
+
+        # Cari slot-slot ter-plot milik customer ini pada baris & lot tersebut
+        idx_kandidat = [
+            idx for idx, d in enumerate(rak_ini)
+            if clean_str(d.get('Part Number')).upper() == pn
+            and clean_str(d.get('Lot Number')) == lot
+            and clean_str(d.get('Jadwal Kirim')) == jk_target
+            and clean_str(d.get('Target Penerima')) == tp_target
+        ]
+        if dari_belakang:
+            idx_kandidat = list(reversed(idx_kandidat))
+
+        # Validasi QC pada slot tersebut
+        for idx_s in idx_kandidat:
+            qc_val = clean_str(rak_ini[idx_s].get('Approval QC')).upper()
+            if not qc_val.startswith("APPROVED"):
+                raise ValueError(f"Rak {k_id}-{b_num} (Lot {lot}) belum berstatus APPROVED QC!")
+
+        idx_hapus = set()
+        diambil_p = 0
+        diambil_slot_pec = 0
+        app_qc_ref = ""
+        catatan_ref = ""
+
+        for idx_s in idx_kandidat:
+            slot_d = rak_ini[idx_s]
+            if not app_qc_ref:
+                app_qc_ref = clean_str(slot_d.get('Approval QC'))
+            if not catatan_ref:
+                catatan_ref = clean_str(slot_d.get('Catatan'))
+
+            ket_s = clean_str(slot_d.get('Keterangan')).lower()
+            is_pec = ('pecahan' in ket_s or 'eceran' in ket_s)
+
+            if not is_pec and diambil_p < turun_p:
+                idx_hapus.add(idx_s)
+                diambil_p += 1
+            elif is_pec and turun_d > 0 and diambil_slot_pec < 1:
+                idx_hapus.add(idx_s)
+                diambil_slot_pec += 1
+
+        if diambil_p < turun_p:
+            raise ValueError(
+                f"Stok palet ter-plot di Rak {k_id}-{b_num} (Lot {lot}) berubah ({diambil_p}P tersedia vs {turun_p}P). Silakan Sinkronkan Stok."
+            )
+
+        # Lepas juga tag Jadwal Kirim & Target Penerima pada sisa palet plot yang tidak ikut turun (misal buffer tidak terpakai)
+        updated_rak_ini = []
+        for idx_s, slot_d in enumerate(rak_ini):
+            if idx_s in idx_hapus:
+                continue
+            if (clean_str(slot_d.get('Part Number')).upper() == pn
+                    and clean_str(slot_d.get('Lot Number')) == lot
+                    and clean_str(slot_d.get('Jadwal Kirim')) == jk_target
+                    and clean_str(slot_d.get('Target Penerima')) == tp_target):
+                slot_d['Jadwal Kirim'] = ""
+                slot_d['Target Penerima'] = ""
+            updated_rak_ini.append(slot_d)
+
+        for i_pos, d in enumerate(updated_rak_ini, 1):
+            d['Pallet Ke'] = float(i_pos)
+
+        work_asal[k_id] = rak_lain + updated_rak_ini
+
+        cat_stg = f"Customer: {tp_target} ({jk_target}) | Dari: {k_id}-{b_num} | Op: {operator_name}"
+        if catatan_umum.strip():
+            cat_stg += f" | {catatan_umum.strip()}"
+
+        for _ in range(turun_p):
+            pallets_ke_staging.append({
+                'Kolom': 'S', 'Baris': 1.0,
+                'Nama Produk': nama, 'Part Number': pn, 'Lot Number': lot,
+                'Keterangan': 'Utuh', 'Catatan': cat_stg, 'Approval QC': app_qc_ref,
+                'Jadwal Kirim': jk_target, 'Target Penerima': tp_target, 'Pallet Ke': 0.0
+            })
+        if turun_d > 0:
+            pallets_ke_staging.append({
+                'Kolom': 'S', 'Baris': 1.0,
+                'Nama Produk': nama, 'Part Number': pn, 'Lot Number': lot,
+                'Keterangan': f"Pecahan: {turun_d} {satuan}", 'Catatan': cat_stg, 'Approval QC': app_qc_ref,
+                'Jadwal Kirim': jk_target, 'Target Penerima': tp_target, 'Pallet Ke': 0.0
+            })
+
+        ringkasan_eksekusi.append({
+            'Kolom': k_id, 'Baris': b_num, 'Part Number': pn, 'Nama Produk': nama,
+            'Lot Number': lot, 'Satuan': satuan, 'Turun_P': turun_p, 'Turun_D': turun_d
+        })
+
+    gabungan_s1 = staging_s1 + pallets_ke_staging
+    for i_pos, d in enumerate(gabungan_s1, 1):
+        d['Pallet Ke'] = float(i_pos)
+
+    for k_id, ref in doc_refs_asal_dict.items():
+        transaction.update(ref, {'data': work_asal[k_id]})
+
+    if snap_staging.exists:
+        transaction.update(doc_ref_staging, {'data': staging_lain + gabungan_s1})
+    else:
+        transaction.set(doc_ref_staging, {'data': staging_lain + gabungan_s1})
+
+    return backup_dict, ringkasan_eksekusi
 
 # ==========================================================
 # 7. MODUL PEMILIHAN PRODUK TERPADU (SLIDE 2 -> 3 -> 4)
@@ -1639,7 +2069,6 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
         else:
             if st.button("📥 MASUKKAN KE DATABASE SEKARANG", type="primary", use_container_width=True):
                 with st.spinner("Memasukkan data aktual ke rak..."):
-                    # Cek otomatis apakah lot ini sudah pernah di-approve QC sebelumnya
                     qc_map = get_qc_approval_map()
                     qc_info_lot = get_status_qc_lot(qc_map, st.session_state.pilih_part, lot_aktif)
                     label_qc_awal = ""
