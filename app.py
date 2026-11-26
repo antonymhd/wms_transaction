@@ -286,10 +286,11 @@ def tentukan_arus_log(jenis_transaksi):
         return "PINDAH"
     return "KOREKSI"
 
-def scan_stok_bebas_untuk_plotting(semua_data, target_part_num):
+def scan_stok_bebas_untuk_plotting(semua_data, target_part_num, strict_fifo_shift=True):
     """
-    Memindai seluruh rak (A-G) untuk Part Number tertentu yang BELUM memiliki Jadwal Kirim,
-    menghitung akses pintu depan/belakang & mengurutkan berdasarkan FIFO tertua.
+    Memindai seluruh rak (A-G) untuk Part Number tertentu yang BELUM memiliki Jadwal Kirim.
+    - strict_fifo_shift=True : Urut mutlak Tanggal (YYMMDD) -> Shift (1, 2, 3) -> Stok Terkecil -> Akses Pintu.
+    - strict_fifo_shift=False: Urut Akses Pintu Tanpa Penghalang -> Tanggal (YYMMDD) -> Shift (1, 2, 3).
     """
     if not semua_data:
         return pd.DataFrame()
@@ -370,9 +371,14 @@ def scan_stok_bebas_untuk_plotting(semua_data, target_part_num):
             'Catatan Rak': cat_rak
         })
 
+    if strict_fifo_shift:
+        sort_cols = ['FIFO_Key', 'Stok Utuh', 'MinPenghalang', 'AksesRank', 'Lot Number', 'Kolom', 'Baris']
+    else:
+        sort_cols = ['MinPenghalang', 'FIFO_Key', 'Stok Utuh', 'AksesRank', 'Lot Number', 'Kolom', 'Baris']
+
     return pd.DataFrame(rekap).sort_values(
-        by=['MinPenghalang', 'FIFO_Key', 'Stok Utuh', 'AksesRank', 'Lot Number', 'Kolom', 'Baris'],
-        ascending=[True, True, True, True, True, True, True]
+        by=sort_cols,
+        ascending=[True] * len(sort_cols)
     ).reset_index(drop=True)
 
 # ==========================================================
