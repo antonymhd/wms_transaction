@@ -50,58 +50,19 @@ def get_konversi_pcs_item(part_num, item_name):
     return isi_pal, pcs_pec
 
 # ==========================================================
-# SLIDE 0: PILIH OPERATOR BERTUGAS
+# SLIDE 0: LOGIN OPERATOR BERTUGAS (USERNAME + PIN/PASSWORD)
 # ==========================================================
 if st.session_state.slide == 0:
-    st.markdown("""
-        <div class="db-info-box" style="text-align: center;">
-            <div style="font-size: 18px; font-weight: bold; color: #F59E0B;">
-                🚚 Outbound Plotting & QC - Rack Navigator
-            </div>
-            <div style="font-size: 13px; opacity: 0.8; margin-top: 4px;">
-                Pengeluaran Barang Ter-Plot PPIC & Approved QC ke Staging (S-1)
-            </div>
-        </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown('<div class="btn-center">', unsafe_allow_html=True)
-    for i in range(0, len(OPERATOR_OUTBOUND), 2):
-        cols = st.columns(2)
-        with cols[0]:
-            op1 = OPERATOR_OUTBOUND[i]
-            if st.button(f"👤 {op1}", key=f"op_outb_{op1}", use_container_width=True):
-                st.session_state.operator = op1
-                st.session_state.mode_transaksi = "OUTBOUND_PLOT"
-                core.muat_undo_firestore("OUTB", op1)
-                core.muat_draft_outbound("OUTB", op1)
-                pindah_slide(1)
-                st.rerun()
-        if i + 1 < len(OPERATOR_OUTBOUND):
-            with cols[1]:
-                op2 = OPERATOR_OUTBOUND[i + 1]
-                if st.button(f"👤 {op2}", key=f"op_outb_{op2}", use_container_width=True):
-                    st.session_state.operator = op2
-                    st.session_state.mode_transaksi = "OUTBOUND_PLOT"
-                    core.muat_undo_firestore("OUTB", op2)
-                    core.muat_draft_outbound("OUTB", op2)
-                    pindah_slide(1)
-                    st.rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.write("")
-    with st.expander("➕ Operator Pengganti / Lainnya"):
-        op_manual = st.text_input("Ketik Nama Operator", placeholder="Masukkan nama...")
-        if st.button("MASUK DENGAN NAMA INI", type="primary", use_container_width=True):
-            if op_manual.strip():
-                nama_fix = op_manual.strip().title()
-                st.session_state.operator = nama_fix
-                st.session_state.mode_transaksi = "OUTBOUND_PLOT"
-                core.muat_undo_firestore("OUTB", nama_fix)
-                core.muat_draft_outbound("OUTB", nama_fix)
-                pindah_slide(1)
-                st.rerun()
-            else:
-                st.warning("Nama operator tidak boleh kosong.")
+    core.render_login_operator(
+        app_title="Outbound Plotting & QC - Rack Navigator",
+        subtitle="Pengeluaran Barang Ter-Plot PPIC & Approved QC ke Staging (S-1)",
+        accent_color="#F59E0B",
+        prefix_app="OUTB",
+        operator_list=OPERATOR_OUTBOUND,
+        slide_tujuan=1,
+        default_mode="OUTBOUND_PLOT",
+        load_draft_type="OUTBOUND"
+    )
     st.stop()
 
 # ==========================================================
@@ -248,7 +209,6 @@ elif st.session_state.slide == 2:
             "lalu tekan tombol konfirmasi di bagian bawah.*"
         )
 
-        # Muat state draft tersimpan jika sesuai jadwal & customer aktif
         saved_items_map = {}
         if (draft_out
                 and draft_out.get("jadwal_kirim") == jk_aktif
@@ -343,7 +303,6 @@ elif st.session_state.slide == 2:
                         'Turun_D': int(val_td)
                     })
 
-        # Auto-save draft ke Firestore jika ada perubahan input selama operator bekerja di lorong
         draft_sig = f"{jk_aktif}|{cust_aktif}|" + str(draft_items_to_save)
         if st.session_state.get("_last_out_draft_sig") != draft_sig:
             core.simpan_draft_outbound("OUTB", st.session_state.operator, {
@@ -394,7 +353,6 @@ elif st.session_state.slide == 2:
                             catatan_muat
                         )
 
-                        # Catat log mutasi per item/lokasi yang diturunkan
                         tele_lines = []
                         for re_it in ringkasan_eks:
                             isi_pal, pcs_pec = get_konversi_pcs_item(re_it['Part Number'], re_it['Nama Produk'])
