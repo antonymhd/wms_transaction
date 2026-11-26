@@ -64,7 +64,7 @@ core.render_header_dan_undo(
     accent_color="#10B981",
     prefix_app="INB",
     mode_badge=mode_badge,
-    reset_keys=['mode_transaksi', 'inbound_draft']
+    reset_keys=['mode_transaksi', 'inbound_draft', '_login_selected_user_INB']
 )
 core.render_progress_bar(st.session_state.slide, st.session_state.mode_transaksi)
 
