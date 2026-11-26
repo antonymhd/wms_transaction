@@ -2835,7 +2835,10 @@ with tab9:
                                             reverse=dari_belakang
                                         )
 
-                                        tagged_p, tagged_d = 0, 0
+                                        tagged_p = 0
+                                        slot_pecahan_butuh = 1 if need_d > 0 else 0
+                                        tagged_slot_pec = 0
+
                                         for slot_d in baris_items:
                                             ket_s = clean_str(slot_d.get('Keterangan')).lower()
                                             is_pec = ('pecahan' in ket_s or 'eceran' in ket_s)
@@ -2843,12 +2846,12 @@ with tab9:
                                                 slot_d['Jadwal Kirim'] = tgl_kirim_str
                                                 slot_d['Target Penerima'] = cust_clean
                                                 tagged_p += 1
-                                            elif is_pec and tagged_d < need_d:
+                                            elif is_pec and tagged_slot_pec < slot_pecahan_butuh:
                                                 slot_d['Jadwal Kirim'] = tgl_kirim_str
                                                 slot_d['Target Penerima'] = cust_clean
-                                                tagged_d += 1
+                                                tagged_slot_pec += 1
 
-                                        if tagged_p < need_p or tagged_d < need_d:
+                                        if tagged_p < need_p or tagged_slot_pec < slot_pecahan_butuh:
                                             return (
                                                 False,
                                                 f"❌ Stok bebas di Rak {k_id}-{b_num} (Lot {lot_id}) berubah sebelum disimpan. Silakan klik 'Cari Lot & Lokasi Racking' ulang.",
@@ -2941,7 +2944,6 @@ with tab9:
             )
             st.dataframe(df_act_grp, hide_index=True, use_container_width=True)
 
-            # Fitur Batalkan Plotting (Reschedule / Salah Plot)
             with st.expander("🗑️ Batalkan Plotting Aktif (Lepas Kunci Jadwal Kirim)"):
                 df_act_grp['Label_Batal'] = df_act_grp.apply(
                     lambda r: f"[{r['Jadwal Kirim']}] {r['Target Penerima']} | Rak {r['Lokasi']} | {r['Nama Produk']} (Lot {r['Lot Number']}) — {int(r['Pallet_Utuh'])}P {int(r['Qty_Pecahan'])} Pecahan",
