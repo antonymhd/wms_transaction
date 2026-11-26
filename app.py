@@ -6,6 +6,7 @@ from firebase_admin import credentials, firestore
 import io
 import copy
 import re
+import math
 import html
 from datetime import datetime, timedelta, timezone
 
