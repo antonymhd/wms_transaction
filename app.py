@@ -2547,7 +2547,10 @@ with tab8:
 # ----------------------------------------------------------
 with tab9:
     st.header("📅 Plotting Jadwal Outbound (PPIC)")
-    st.caption("Pilih kategori & item produk serta jumlah kebutuhan (dalam Pcs otomatis dibulatkan ke Palet, atau langsung Palet). Sistem mencarikan Lot & lokasi rak secara FIFO.")
+    st.caption(
+        "Pilih kategori & item produk serta jumlah kebutuhan (dalam Pcs otomatis dibulatkan ke Palet, atau langsung Palet). "
+        "Sistem mencarikan Lot & lokasi rak secara Strict FIFO (Tanggal & Shift tertua) serta menyertakan pecahan tertua."
+    )
 
     df_master_plot = load_master_produk()
     if df_master_plot.empty:
@@ -2558,7 +2561,10 @@ with tab9:
 
         mode_input_plot = st.radio(
             "Satuan Input Kebutuhan Delivery:",
-            ["🔢 Input dalam Pcs (Otomatis Konversi & Bulatkan ke Palet)", "📦 Input Manual Palet & Pecahan"],
+            [
+                "🔢 Input dalam Pcs (Otomatis Konversi & Bulatkan ke Palet)",
+                "📦 Input Manual Palet & Pecahan"
+            ],
             horizontal=True,
             key="plot_mode_satuan"
         )
@@ -2602,13 +2608,17 @@ with tab9:
                     total_pcs_bulat = qty_plot_palet * isi_pallet_master
                     selisih_pcs = total_pcs_bulat - qty_plot_pcs
                     st.info(
-                        f"📐 **Standar Master (`{part_plot_clean}`):** `1 Palet = {isi_pallet_master:,} pcs`\n\n"
-                        f"🔄 **{qty_plot_pcs:,} pcs** = `{palet_desimal:.2f} palet` ➔ Dibulatkan ke atas menjadi **{qty_plot_palet} Palet** "
+                        f"📐 **Standar Master (`{part_plot_clean}`):** `1 Palet = {isi_pallet_master:,} pcs`"
+                        + (f" (`1 {satuan_plot} = {pcs_satuan_master:,} pcs`)" if pcs_satuan_master > 0 else "")
+                        + f"\n\n🔄 **{qty_plot_pcs:,} pcs** = `{palet_desimal:.2f} palet` ➔ Dibulatkan ke atas menjadi **{qty_plot_palet} Palet** "
                         f"(`{total_pcs_bulat:,} pcs`, cadangan pembulatan `+{selisih_pcs:,} pcs`)"
                     )
                 else:
                     konversi_valid = False
-                    st.error(f"❌ Data `Isi 1 Pallet (pcs)` untuk `{part_plot_clean}` belum terisi di `Master_Produk.csv`. Gunakan mode input Palet manual.")
+                    st.error(
+                        f"❌ Data `Isi 1 Pallet (pcs)` untuk `{part_plot_clean}` belum terisi di `Master_Produk.csv`. "
+                        f"Gunakan mode input Palet manual."
+                    )
         else:
             c_man1, c_man2 = st.columns(2)
             with c_man1:
@@ -2616,14 +2626,24 @@ with tab9:
             with c_man2:
                 qty_plot_dus = st.number_input(f"4. Pecahan ({satuan_plot})", min_value=0, value=0, step=1, key="plot_qty_d")
 
-        pakai_buffer_1 = st.checkbox(
-            "🛡️ Tambahkan Buffer Antisipasi +1 Palet (Direkomendasikan agar operator tidak kekurangan stok di lorong)",
-            value=True,
-            key="plot_chk_buffer"
-        )
+        c_opt_pl1, c_opt_pl2 = st.columns(2)
+        with c_opt_pl1:
+            pakai_buffer_1 = st.checkbox(
+                "🛡️ Tambahkan Buffer Antisipasi +1 Palet",
+                value=True,
+                help="Direkomendasikan agar operator forklift tidak kekurangan stok di lorong.",
+                key="plot_chk_buffer"
+            )
+        with c_opt_pl2:
+            ikut_pecahan_fifo = st.checkbox(
+                "🧹 Otomatis ikut sertakan slot pecahan tertua (FIFO)",
+                value=True,
+                help="Menyertakan sisa pecahan dus/sak tertua agar tidak tertinggal menjadi stok mati di rak.",
+                key="plot_chk_pecahan_fifo"
+            )
 
-        if st.button("🔍 Cari Lot & Lokasi Racking (FIFO)", type="primary", use_container_width=True, disabled=not konversi_valid):
-            with st.spinner("Memindai seluruh rak A–G untuk mencari stok bebas (FIFO)..."):
+        if st.button("🔍 Cari Lot & Lokasi Racking (Strict FIFO)", type="primary", use_container_width=True, disabled=not konversi_valid):
+            with st.spinner("Memindai seluruh rak A–G untuk mencari stok bebas (Strict FIFO)..."):
                 docs_scan = list(db.collection(NAMA_DATABASE).stream())
                 log_fb_usage('read', len(docs_scan))
                 all_rak_records = []
@@ -2639,27 +2659,47 @@ with tab9:
 
         if st.session_state.get('plot_search_ready') and st.session_state.get('plot_target_part') == part_plot_clean and konversi_valid:
             all_rak_records = st.session_state.get('plot_all_records_cache', [])
-            df_kandidat = scan_stok_bebas_untuk_plotting(all_rak_records, part_plot_clean)
-
-            target_p_total = int(qty_plot_palet) + (1 if pakai_buffer_1 and qty_plot_palet > 0 else 0)
-            target_d_total = int(qty_plot_dus)
+            df_kandidat = scan_stok_bebas_untuk_plotting(all_rak_records, part_plot_clean, strict_fifo_shift=True)
 
             if df_kandidat.empty:
                 st.warning(f"⚠️ Tidak ditemukan stok bebas (belum ter-plot) untuk **{pilih_item_plot}** (`{part_plot_clean}`) di rak A–G.")
             else:
+                target_p_total = int(qty_plot_palet) + (1 if pakai_buffer_1 and qty_plot_palet > 0 else 0)
+                target_d_total = int(qty_plot_dus)
+
+                # 1. Alokasi slot pecahan tertua (FIFO) lebih dulu jika opsi aktif
+                auto_pecahan_map = {}
+                total_pcs_dari_pecahan = 0
+                if ikut_pecahan_fifo:
+                    for idx_r, r_k in df_kandidat.iterrows():
+                        avail_d = int(r_k['Stok Dus/Sak'])
+                        if avail_d > 0:
+                            auto_pecahan_map[idx_r] = avail_d
+                            if pcs_satuan_master > 0:
+                                total_pcs_dari_pecahan += avail_d * pcs_satuan_master
+
+                # Jika mode input dalam Pcs & pecahan FIFO ikut terambil, kurangi kebutuhan palet utuh secara proporsional
+                if mode_input_plot.startswith("🔢") and isi_pallet_master > 0 and ikut_pecahan_fifo and total_pcs_dari_pecahan > 0:
+                    sisa_pcs_setelah_pecahan = max(0, int(qty_plot_pcs) - total_pcs_dari_pecahan)
+                    palet_utuh_efektif = int(math.ceil(sisa_pcs_setelah_pecahan / isi_pallet_master)) if sisa_pcs_setelah_pecahan > 0 else 0
+                    target_p_total = palet_utuh_efektif + (1 if pakai_buffer_1 and (palet_utuh_efektif > 0 or total_pcs_dari_pecahan > 0) else 0)
+
                 sisa_p_need = target_p_total
                 sisa_d_need = target_d_total
                 plot_p_list, plot_d_list = [], []
 
-                for _, r_k in df_kandidat.iterrows():
+                for idx_r, r_k in df_kandidat.iterrows():
                     avail_p = int(r_k['Stok Utuh'])
                     avail_d = int(r_k['Stok Dus/Sak'])
 
                     take_p = min(avail_p, sisa_p_need)
                     sisa_p_need -= take_p
 
-                    take_d = min(avail_d, sisa_d_need)
-                    sisa_d_need -= take_d
+                    if idx_r in auto_pecahan_map:
+                        take_d = auto_pecahan_map[idx_r]
+                    else:
+                        take_d = min(avail_d, sisa_d_need)
+                        sisa_d_need -= take_d
 
                     plot_p_list.append(take_p)
                     plot_d_list.append(take_d)
@@ -2671,20 +2711,26 @@ with tab9:
                 st.divider()
                 st.markdown(f"**5. Hasil Kandidat Lot & Lokasi Rak untuk `{pilih_item_plot}` (`{part_plot_clean}`)**")
 
-                info_target_str = f"Target Terhitung: **{target_p_total} Palet**"
-                if mode_input_plot.startswith("🔢") and isi_pallet_master > 0:
-                    info_target_str += f" *(dari kebutuhan {qty_plot_pcs:,} pcs ➔ {qty_plot_palet}P bulat" + (" + 1P buffer)" if pakai_buffer_1 else ")")
-                elif pakai_buffer_1 and qty_plot_palet > 0:
-                    info_target_str += f" ({qty_plot_palet} kebutuhan + 1 buffer)"
-                if target_d_total > 0:
-                    info_target_str += f" & **{target_d_total} {satuan_plot}**"
-                if isi_pallet_master > 0:
-                    info_target_str += f" | Setara Total: **{(target_p_total * isi_pallet_master) + (target_d_total * pcs_satuan_master):,} pcs**"
+                tot_plot_p_prev = int(df_kandidat['Plot Utuh'].sum())
+                tot_plot_d_prev = int(df_kandidat[f'Plot {satuan_plot.title()}'].sum())
 
-                st.caption(info_target_str + ". *Silakan sesuaikan kolom `Plot Utuh` jika perlu.*")
+                info_target_str = f"Rencana Ter-plot: **{tot_plot_p_prev} Palet Utuh**"
+                if tot_plot_d_prev > 0:
+                    info_target_str += f" + **{tot_plot_d_prev} {satuan_plot}**"
+                if mode_input_plot.startswith("🔢") and isi_pallet_master > 0:
+                    est_total_pcs = (tot_plot_p_prev * isi_pallet_master) + (tot_plot_d_prev * pcs_satuan_master)
+                    info_target_str += f" *(Kebutuhan: {qty_plot_pcs:,} pcs ➔ Estimasi Muat: **{est_total_pcs:,} pcs**)*"
+                elif isi_pallet_master > 0:
+                    est_total_pcs = (tot_plot_p_prev * isi_pallet_master) + (tot_plot_d_prev * pcs_satuan_master)
+                    info_target_str += f" *(Setara **{est_total_pcs:,} pcs**)*"
+
+                st.caption(info_target_str + ". *Silakan sesuaikan kolom `PLOT PALET` / `PLOT DUS/SAK` jika perlu.*")
 
                 if sisa_p_need > 0 or sisa_d_need > 0:
-                    st.warning(f"⚠️ Stok bebas di gudang kurang **{sisa_p_need} Palet** {f'dan **{sisa_d_need} {satuan_plot}**' if sisa_d_need > 0 else ''} dari target plotting!")
+                    st.warning(
+                        f"⚠️ Stok bebas di gudang kurang **{sisa_p_need} Palet** "
+                        f"{f'dan **{sisa_d_need} {satuan_plot}**' if sisa_d_need > 0 else ''} dari target plotting!"
+                    )
 
                 cols_tampil = [
                     'Lokasi', 'Lot Number', 'Akses Pintu', 'Stok Utuh', 'Stok Dus/Sak',
@@ -2695,7 +2741,7 @@ with tab9:
                     column_config={
                         'Lokasi': st.column_config.TextColumn("Lokasi Rak", disabled=True),
                         'Lot Number': st.column_config.TextColumn("No. Lot (FIFO)", disabled=True),
-                        'Akses Pintu': st.column_config.TextColumn("Akses Pintu", disabled=True),
+                        'Akses Pintu': st.column_config.TextColumn("Akses Pintu (Dinamis)", disabled=True),
                         'Stok Utuh': st.column_config.NumberColumn("Stok Palet", disabled=True),
                         'Stok Dus/Sak': st.column_config.NumberColumn(f"Stok {satuan_plot.title()}", disabled=True),
                         'Plot Utuh': st.column_config.NumberColumn("🎯 PLOT PALET", min_value=0, required=True),
@@ -2705,7 +2751,7 @@ with tab9:
                     },
                     hide_index=True,
                     use_container_width=True,
-                    key=f"editor_plotting_{part_plot_clean}_{target_p_total}_{target_d_total}"
+                    key=f"editor_plotting_{part_plot_clean}_{target_p_total}_{target_d_total}_{ikut_pecahan_fifo}"
                 )
 
                 st.markdown("**6. Tetapkan Jadwal Kirim & Target Penerima (Customer)**")
@@ -2782,6 +2828,7 @@ with tab9:
                                             and clean_str(d.get('Part Number')).upper() == part_plot_clean
                                             and clean_str(d.get('Lot Number')) == lot_id
                                             and clean_str(d.get('Jadwal Kirim')) == ""
+                                            and clean_str(d.get('Target Penerima')) == ""
                                         ]
                                         baris_items.sort(
                                             key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)),
@@ -2802,7 +2849,12 @@ with tab9:
                                                 tagged_d += 1
 
                                         if tagged_p < need_p or tagged_d < need_d:
-                                            return False, f"❌ Stok bebas di Rak {k_id}-{b_num} (Lot {lot_id}) berubah sebelum disimpan. Silakan klik 'Cari Lot & Lokasi Racking' ulang.", {}, {}
+                                            return (
+                                                False,
+                                                f"❌ Stok bebas di Rak {k_id}-{b_num} (Lot {lot_id}) berubah sebelum disimpan. Silakan klik 'Cari Lot & Lokasi Racking' ulang.",
+                                                {},
+                                                {}
+                                            )
 
                                     for k, ref in doc_refs_plot.items():
                                         transaction.set(ref, {'data': work_map[k]})
@@ -2818,7 +2870,12 @@ with tab9:
 
                                     tot_pl_p = sum(x['Plot_P'] for x in alokasi_valid)
                                     tot_pl_d = sum(x['Plot_D'] for x in alokasi_valid)
-                                    ringkas_lok = ", ".join(f"{x['Lokasi']} ({x['Lot']}: {x['Plot_P']}P)" for x in alokasi_valid)
+                                    ringkas_lok = ", ".join(
+                                        f"{x['Lokasi']} ({x['Lot']}: {x['Plot_P']}P"
+                                        + (f"+{x['Plot_D']}{satuan_plot}" if x['Plot_D'] > 0 else "")
+                                        + ")"
+                                        for x in alokasi_valid
+                                    )
                                     req_pcs_note = f" | Req: {qty_plot_pcs:,} pcs" if mode_input_plot.startswith("🔢") else ""
                                     det_pl = f"Jadwal: {tgl_kirim_str} | Customer: {cust_clean}{req_pcs_note} | Lokasi: {ringkas_lok}"
 
@@ -2851,16 +2908,21 @@ with tab9:
             record_doc_size(d_ac.id, arr_ac)
             for item_ac in arr_ac:
                 jk = clean_str(item_ac.get('Jadwal Kirim'))
-                if jk:
+                tp = clean_str(item_ac.get('Target Penerima'))
+                if jk or tp:
+                    ket_ac = clean_str(item_ac.get('Keterangan')).lower()
+                    is_pec_ac = ('pecahan' in ket_ac or 'eceran' in ket_ac)
+                    pec_val_ac = parse_keterangan(ket_ac)[0] if is_pec_ac else 0
                     active_rows.append({
                         'Jadwal Kirim': jk,
-                        'Target Penerima': clean_str(item_ac.get('Target Penerima')),
+                        'Target Penerima': tp,
                         'Lokasi': f"{clean_str(item_ac.get('Kolom'))}-{int(float(item_ac.get('Baris', 0) or 0))}",
                         'Part Number': clean_str(item_ac.get('Part Number')),
                         'Nama Produk': clean_str(item_ac.get('Nama Produk')),
                         'Lot Number': clean_str(item_ac.get('Lot Number')),
                         'Approval QC': clean_str(item_ac.get('Approval QC')) or "Menunggu QC",
-                        'Is_Pecahan': 1 if ('pecahan' in clean_str(item_ac.get('Keterangan')).lower() or 'eceran' in clean_str(item_ac.get('Keterangan')).lower()) else 0
+                        'Pallet_Utuh': 0 if is_pec_ac else 1,
+                        'Qty_Pecahan': pec_val_ac
                     })
         st.session_state['active_plots_list'] = active_rows
 
@@ -2874,7 +2936,70 @@ with tab9:
                 ['Jadwal Kirim', 'Target Penerima', 'Lokasi', 'Part Number', 'Nama Produk', 'Lot Number', 'Approval QC'],
                 as_index=False
             ).agg(
-                Pallet_Utuh=('Is_Pecahan', lambda s: int((s == 0).sum())),
-                Slot_Pecahan=('Is_Pecahan', lambda s: int((s == 1).sum()))
+                Pallet_Utuh=('Pallet_Utuh', 'sum'),
+                Qty_Pecahan=('Qty_Pecahan', 'sum')
             )
             st.dataframe(df_act_grp, hide_index=True, use_container_width=True)
+
+            # Fitur Batalkan Plotting (Reschedule / Salah Plot)
+            with st.expander("🗑️ Batalkan Plotting Aktif (Lepas Kunci Jadwal Kirim)"):
+                df_act_grp['Label_Batal'] = df_act_grp.apply(
+                    lambda r: f"[{r['Jadwal Kirim']}] {r['Target Penerima']} | Rak {r['Lokasi']} | {r['Nama Produk']} (Lot {r['Lot Number']}) — {int(r['Pallet_Utuh'])}P {int(r['Qty_Pecahan'])} Pecahan",
+                    axis=1
+                )
+                pilih_batal_list = st.multiselect(
+                    "Pilih baris plotting yang ingin dibatalkan (dikembalikan ke stok bebas):",
+                    options=df_act_grp['Label_Batal'].tolist(),
+                    key="sel_batal_plotting"
+                )
+                if st.button("🔓 Batalkan Plotting Terpilih", type="secondary"):
+                    if not pilih_batal_list:
+                        st.warning("Pilih minimal 1 baris plotting yang akan dibatalkan.")
+                    else:
+                        rows_to_cancel = df_act_grp[df_act_grp['Label_Batal'].isin(pilih_batal_list)]
+                        kol_batal = sorted({r['Lokasi'].split("-")[0] for _, r in rows_to_cancel.iterrows()})
+                        refs_batal = {k: db.collection(NAMA_DATABASE).document(f"Kolom_{k}") for k in kol_batal}
+
+                        @firestore.transactional
+                        def tx_batal_plotting(transaction):
+                            snaps = {k: ref.get(transaction=transaction) for k, ref in refs_batal.items()}
+                            log_fb_usage('read', len(snaps))
+                            fresh_b, work_b = {}, {}
+                            for k, sp in snaps.items():
+                                arr = copy.deepcopy(sp.to_dict().get('data', [])) if sp.exists else []
+                                fresh_b[k] = copy.deepcopy(arr)
+                                work_b[k] = copy.deepcopy(arr)
+
+                            for _, rc in rows_to_cancel.iterrows():
+                                k_b, b_b = rc['Lokasi'].split("-")[0], int(rc['Lokasi'].split("-")[1])
+                                for slot in work_b[k_b]:
+                                    if (is_same_baris(slot, b_b)
+                                            and clean_str(slot.get('Part Number')).upper() == clean_str(rc['Part Number']).upper()
+                                            and clean_str(slot.get('Lot Number')) == clean_str(rc['Lot Number'])
+                                            and clean_str(slot.get('Jadwal Kirim')) == clean_str(rc['Jadwal Kirim'])
+                                            and clean_str(slot.get('Target Penerima')) == clean_str(rc['Target Penerima'])):
+                                        slot['Jadwal Kirim'] = ""
+                                        slot['Target Penerima'] = ""
+
+                            for k, ref in refs_batal.items():
+                                transaction.set(ref, {'data': work_b[k]})
+                            log_fb_usage('write', len(refs_batal))
+                            return fresh_b, work_b
+
+                        snap_b, final_b = tx_batal_plotting(db.transaction())
+                        for k_u, arr_u in final_b.items():
+                            record_doc_size(f"Kolom_{k_u}", arr_u)
+                        catat_log_mutasi(
+                            "BATAL PLOTTING (PPIC)", ",".join(kol_batal), "PLOT",
+                            "Pembatalan Plotting Outbound", "-", "-", 0, 0, 0,
+                            keterangan=f"Membatalkan {len(rows_to_cancel)} grup plotting",
+                            tujuan_kategori="BATAL PLOTTING",
+                            detail_sistem="; ".join(pilih_batal_list)
+                        )
+                        clear_all_rak_caches()
+                        st.session_state.update({
+                            'undo_dict': copy.deepcopy(snap_b),
+                            'action_msg': f"Berhasil membatalkan {len(rows_to_cancel)} grup plotting (kembali ke stok bebas).",
+                            'action_status': 'DONE'
+                        })
+                        st.rerun()
