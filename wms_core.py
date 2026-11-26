@@ -3,9 +3,11 @@ import pandas as pd
 import math
 import re
 import requests
+import hmac
 from datetime import datetime, timedelta
 import firebase_admin
 from firebase_admin import credentials, firestore
+
 
 # ==========================================================
 # 1. KONSTANTA, ZONA KHUSUS, FILTER WIP & INISIALISASI FIREBASE
@@ -2300,3 +2302,150 @@ def render_alur_pengambilan_terpadu(
                     st.error(f"❌ Transaksi Dibatalkan: {err}")
                 except Exception as err:
                     st.error(f"❌ Kesalahan Sistem: {err}")
+
+
+# ==========================================================
+# 5B. AUTENTIKASI OPERATOR TERPADU (0 READ FIREBASE VIA SECRETS)
+# ==========================================================
+def get_daftar_akun_operator():
+    """Membaca daftar username & password/PIN dari st.secrets['auth_operators']."""
+    try:
+        raw_auth = dict(st.secrets["auth_operators"])
+        return {str(k).strip(): str(v).strip() for k, v in raw_auth.items() if str(k).strip()}
+    except Exception:
+        return {}
+
+def verifikasi_login_operator(username_input, password_input):
+    """Memvalidasi username (case-insensitive) & password menggunakan constant-time compare."""
+    akun_map = get_daftar_akun_operator()
+    if not akun_map:
+        return False, "Konfigurasi [auth_operators] belum diatur di Streamlit Secrets."
+
+    u_clean = str(username_input).strip()
+    p_clean = str(password_input).strip()
+    if not u_clean or not p_clean:
+        return False, "Username dan PIN/Password wajib diisi."
+
+    matched_nama = None
+    matched_pass = None
+    for nama_terdaftar, pass_terdaftar in akun_map.items():
+        if nama_terdaftar.lower() == u_clean.lower():
+            matched_nama = nama_terdaftar
+            matched_pass = pass_terdaftar
+            break
+
+    if matched_nama is None:
+        return False, f"Username '{u_clean}' tidak terdaftar."
+
+    if hmac.compare_digest(p_clean, matched_pass):
+        return True, matched_nama
+    return False, "PIN / Password salah!"
+
+def render_login_operator(
+    app_title,
+    subtitle,
+    accent_color,
+    prefix_app,
+    operator_list,
+    slide_tujuan=1,
+    default_mode=None,
+    load_draft_type=None
+):
+    """
+    Komponen layar login standar (Slide 0) untuk LTIn, LTOut, dan LTOutb.
+    Operator memilih nama dari grid tombol (atau ketik manual), lalu memasukkan PIN/Password.
+    """
+    st.markdown(f"""
+        <div class="db-info-box" style="text-align: center;">
+            <div style="font-size: 18px; font-weight: bold; color: {accent_color};">
+                🔐 {app_title}
+            </div>
+            <div style="font-size: 13px; opacity: 0.85; margin-top: 4px;">
+                {subtitle}
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+
+    sel_key = f"_login_selected_user_{prefix_app}"
+    if sel_key not in st.session_state:
+        st.session_state[sel_key] = None
+
+    # Tahap A: Pilih Nama Operator dari Tombol Cepat atau Input Manual
+    if st.session_state[sel_key] is None:
+        st.markdown("**1. Pilih Nama Operator Bertugas:**")
+        st.markdown('<div class="btn-center">', unsafe_allow_html=True)
+        for i in range(0, len(operator_list), 2):
+            cols = st.columns(2)
+            with cols[0]:
+                op1 = operator_list[i]
+                if st.button(f"👤 {op1}", key=f"sel_op_{prefix_app}_{op1}", use_container_width=True):
+                    st.session_state[sel_key] = op1
+                    st.rerun()
+            if i + 1 < len(operator_list):
+                with cols[1]:
+                    op2 = operator_list[i + 1]
+                    if st.button(f"👤 {op2}", key=f"sel_op_{prefix_app}_{op2}", use_container_width=True):
+                        st.session_state[sel_key] = op2
+                        st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        st.write("")
+        with st.expander("➕ Login Username Manual / Operator Pengganti"):
+            with st.form(key=f"form_manual_login_{prefix_app}", clear_on_submit=False):
+                u_man = st.text_input("Username", placeholder="Cth: Operator_Pengganti")
+                p_man = st.text_input("PIN / Password", type="password", placeholder="Masukkan PIN/Password...")
+                sub_man = st.form_submit_button("🔓 MASUK", type="primary", use_container_width=True)
+                if sub_man:
+                    ok, res = verifikasi_login_operator(u_man, p_man)
+                    if ok:
+                        st.session_state.operator = res
+                        if default_mode:
+                            st.session_state.mode_transaksi = default_mode
+                        muat_undo_firestore(prefix_app, res)
+                        if load_draft_type == "INBOUND":
+                            muat_draft_inbound(prefix_app, res)
+                        elif load_draft_type == "OUTBOUND":
+                            muat_draft_outbound(prefix_app, res)
+                        st.session_state[sel_key] = None
+                        st.session_state.slide = slide_tujuan
+                        st.rerun()
+                    else:
+                        st.error(f"❌ {res}")
+
+    # Tahap B: Masukkan PIN / Password untuk Nama yang Dipilih
+    else:
+        nama_dipilih = st.session_state[sel_key]
+        if st.button("🔙 GANTI NAMA OPERATOR", key=f"back_sel_op_{prefix_app}"):
+            st.session_state[sel_key] = None
+            st.rerun()
+
+        with st.container(border=True):
+            st.markdown(
+                f"<div style='text-align:center;font-size:17px;margin-bottom:8px;'>"
+                f"Login sebagai: <strong style='color:{accent_color};'>👤 {escape_html(nama_dipilih)}</strong>"
+                f"</div>",
+                unsafe_allow_html=True
+            )
+            with st.form(key=f"form_pin_login_{prefix_app}", clear_on_submit=True):
+                pin_input = st.text_input(
+                    "Masukkan PIN / Password:",
+                    type="password",
+                    placeholder="••••"
+                )
+                btn_login = st.form_submit_button("🔓 VERIFIKASI & MASUK", type="primary", use_container_width=True)
+                if btn_login:
+                    ok, res = verifikasi_login_operator(nama_dipilih, pin_input)
+                    if ok:
+                        st.session_state.operator = res
+                        if default_mode:
+                            st.session_state.mode_transaksi = default_mode
+                        muat_undo_firestore(prefix_app, res)
+                        if load_draft_type == "INBOUND":
+                            muat_draft_inbound(prefix_app, res)
+                        elif load_draft_type == "OUTBOUND":
+                            muat_draft_outbound(prefix_app, res)
+                        st.session_state[sel_key] = None
+                        st.session_state.slide = slide_tujuan
+                        st.rerun()
+                    else:
+                        st.error(f"❌ {res}")
