@@ -380,7 +380,97 @@ def scan_stok_bebas_untuk_plotting(semua_data, target_part_num, strict_fifo_shif
         by=sort_cols,
         ascending=[True] * len(sort_cols)
     ).reset_index(drop=True)
+def evaluasi_akses_dinamis_plot(df_kandidat, all_rak_records, target_part_num):
+    """
+    Menghitung ulang status 'Akses Pintu' secara dinamis dengan memperhitungkan
+    palet-palet di lorong yang sama yang IKUT ter-plot (sehingga tidak lagi menjadi penghalang fisik).
+    """
+    if df_kandidat.empty:
+        return df_kandidat
 
+    pn_target = clean_str(target_part_num).upper()
+    df_all = pd.DataFrame(all_rak_records)
+    df_all['Baris_Int'] = pd.to_numeric(df_all['Baris'], errors='coerce').fillna(0).astype(int)
+    df_all['Pallet_Ke_Num'] = pd.to_numeric(df_all['Pallet Ke'], errors='coerce').fillna(0)
+    for col_opt in ['Jadwal Kirim', 'Target Penerima', 'Keterangan']:
+        df_all[col_opt] = df_all[col_opt].apply(clean_str) if col_opt in df_all.columns else ""
+
+    # Peta jumlah palet utuh yang ter-plot per (Kolom, Baris, Lot)
+    plot_map = {}
+    for _, r in df_kandidat.iterrows():
+        plot_map[(r['Kolom'], int(r['Baris']), clean_str(r['Lot Number']))] = int(r['Plot Utuh'])
+
+    akses_dinamis_list = []
+    for _, r in df_kandidat.iterrows():
+        kol = r['Kolom']
+        bar = int(r['Baris'])
+        lot = clean_str(r['Lot Number'])
+
+        df_aisle = df_all[
+            (df_all['Kolom'].apply(clean_str) == kol) &
+            (df_all['Baris_Int'] == bar)
+        ].sort_values('Pallet_Ke_Num')
+
+        target_slots = df_aisle[
+            (df_aisle['Part Number'].apply(clean_str).str.upper() == pn_target) &
+            (df_aisle['Lot Number'].apply(clean_str) == lot) &
+            (df_aisle['Jadwal Kirim'] == "") &
+            (df_aisle['Target Penerima'] == "")
+        ]
+        if target_slots.empty:
+            akses_dinamis_list.append(r['Akses Pintu'])
+            continue
+
+        min_pos = target_slots['Pallet_Ke_Num'].min()
+        max_pos = target_slots['Pallet_Ke_Num'].max()
+
+        # Hitung sisa palet di DEPAN dan BELAKANG yang TIDAK ikut ter-plot
+        sisa_depan = 0
+        sisa_belakang = 0
+        terbuka_oleh_rombongan = False
+
+        for pos_side, df_side in [
+            ("DEPAN", df_aisle[df_aisle['Pallet_Ke_Num'] < min_pos]),
+            ("BELAKANG", df_aisle[df_aisle['Pallet_Ke_Num'] > max_pos])
+        ]:
+            # Kelompokkan per (Part Number, Lot Number, Jadwal Kirim) di sisi tersebut
+            sisa_sisi = 0
+            for (p_s, l_s, jk_s), grp_s in df_side.groupby([
+                df_side['Part Number'].apply(clean_str).str.upper(),
+                df_side['Lot Number'].apply(clean_str),
+                df_side['Jadwal Kirim']
+            ]):
+                total_slot_grup = len(grp_s)
+                if p_s == pn_target and jk_s == "":
+                    diambil_plot = plot_map.get((kol, bar, l_s), 0)
+                    sisa_grup = max(0, total_slot_grup - diambil_plot)
+                    if diambil_plot > 0 and sisa_grup == 0 and pos_side == "DEPAN":
+                        terbuka_oleh_rombongan = True
+                else:
+                    sisa_grup = total_slot_grup
+                sisa_sisi += sisa_grup
+
+            if pos_side == "DEPAN":
+                sisa_depan = sisa_sisi
+            else:
+                sisa_belakang = sisa_sisi
+
+        if sisa_depan == 0:
+            if terbuka_oleh_rombongan:
+                akses_dinamis_list.append("DEPAN (FIFO - Lanjut Antrean)")
+            else:
+                akses_dinamis_list.append("DEPAN (FIFO)")
+        elif sisa_belakang == 0:
+            akses_dinamis_list.append("BELAKANG (LIFO)")
+        else:
+            if sisa_depan <= sisa_belakang:
+                akses_dinamis_list.append(f"TERHALANG DEPAN ({sisa_depan}P)")
+            else:
+                akses_dinamis_list.append(f"TERHALANG BELAKANG ({sisa_belakang}P)")
+
+    df_out = df_kandidat.copy()
+    df_out['Akses Pintu'] = akses_dinamis_list
+    return df_out
 # ==========================================================
 # 4. CETAK KARTU RACKING / PICKING LIST
 # ==========================================================
@@ -2576,6 +2666,7 @@ with tab9:
 
                 df_kandidat['Plot Utuh'] = plot_p_list
                 df_kandidat[f'Plot {satuan_plot.title()}'] = plot_d_list
+                df_kandidat = evaluasi_akses_dinamis_plot(df_kandidat, all_rak_records, part_plot_clean)
 
                 st.divider()
                 st.markdown(f"**5. Hasil Kandidat Lot & Lokasi Rak untuk `{pilih_item_plot}` (`{part_plot_clean}`)**")
