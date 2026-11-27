@@ -1,82 +1,98 @@
 import tomllib
-import pandas as pd
+import math
 import firebase_admin
 from firebase_admin import credentials, firestore
 from supabase import create_client
 
-# 1. Baca secrets.toml lokal
+# 1. Baca kredensial langsung dari .streamlit/secrets.toml
 with open(".streamlit/secrets.toml", "rb") as f:
     secrets = tomllib.load(f)
 
-# 2. Koneksi Firestore (Sumber)
+# 2. Koneksi ke Firebase Firestore
 if not firebase_admin._apps:
     cred = credentials.Certificate(dict(secrets["firebase"]))
     firebase_admin.initialize_app(cred)
-db_fs = firestore.client()
+db_firebase = firestore.client()
 
-# 3. Koneksi Supabase (Tujuan)
-sb = create_client(secrets["supabase"]["url"], secrets["supabase"]["key"])
+# 3. Koneksi ke Supabase
+sb_url = secrets["supabase"]["url"]
+sb_key = secrets["supabase"]["key"]
+supabase = create_client(sb_url, sb_key)
 
-print("1. Mengambil data dari Firestore 'uji_coba_rak'...")
-docs = db_fs.collection("uji_coba_rak").stream()
-semua_data = []
-for doc in docs:
-    d = doc.to_dict() or {}
-    if "data" in d and isinstance(d["data"], list):
-        semua_data.extend(d["data"])
+NAMA_KOLEKSI = "uji_coba_rak"
+NAMA_TABEL = "uji_coba_rak"
 
-print(f"Total baris ditemukan: {len(semua_data)}")
+def clean_str(val):
+    if val is None:
+        return ""
+    if isinstance(val, float) and math.isnan(val):
+        return ""
+    s = str(val).strip()
+    return "" if s.lower() in ["nan", "none", "<na>"] else s
 
-# 4. Normalisasi format kolom & deduplikasi (kolom, baris, pallet_ke)
-rows_map = {}
-for item in semua_data:
-    kol = str(item.get("Kolom", "")).strip().upper()
-    bar = int(pd.to_numeric(item.get("Baris", 0), errors="coerce") or 0)
-    plt_raw = item.get("Pallet Ke", item.get("Palet Ke", 0))
-    plt_ke = int(pd.to_numeric(plt_raw, errors="coerce") or 0)
+def clean_int(val):
+    try:
+        if val is None or (isinstance(val, float) and math.isnan(val)):
+            return 0
+        return int(float(str(val).strip()))
+    except Exception:
+        return 0
 
-    if kol not in ["A", "B", "C", "D", "E", "F", "G"] or bar <= 0 or plt_ke <= 0:
-        continue
+def main():
+    print(f"📥 Menarik seluruh dokumen dari Firestore '{NAMA_KOLEKSI}'...")
+    docs = db_firebase.collection(NAMA_KOLEKSI).stream()
 
-    pn = str(item.get("Part Number", "") or "").strip().upper()
-    if pn.lower() in ["nan", "none", "<na>"]:
-        pn = ""
+    raw_rows = []
+    doc_count = 0
+    for doc in docs:
+        doc_count += 1
+        doc_data = doc.to_dict()
+        if "data" in doc_data and isinstance(doc_data["data"], list):
+            raw_rows.extend(doc_data["data"])
 
-    nm = str(item.get("Nama Produk") or item.get("Nama Barang") or "").strip()
-    if nm.lower() in ["nan", "none", "<na>"]:
-        nm = ""
+    print(f"✅ Ditemukan {doc_count} dokumen dengan total {len(raw_rows)} baris palet.")
 
-    lot = str(item.get("Lot Number", "") or "").strip()
-    if lot.lower() in ["nan", "none", "<na>"]:
-        lot = ""
+    if not raw_rows:
+        print("⚠️ Tidak ada data untuk dimigrasi.")
+        return
 
-    ket = str(item.get("Keterangan", "") or "").strip()
-    if ket.lower() in ["nan", "none", "<na>"]:
-        ket = ""
+    # Normalisasi struktur kolom agar seragam
+    payload = []
+    for r in raw_rows:
+        # Handle variasi penamaan kolom di Firebase
+        pallet_val = r.get("Pallet Ke", r.get("Palet Ke", r.get("pallet_ke", 0)))
+        nama_val = r.get("Nama Produk", r.get("Nama Barang", r.get("nama_produk", "")))
 
-    cat = str(item.get("Catatan", "") or "").strip()
-    if cat.lower() in ["nan", "none", "<na>"]:
-        cat = ""
+        kolom_clean = clean_str(r.get("Kolom", r.get("kolom", ""))).upper()
+        baris_clean = clean_int(r.get("Baris", r.get("baris", 0)))
 
-    rows_map[(kol, bar, plt_ke)] = {
-        "kolom": kol,
-        "baris": bar,
-        "pallet_ke": plt_ke,
-        "part_number": pn,
-        "nama_produk": nm,
-        "lot_number": lot,
-        "keterangan": ket,
-        "catatan": cat,
-    }
+        if not kolom_clean or baris_clean == 0:
+            continue
 
-payload = list(rows_map.values())
-print(f"2. Mengunggah {len(payload)} baris unik ke Supabase 'stok_rak'...")
+        payload.append({
+            "kolom": kolom_clean,
+            "baris": baris_clean,
+            "pallet_ke": clean_int(pallet_val),
+            "part_number": clean_str(r.get("Part Number", r.get("part_number", ""))).upper(),
+            "nama_produk": clean_str(nama_val),
+            "lot_number": clean_str(r.get("Lot Number", r.get("lot_number", ""))),
+            "keterangan": clean_str(r.get("Keterangan", r.get("keterangan", ""))),
+            "catatan": clean_str(r.get("Catatan", r.get("catatan", "")))
+        })
 
-# 5. Upsert per batch 500 baris agar cepat & aman
-BATCH_SIZE = 500
-for i in range(0, len(payload), BATCH_SIZE):
-    batch = payload[i : i + BATCH_SIZE]
-    sb.table("stok_rak").upsert(batch, on_conflict="kolom,baris,pallet_ke").execute()
-    print(f"   Terkirim {min(i + BATCH_SIZE, len(payload))} / {len(payload)} baris")
+    print(f"🧹 Membersihkan tabel '{NAMA_TABEL}' di Supabase sebelum insert ulang...")
+    supabase.table(NAMA_TABEL).delete().neq("id", 0).execute()
 
-print("✅ Migrasi selesai! Silakan cek menu Table Editor -> stok_rak di Supabase.")
+    # Upload bertahap per 500 baris agar stabil & cepat
+    batch_size = 500
+    total_inserted = 0
+    for i in range(0, len(payload), batch_size):
+        chunk = payload[i : i + batch_size]
+        supabase.table(NAMA_TABEL).insert(chunk).execute()
+        total_inserted += len(chunk)
+        print(f"🚀 Terkirim: {total_inserted} / {len(payload)} baris...")
+
+    print("🎉 Re-migrasi selesai 100%!")
+
+if __name__ == "__main__":
+    main()
