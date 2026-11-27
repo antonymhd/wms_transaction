@@ -2,12 +2,45 @@ import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
 from supabase import create_client, Client
+from postgrest.exceptions import APIError
 import re
 import io
 from datetime import datetime, timedelta
 import plotly.express as px
-from postgrest.exceptions import APIError
 
+# ==========================================================
+# 1. KONFIGURASI HALAMAN (WAJIB PALING PERTAMA)
+# ==========================================================
+st.set_page_config(
+    page_title="Warehouse 2D Racking",
+    page_icon="📦",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# ==========================================================
+# 2. INIT SUPABASE (POSTGRESQL)
+# ==========================================================
+NAMA_TABEL = 'uji_coba_rak'
+
+@st.cache_resource
+def init_supabase() -> Client:
+    if "supabase" in st.secrets:
+        url = st.secrets["supabase"]["url"]
+        key = st.secrets["supabase"]["key"]
+    elif "connections" in st.secrets and "supabase" in st.secrets["connections"]:
+        url = st.secrets["connections"]["supabase"]["SUPABASE_URL"]
+        key = st.secrets["connections"]["supabase"]["SUPABASE_KEY"]
+    else:
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_KEY"]
+    return create_client(url, key)
+
+supabase = init_supabase()
+
+# ==========================================================
+# 3. FUNGSI LOAD DATA (PAGINATION SAFE, ERROR HANDLED & MASTER)
+# ==========================================================
 @st.cache_data(ttl=300)
 def load_data_from_supabase():
     semua_data = []
@@ -28,54 +61,17 @@ def load_data_from_supabase():
                 break
             offset += batch_size
     except APIError as e:
-        st.error(f"Detail Error Supabase -> Code: {e.code} | Message: {e.message} | Hint: {e.hint}")
-        st.stop()
-
-# ==========================================================
-# 1. KONFIGURASI HALAMAN
-# ==========================================================
-st.set_page_config(
-    page_title="Warehouse 2D Racking", 
-    page_icon="📦", 
-    layout="wide", 
-    initial_sidebar_state="expanded"
-)
-
-# ==========================================================
-# 2. INIT SUPABASE (POSTGRESQL)
-# ==========================================================
-NAMA_TABEL = 'uji_coba_rak'
-
-@st.cache_resource
-def init_supabase() -> Client:
-    url = st.secrets["supabase"]["url"]
-    key = st.secrets["supabase"]["key"]
-    return create_client(url, key)
-
-supabase = init_supabase()
-
-# ==========================================================
-# 3. FUNGSI LOAD DATA (PAGINATION SAFE & MASTER PRODUK)
-# ==========================================================
-@st.cache_data(ttl=300)
-def load_data_from_supabase():
-    semua_data = []
-    batch_size = 1000
-    offset = 0
-
-    # Tarik bertahap per 1000 baris agar kapasitas 6.548 palet tidak terpotong limit default API Supabase
-    while True:
-        response = (
-            supabase.table(NAMA_TABEL)
-            .select("*")
-            .range(offset, offset + batch_size - 1)
-            .execute()
+        st.error(
+            f"❌ **Gagal memuat data dari Supabase (`{NAMA_TABEL}`)**\n\n"
+            f"- **Code:** `{e.code}`\n"
+            f"- **Message:** {e.message}\n"
+            f"- **Details:** {e.details}\n"
+            f"- **Hint:** {e.hint}"
         )
-        rows = response.data or []
-        semua_data.extend(rows)
-        if len(rows) < batch_size:
-            break
-        offset += batch_size
+        st.stop()
+    except Exception as e:
+        st.error(f"❌ **Terjadi kesalahan koneksi Supabase:** {e}")
+        st.stop()
 
     if not semua_data:
         return pd.DataFrame()
@@ -97,11 +93,11 @@ def load_data_from_supabase():
         'keterangan': 'Keterangan',
         'catatan': 'Catatan'
     }
-    rename_dict = {}
-    for c in df.columns:
-        c_clean = c.strip().lower()
-        if c_clean in col_mapping:
-            rename_dict[c] = col_mapping[c_clean]
+    rename_dict = {
+        c: col_mapping[c.strip().lower()]
+        for c in df.columns
+        if c.strip().lower() in col_mapping
+    }
     df.rename(columns=rename_dict, inplace=True)
 
     for col in ['Baris', 'Pallet Ke']:
@@ -134,7 +130,10 @@ def load_master_produk():
 df_master_global = load_master_produk()
 master_dict = {}
 if not df_master_global.empty and 'Part Number Clean' in df_master_global.columns:
-    kat_cols = [c for c in df_master_global.columns if any(k in c.lower() for k in ['kategori', 'jenis', 'group', 'tipe', 'nama'])]
+    kat_cols = [
+        c for c in df_master_global.columns
+        if any(k in c.lower() for k in ['kategori', 'jenis', 'group', 'tipe', 'nama'])
+    ]
     for _, row in df_master_global.iterrows():
         pn = row['Part Number Clean']
         ip = pd.to_numeric(row.get('Isi 1 Pallet (pcs)', 0), errors='coerce')
@@ -149,7 +148,7 @@ if not df_master_global.empty and 'Part Number Clean' in df_master_global.column
         }
 
 # ==========================================================
-# FUNGSI HELPER, PARSER STOK AKURAT, & KLASIFIKASI PRODUK
+# 4. FUNGSI HELPER, PARSER STOK AKURAT, & KLASIFIKASI PRODUK
 # ==========================================================
 def get_waktu_jkt():
     return datetime.utcnow() + timedelta(hours=7)
@@ -182,7 +181,7 @@ def parse_keterangan_stok(row_ket):
     if not ket_str or ket_str in ['nan', 'none', '-', 'utuh', 'full']:
         return 1, 0, 0
 
-    if 'pecahan' not in ket_str and 'eceran' not in ket_str and 'dus' not in ket_str and 'sak' not in ket_str and 'pcs' not in ket_str:
+    if not any(k in ket_str for k in ['pecahan', 'eceran', 'dus', 'sak', 'pcs']):
         return 1, 0, 0
 
     val_pecahan = 0
@@ -236,8 +235,8 @@ def klasifikasi_kategori_palet(part_num, nama_produk, baris=0):
         return "Cup Printing"
 
     warna_keywords = [
-        "COLOR", "COLOUR", "MERAH", "BIRU", "HIJAU", "KUNING", 
-        "COKLAT", "COKELAT", "PUTIH", "HITAM", "ORANGE", "UNGU", 
+        "COLOR", "COLOUR", "MERAH", "BIRU", "HIJAU", "KUNING",
+        "COKLAT", "COKELAT", "PUTIH", "HITAM", "ORANGE", "UNGU",
         "PINK", "GOLD", "SILVER", "TOSCA", "MAROON", "RED", "BLUE", "GREEN", "YELLOW"
     ]
     if any(re.search(rf'\b{w}\b', combined) for w in warna_keywords):
@@ -288,20 +287,18 @@ def build_picking_cards(kolom, baris, df_sub, prod_col):
     lokasi_str = f"{kolom}-{baris}"
     area_str = "Area 1 (1–16)" if baris <= 16 else "Area 2 (17–28)"
 
+    empty_card = [{
+        'Lokasi': lokasi_str, 'Area': area_str, 'Part Number': '-',
+        'Nama Produk': 'RAK KOSONG', 'Total Fisik': '0', 'Total Pcs': 0,
+        'Rumus Konversi': '-', 'Detail Lot': [], 'Is_Empty': True
+    }]
+
     if df_sub.empty or 'Part Number' not in df_sub.columns:
-        return [{
-            'Lokasi': lokasi_str, 'Area': area_str, 'Part Number': '-',
-            'Nama Produk': 'RAK KOSONG', 'Total Fisik': '0', 'Total Pcs': 0,
-            'Rumus Konversi': '-', 'Detail Lot': [], 'Is_Empty': True
-        }]
+        return empty_card
 
     valid_df = df_sub[~df_sub['Part Number'].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>"])].copy()
     if valid_df.empty:
-        return [{
-            'Lokasi': lokasi_str, 'Area': area_str, 'Part Number': '-',
-            'Nama Produk': 'RAK KOSONG', 'Total Fisik': '0', 'Total Pcs': 0,
-            'Rumus Konversi': '-', 'Detail Lot': [], 'Is_Empty': True
-        }]
+        return empty_card
 
     valid_df['PN_Clean'] = valid_df['Part Number'].astype(str).str.strip().str.upper()
     if 'Pallet Ke' in valid_df.columns:
@@ -312,7 +309,11 @@ def build_picking_cards(kolom, baris, df_sub, prod_col):
 
     for pn in pn_order:
         df_item = valid_df[valid_df['PN_Clean'] == pn].copy()
-        prod_name = str(df_item[prod_col].dropna().values[0]).strip() if prod_col in df_item.columns and len(df_item[prod_col].dropna().values) > 0 else "-"
+        prod_name = (
+            str(df_item[prod_col].dropna().values[0]).strip()
+            if prod_col in df_item.columns and len(df_item[prod_col].dropna().values) > 0
+            else "-"
+        )
 
         master_info = master_dict.get(pn, {'ip': 0, 'pb': 0, 'ps': 0})
         pss = master_info['pb'] if pn.endswith(('D', 'G')) else master_info['ps']
@@ -535,7 +536,7 @@ def render_print_html(cards, judul_dok, waktu_cetak):
     """
 
 # ==========================================================
-# 4. SIDEBAR & PENGATURAN
+# 5. SIDEBAR & PENGATURAN
 # ==========================================================
 st.sidebar.header("🔄 Sinkronisasi Real-Time")
 st.sidebar.info("Data dikunci selama 5 menit (cache lokal) agar pemuatan grid seketika.")
@@ -547,12 +548,12 @@ if st.sidebar.button("🔄 Tarik Data Gudang Terbaru", use_container_width=True,
 st.sidebar.divider()
 st.sidebar.header("👁️ Mode Tampilan Kotak")
 mode_tampilan = st.sidebar.radio("Angka di dalam kotak rak mewakili:", [
-    "Variasi SKU (Jenis Barang)", 
+    "Variasi SKU (Jenis Barang)",
     "Sisa Slot Kosong"
 ])
 
 # ==========================================================
-# 5. MEMUAT DATA UTAMA & PENCARIAN
+# 6. MEMUAT DATA UTAMA & PENCARIAN
 # ==========================================================
 st.title("📦 Visualisasi Grid Gudang (Live Monitor)")
 st.caption(f"Layar pantau Read-Only. Terhubung ke Supabase: {NAMA_TABEL} (Area Shuttle A - G)")
@@ -644,7 +645,7 @@ if tipe_cari in ["Berdasarkan Produk", "Berdasarkan Part Number"]:
                 st.markdown(
                     f"<div style='text-align: right; padding-top: 8px; font-size: 16px; color: #475569;'>"
                     f"Total Kuantitas Keseluruhan (Rak A-G): <span style='color: #2563eb; font-weight: 900; font-size: 18px;'>{total_semua_format} Pcs</span>"
-                    f"</div>", 
+                    f"</div>",
                     unsafe_allow_html=True
                 )
             st.divider()
@@ -661,7 +662,7 @@ else:
     search_lot = "" if pilihan_lot == "-- Tampilkan Semua --" else pilihan_lot
 
 # ==========================================================
-# 6. LOGIKA MATRIKS RAK (CACHED UNTUK POP-UP INSTAN)
+# 7. LOGIKA MATRIKS RAK (CACHED UNTUK POP-UP INSTAN)
 # ==========================================================
 def is_rack_exist(kolom, baris):
     if kolom == 'F' and baris < 5: return False
@@ -724,8 +725,8 @@ def process_matrix_data(df, search_term, search_lot_term, prod_col):
                 total_kosong += 1
 
             matrix_info[(k, b)] = {
-                'exist': True, 'sku_cnt': sku, 'filled': filled, 
-                'usable_space': usable_space, 'max_slot': max_slot, 
+                'exist': True, 'sku_cnt': sku, 'filled': filled,
+                'usable_space': usable_space, 'max_slot': max_slot,
                 'df_sub': sub, 'is_match': is_match
             }
 
@@ -759,17 +760,17 @@ if bayangan_data:
     df_bayangan = df_bayangan[cols_tersedia].sort_values(by=['Kolom', 'Baris', 'Pallet Ke'])
     csv = df_bayangan.to_csv(index=False, sep=";").encode('utf-8-sig')
     st.sidebar.download_button(
-        label="📥 Unduh Daftar Pallet Bayangan", 
-        data=csv, 
-        file_name=f"Cek_Lapangan_Overlimit_{get_waktu_jkt().strftime('%Y%m%d_%H%M')}.csv", 
-        mime="text/csv", 
+        label="📥 Unduh Daftar Pallet Bayangan",
+        data=csv,
+        file_name=f"Cek_Lapangan_Overlimit_{get_waktu_jkt().strftime('%Y%m%d_%H%M')}.csv",
+        mime="text/csv",
         type="primary"
     )
 else:
     st.sidebar.success("✅ Seluruh rak dalam batas kapasitas normal.")
 
 # ==========================================================
-# 7. POP-UP DETAIL RAK (+ CETAK KARTU CEPAT)
+# 8. POP-UP DETAIL RAK (+ CETAK KARTU CEPAT)
 # ==========================================================
 @st.dialog("📦 Rincian Detail Rak", width="large")
 def show_rack_detail(k, b, info):
@@ -849,7 +850,7 @@ def show_rack_detail(k, b, info):
         components.html(html_single, height=420, scrolling=True)
 
 # ==========================================================
-# 8. METRIK ATAS & TABS UTAMA
+# 9. METRIK ATAS & TABS UTAMA
 # ==========================================================
 col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
 total_baris_hitung = total_ideal + total_warning + total_critical + total_kosong
@@ -880,34 +881,34 @@ with tab_grid:
         })
 
         warna_pie = {
-            '🟢 Ideal': 'palegreen', 
-            '🟡 Campur': 'gold', 
-            '🔴 Kritis': 'crimson', 
+            '🟢 Ideal': 'palegreen',
+            '🟡 Campur': 'gold',
+            '🔴 Kritis': 'crimson',
             '⚪ Kosong': 'gainsboro'
         }
 
         fig_status = px.pie(
-            df_pie, 
-            values='Jumlah', 
-            names='Status', 
+            df_pie,
+            values='Jumlah',
+            names='Status',
             color='Status',
-            color_discrete_map=warna_pie, 
+            color_discrete_map=warna_pie,
             hole=0.4
         )
 
         fig_status.update_traces(
-            textposition='inside', 
+            textposition='inside',
             textinfo='percent+label',
             hovertemplate="<b>%{label}</b><br>Jumlah: %{value} Rak<br>Persentase: %{percent}<extra></extra>",
-            textfont_size=13, 
+            textfont_size=13,
             textfont_color='black'
         )
 
         fig_status.update_layout(
-            margin=dict(t=15, b=15, l=10, r=10), 
-            height=300, 
+            margin=dict(t=15, b=15, l=10, r=10),
+            height=300,
             showlegend=False,
-            plot_bgcolor='rgba(0,0,0,0)', 
+            plot_bgcolor='rgba(0,0,0,0)',
             paper_bgcolor='rgba(0,0,0,0)'
         )
         st.plotly_chart(fig_status, use_container_width=True)
@@ -919,7 +920,7 @@ with tab_grid:
         st.markdown(
             f"<div style='text-align:center; font-weight:800; font-size:15px; color:#334155;'>"
             f"📦 Komposisi Palet Produk vs Free Space ({total_palet_terisi:,} / {KAPASITAS_IDEAL_TOTAL:,} Plt • {persen_isi:.1f}%)"
-            f"</div>".replace(',', '.'), 
+            f"</div>".replace(',', '.'),
             unsafe_allow_html=True
         )
 
@@ -977,7 +978,13 @@ with tab_grid:
     div[class^="st-key-btn_"] button p { margin: 0 !important; line-height: 1 !important; font-size: clamp(9px, 1.2vw, 14px) !important; }
     '''
     dynamic_css = f"{css_block_1}\n{css_block_2}\n{css_block_3}\n{css_block_4}\n{css_btn}"
-    color_map = {'match': {"bg": "deepskyblue", "txt": "black", "sel": []}, 'critical': {"bg": "crimson", "txt": "white", "sel": []}, 'warning': {"bg": "gold", "txt": "black", "sel": []}, 'ideal': {"bg": "palegreen", "txt": "black", "sel": []}, 'empty': {"bg": "gainsboro", "txt": "gray", "sel": []}}
+    color_map = {
+        'match': {"bg": "deepskyblue", "txt": "black", "sel": []},
+        'critical': {"bg": "crimson", "txt": "white", "sel": []},
+        'warning': {"bg": "gold", "txt": "black", "sel": []},
+        'ideal': {"bg": "palegreen", "txt": "black", "sel": []},
+        'empty': {"bg": "gainsboro", "txt": "gray", "sel": []}
+    }
 
     for k in kolom_list:
         for b in baris_list:
@@ -993,7 +1000,8 @@ with tab_grid:
             else: color_map['empty']['sel'].append(sel)
 
     for group in color_map.values():
-        if group['sel']: dynamic_css += f"\n{', '.join(group['sel'])} {{ background-color: {group['bg']} !important; color: {group['txt']} !important; }}"
+        if group['sel']:
+            dynamic_css += f"\n{', '.join(group['sel'])} {{ background-color: {group['bg']} !important; color: {group['txt']} !important; }}"
 
     st.markdown(f"<style>{dynamic_css}</style>", unsafe_allow_html=True)
 
