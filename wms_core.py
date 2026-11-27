@@ -1204,54 +1204,71 @@ def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh,
 
 
 def simpan_draft_inbound(prefix_app, operator_name, draft_payload):
-    """Menyimpan draft inbound ke tabel Supabase `wms_inbound_drafts` (kolom doc_id & data)."""
-    if not operator_name:
-        return
+    """Menyimpan draft inbound ke tabel Supabase `wms_inbound_drafts` per operator."""
+    op_clean = clean_str(operator_name)
+    if not op_clean:
+        return False
     saved_str = get_waktu_jkt().strftime("%Y-%m-%d %H:%M:%S")
     payload_copy = copy.deepcopy(draft_payload)
     payload_copy["saved_at"] = saved_str
+    payload_copy["source_app"] = prefix_app
     st.session_state.inbound_draft = payload_copy
     try:
         supabase.table(DB_DRAFT_INBOUND).upsert({
-            "doc_id": f"{prefix_app}_{operator_name}",
+            "doc_id": f"INBOUND_{op_clean}",
             "data": payload_copy,
             "migrated_at": datetime.now(timezone.utc).isoformat(),
         }, on_conflict="doc_id").execute()
+        return True
     except Exception as e:
-        st.toast(f"⚠️ Gagal simpan draft ke Supabase: {e}", icon="⚠️")
+        st.error(f"❌ Gagal menyimpan draft ke Supabase: {e}")
+        return False
 
 
 def muat_draft_inbound(prefix_app, operator_name):
-    if not operator_name:
+    """Membaca draft inbound dari Supabase (mendukung doc_id baru INBOUND_<Op> maupun lama IN_/INB_<Op>)."""
+    op_clean = clean_str(operator_name)
+    if not op_clean:
         st.session_state.inbound_draft = None
-        return
+        return None
     try:
+        kandidat_ids = [f"INBOUND_{op_clean}", f"{prefix_app}_{op_clean}", f"INB_{op_clean}", f"IN_{op_clean}"]
         res = (
             supabase.table(DB_DRAFT_INBOUND)
             .select("*")
-            .eq("doc_id", f"{prefix_app}_{operator_name}")
+            .in_("doc_id", list(dict.fromkeys(kandidat_ids)))
             .execute()
         )
-        if res.data:
-            rec = res.data[0]
-            data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
-            saved_at = data.get("saved_at")
-            if saved_at:
-                saved_dt = datetime.strptime(saved_at, "%Y-%m-%d %H:%M:%S")
-                if (get_waktu_jkt() - saved_dt) <= timedelta(hours=12):
-                    st.session_state.inbound_draft = data
-                    return
-    except Exception:
-        pass
+        for rec in (res.data or []):
+            data = rec.get("data")
+            if isinstance(data, str):
+                import json
+                data = json.loads(data)
+            if isinstance(data, dict) and data.get("item"):
+                saved_at = clean_str(data.get("saved_at"))
+                if saved_at:
+                    try:
+                        saved_dt = datetime.strptime(saved_at[:19], "%Y-%m-%d %H:%M:%S")
+                        if (get_waktu_jkt() - saved_dt) > timedelta(hours=12):
+                            continue
+                    except Exception:
+                        pass
+                st.session_state.inbound_draft = data
+                return data
+    except Exception as e:
+        st.warning(f"⚠️ Gagal membaca draft: {e}")
     st.session_state.inbound_draft = None
+    return None
 
 
 def hapus_draft_inbound(prefix_app, operator_name):
     st.session_state.inbound_draft = None
-    if not operator_name:
+    op_clean = clean_str(operator_name)
+    if not op_clean:
         return
     try:
-        supabase.table(DB_DRAFT_INBOUND).delete().eq("doc_id", f"{prefix_app}_{operator_name}").execute()
+        kandidat_ids = [f"INBOUND_{op_clean}", f"{prefix_app}_{op_clean}", f"INB_{op_clean}", f"IN_{op_clean}"]
+        supabase.table(DB_DRAFT_INBOUND).delete().in_("doc_id", list(dict.fromkeys(kandidat_ids))).execute()
     except Exception:
         pass
 
