@@ -28,15 +28,18 @@ PART_KHUSUS_TOP_TIER = {'MJSCN3802703D', 'MJSCN3802901D'}
 # Item Cup Natural khusus yang boleh diambil untuk Suplai WIP (selain seluruh Preform & Cup Color)
 PART_WIP_CUP_NATURAL = {'MJSCN3902902G', 'MJSCN3903101D', 'MJSCN3204303D', 'MJSCN3205004D'}
 
+
 def is_zona_jdo(kolom, baris_int):
     k = str(kolom).strip().upper()
     return (k == 'F' and 1 <= baris_int <= 16) or (k == 'G' and 17 <= baris_int <= 28)
+
 
 def is_rak_valid_untuk_produk(kolom, baris_int, part_num):
     p = str(part_num).strip().upper()
     if p in PART_KHUSUS_TOP_TIER:
         return is_zona_jdo(kolom, baris_int)
     return True
+
 
 def hitung_zone_penalty(kolom, baris_int, target_item, part_num):
     """
@@ -79,7 +82,7 @@ def hitung_zone_penalty(kolom, baris_int, target_item, part_num):
 
 
 class _DummySupabaseShim:
-    """Kompatibilitas pemanggilan lama `db.collection(...).document(...)` & `db.transaction()`."""
+    """Kompatibilitas pemanggilan `db.collection(...).document(...)` & `db.transaction()`."""
     class _DummyDocRef:
         def __init__(self, table_name, doc_id):
             self.table_name = table_name
@@ -171,6 +174,7 @@ def _sync_kolom_to_supabase(kolom_id: str, slot_dicts: list):
     """Menyinkronkan seluruh daftar slot 1 kolom (upsert baris aktif + hapus sisa slot kosong)."""
     kol = clean_str(kolom_id).upper()
     payload_map = {}
+    now_iso = datetime.now(timezone.utc).isoformat()
 
     for item in slot_dicts:
         pn = clean_str(item.get('Part Number')).upper()
@@ -191,7 +195,7 @@ def _sync_kolom_to_supabase(kolom_id: str, slot_dicts: list):
             'jadwal_kirim': clean_str(item.get('Jadwal Kirim')),
             'target_penerima': clean_str(item.get('Target Penerima')),
             'status': clean_str(item.get('Status')) or 'Terisi',
-            'updated_at': datetime.now(timezone.utc).isoformat(),
+            'updated_at': now_iso,
         }
 
     payload = list(payload_map.values())
@@ -507,13 +511,26 @@ def get_all_racking_data():
 
 @st.cache_data(ttl=120)
 def get_qc_approval_map():
-    """Membaca peta master Approval QC per Part_Lot dari tabel wms_qc_approval."""
+    """Membaca peta master Approval QC dari tabel wms_qc_approval (skema doc_id & data JSONB)."""
     try:
         res = supabase.table(DB_QC_APPROVAL).select("*").execute()
+        rows = res.data or []
         lots_map = {}
-        for r in (res.data or []):
-            k = clean_str(r.get("lot_key")).upper()
-            if k:
+
+        for r in rows:
+            doc_id = clean_str(r.get("doc_id"))
+            data_json = r.get("data") if isinstance(r.get("data"), dict) else None
+
+            if doc_id == "status_lot" and data_json is not None:
+                nested_lots = data_json.get("lots")
+                if isinstance(nested_lots, dict):
+                    for k_lot, v_info in nested_lots.items():
+                        if isinstance(v_info, dict):
+                            lots_map[clean_str(k_lot).upper()] = v_info
+            elif doc_id and data_json is not None:
+                lots_map[doc_id.upper()] = data_json
+            elif clean_str(r.get("lot_key")):
+                k = clean_str(r.get("lot_key")).upper()
                 lots_map[k] = {
                     "status": clean_str(r.get("status")) or "PENDING",
                     "part_num": clean_str(r.get("part_num")).upper(),
@@ -548,7 +565,7 @@ def get_status_qc_lot(qc_map, part_num, lot_num, fallback_col_val=""):
 
 def simpan_approval_qc_lot(part_num, item_name, lot_num, status_baru, qc_by, catatan_qc=""):
     """
-    Menyimpan status approval QC ke tabel master 'wms_qc_approval'
+    Menyimpan status approval QC ke tabel master 'wms_qc_approval' (skema doc_id='status_lot', data={'lots': ...})
     sekaligus memperbarui kolom 'approval_qc' di seluruh slot rak terkait di Supabase.
     """
     part_clean = str(part_num).strip().upper()
@@ -557,27 +574,30 @@ def simpan_approval_qc_lot(part_num, item_name, lot_num, status_baru, qc_by, cat
     waktu_str = get_waktu_jkt().strftime("%Y-%m-%d %H:%M:%S")
     cat_clean = str(catatan_qc).strip()
 
+    lots_dict = dict(get_qc_approval_map())
     if status_baru == "PENDING":
-        supabase.table(DB_QC_APPROVAL).delete().eq("lot_key", key).execute()
+        lots_dict.pop(key, None)
         label_kolom_rak = ""
     else:
-        supabase.table(DB_QC_APPROVAL).upsert({
-            "lot_key": key,
+        lots_dict[key] = {
+            "status": status_baru,
             "part_num": part_clean,
             "item_name": str(item_name).strip(),
             "lot_num": lot_clean,
-            "status": status_baru,
             "qc_by": qc_by,
             "waktu": waktu_str,
             "catatan": cat_clean,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }, on_conflict="lot_key").execute()
-
+        }
         label_kolom_rak = f"{status_baru} ({qc_by} | {waktu_str[5:16]})"
         if cat_clean:
             label_kolom_rak += f" - {cat_clean}"
 
-    # Cari kolom terdampak sebelum update batch
+    supabase.table(DB_QC_APPROVAL).upsert({
+        "doc_id": "status_lot",
+        "data": {"lots": lots_dict, "updated_at": waktu_str},
+        "migrated_at": datetime.now(timezone.utc).isoformat(),
+    }, on_conflict="doc_id").execute()
+
     res_match = (
         supabase.table(NAMA_DATABASE)
         .select("kolom")
@@ -637,31 +657,35 @@ def update_qc_slot_terplot(jadwal_kirim, target_penerima, part_num, lot_num, sta
 
     if rows_found:
         ids_upd = [r["id"] for r in rows_found]
+        now_iso = datetime.now(timezone.utc).isoformat()
         for i in range(0, len(ids_upd), 500):
             (
                 supabase.table(NAMA_DATABASE)
-                .update({"approval_qc": label_qc, "updated_at": datetime.now(timezone.utc).isoformat()})
+                .update({"approval_qc": label_qc, "updated_at": now_iso})
                 .in_("id", ids_upd[i:i + 500])
                 .execute()
             )
 
-    # Sinkronkan juga ke master wms_qc_approval
     try:
         key = make_qc_lot_key(pn_target, lot_target)
+        lots_dict = dict(get_qc_approval_map())
         if status_qc == "PENDING":
-            supabase.table(DB_QC_APPROVAL).delete().eq("lot_key", key).execute()
+            lots_dict.pop(key, None)
         else:
-            supabase.table(DB_QC_APPROVAL).upsert({
-                "lot_key": key,
+            lots_dict[key] = {
+                "status": status_qc,
                 "part_num": pn_target,
                 "item_name": nama_item_found,
                 "lot_num": lot_target.upper(),
-                "status": status_qc,
                 "qc_by": operator_qc,
                 "waktu": waktu_str,
                 "catatan": cat_clean,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }, on_conflict="lot_key").execute()
+            }
+        supabase.table(DB_QC_APPROVAL).upsert({
+            "doc_id": "status_lot",
+            "data": {"lots": lots_dict, "updated_at": waktu_str},
+            "migrated_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="doc_id").execute()
     except Exception:
         pass
 
@@ -1137,7 +1161,7 @@ def scan_plotting_untuk_outbound(semua_data, jadwal_kirim, target_penerima, qc_m
 
 
 # ==========================================================
-# 5. AUDIT LOG, PERSISTENT UNDO & AUTO-SAVE DRAFT (SUPABASE)
+# 5. AUDIT LOG, PERSISTENT UNDO & AUTO-SAVE DRAFT (SKEMA doc_id & data)
 # ==========================================================
 def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh, pecahan, eceran, keterangan=""):
     kol_str = clean_str(kolom)
@@ -1180,20 +1204,21 @@ def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh,
 
 
 def simpan_draft_inbound(prefix_app, operator_name, draft_payload):
+    """Menyimpan draft inbound ke tabel Supabase `wms_inbound_drafts` (kolom doc_id & data)."""
     if not operator_name:
         return
     saved_str = get_waktu_jkt().strftime("%Y-%m-%d %H:%M:%S")
-    draft_payload["saved_at"] = saved_str
-    st.session_state.inbound_draft = draft_payload
+    payload_copy = copy.deepcopy(draft_payload)
+    payload_copy["saved_at"] = saved_str
+    st.session_state.inbound_draft = payload_copy
     try:
         supabase.table(DB_DRAFT_INBOUND).upsert({
-            "draft_key": f"{prefix_app}_{operator_name}",
-            "payload": draft_payload,
-            "saved_at": saved_str,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }, on_conflict="draft_key").execute()
-    except Exception:
-        pass
+            "doc_id": f"{prefix_app}_{operator_name}",
+            "data": payload_copy,
+            "migrated_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="doc_id").execute()
+    except Exception as e:
+        st.toast(f"⚠️ Gagal simpan draft ke Supabase: {e}", icon="⚠️")
 
 
 def muat_draft_inbound(prefix_app, operator_name):
@@ -1204,13 +1229,13 @@ def muat_draft_inbound(prefix_app, operator_name):
         res = (
             supabase.table(DB_DRAFT_INBOUND)
             .select("*")
-            .eq("draft_key", f"{prefix_app}_{operator_name}")
+            .eq("doc_id", f"{prefix_app}_{operator_name}")
             .execute()
         )
         if res.data:
             rec = res.data[0]
-            data = rec.get("payload") or {}
-            saved_at = data.get("saved_at") or rec.get("saved_at")
+            data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+            saved_at = data.get("saved_at")
             if saved_at:
                 saved_dt = datetime.strptime(saved_at, "%Y-%m-%d %H:%M:%S")
                 if (get_waktu_jkt() - saved_dt) <= timedelta(hours=12):
@@ -1226,27 +1251,27 @@ def hapus_draft_inbound(prefix_app, operator_name):
     if not operator_name:
         return
     try:
-        supabase.table(DB_DRAFT_INBOUND).delete().eq("draft_key", f"{prefix_app}_{operator_name}").execute()
+        supabase.table(DB_DRAFT_INBOUND).delete().eq("doc_id", f"{prefix_app}_{operator_name}").execute()
     except Exception:
         pass
 
 
 def simpan_draft_outbound(prefix_app, operator_name, draft_payload):
-    """Menyimpan draft progress penurunan barang Outbound di Supabase selama lead time forklift."""
+    """Menyimpan draft progress penurunan barang Outbound di Supabase `wms_outbound_drafts` (kolom doc_id & data)."""
     if not operator_name:
         return
     saved_str = get_waktu_jkt().strftime("%Y-%m-%d %H:%M:%S")
-    draft_payload["saved_at"] = saved_str
-    st.session_state.outbound_draft = draft_payload
+    payload_copy = copy.deepcopy(draft_payload)
+    payload_copy["saved_at"] = saved_str
+    st.session_state.outbound_draft = payload_copy
     try:
         supabase.table(DB_DRAFT_OUTBOUND).upsert({
-            "draft_key": f"{prefix_app}_{operator_name}",
-            "payload": draft_payload,
-            "saved_at": saved_str,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }, on_conflict="draft_key").execute()
-    except Exception:
-        pass
+            "doc_id": f"{prefix_app}_{operator_name}",
+            "data": payload_copy,
+            "migrated_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="doc_id").execute()
+    except Exception as e:
+        st.toast(f"⚠️ Gagal simpan draft outbound: {e}", icon="⚠️")
 
 
 def muat_draft_outbound(prefix_app, operator_name):
@@ -1257,13 +1282,13 @@ def muat_draft_outbound(prefix_app, operator_name):
         res = (
             supabase.table(DB_DRAFT_OUTBOUND)
             .select("*")
-            .eq("draft_key", f"{prefix_app}_{operator_name}")
+            .eq("doc_id", f"{prefix_app}_{operator_name}")
             .execute()
         )
         if res.data:
             rec = res.data[0]
-            data = rec.get("payload") or {}
-            saved_at = data.get("saved_at") or rec.get("saved_at")
+            data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+            saved_at = data.get("saved_at")
             if saved_at:
                 saved_dt = datetime.strptime(saved_at, "%Y-%m-%d %H:%M:%S")
                 if (get_waktu_jkt() - saved_dt) <= timedelta(hours=12):
@@ -1279,13 +1304,13 @@ def hapus_draft_outbound(prefix_app, operator_name):
     if not operator_name:
         return
     try:
-        supabase.table(DB_DRAFT_OUTBOUND).delete().eq("draft_key", f"{prefix_app}_{operator_name}").execute()
+        supabase.table(DB_DRAFT_OUTBOUND).delete().eq("doc_id", f"{prefix_app}_{operator_name}").execute()
     except Exception:
         pass
 
 
 def simpan_undo_firestore(prefix_app, operator_name, undo_dict, action_msg, mode_label):
-    """Menyimpan snapshot posisi sebelum transaksi ke Supabase `wms_undo_state` (nama fungsi dipertahankan untuk kompatibilitas)."""
+    """Menyimpan snapshot posisi sebelum transaksi ke Supabase `wms_undo_state` (kolom doc_id & data)."""
     now_str = get_waktu_jkt().strftime("%Y-%m-%d %H:%M:%S")
     payload = {
         "status": "DONE",
@@ -1297,16 +1322,12 @@ def simpan_undo_firestore(prefix_app, operator_name, undo_dict, action_msg, mode
     st.session_state.undo_record = payload
     try:
         supabase.table(DB_UNDO_STATE).upsert({
-            "state_key": f"{prefix_app}_{operator_name}",
-            "status": "DONE",
-            "mode": mode_label,
-            "undo_dict": undo_dict,
-            "action_msg": action_msg,
-            "created_at": now_str,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }, on_conflict="state_key").execute()
-    except Exception:
-        pass
+            "doc_id": f"{prefix_app}_{operator_name}",
+            "data": payload,
+            "migrated_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="doc_id").execute()
+    except Exception as e:
+        st.toast(f"⚠️ Gagal simpan state undo: {e}", icon="⚠️")
 
 
 def muat_undo_firestore(prefix_app, operator_name):
@@ -1314,11 +1335,12 @@ def muat_undo_firestore(prefix_app, operator_name):
         res = (
             supabase.table(DB_UNDO_STATE)
             .select("*")
-            .eq("state_key", f"{prefix_app}_{operator_name}")
+            .eq("doc_id", f"{prefix_app}_{operator_name}")
             .execute()
         )
         if res.data:
-            data = res.data[0]
+            rec = res.data[0]
+            data = rec.get("data") if isinstance(rec.get("data"), dict) else rec
             if data.get("status") == "DONE" and data.get("created_at"):
                 created_dt = datetime.strptime(data["created_at"], "%Y-%m-%d %H:%M:%S")
                 if (get_waktu_jkt() - created_dt) <= timedelta(minutes=30):
@@ -1330,14 +1352,15 @@ def muat_undo_firestore(prefix_app, operator_name):
 
 
 def tutup_undo_firestore(prefix_app, operator_name, new_status="CLOSED"):
+    current_data = copy.deepcopy(st.session_state.get("undo_record") or {})
+    current_data["status"] = new_status
     st.session_state.undo_record = {"status": new_status} if new_status == "UNDONE" else None
     try:
-        (
-            supabase.table(DB_UNDO_STATE)
-            .update({"status": new_status, "updated_at": datetime.now(timezone.utc).isoformat()})
-            .eq("state_key", f"{prefix_app}_{operator_name}")
-            .execute()
-        )
+        supabase.table(DB_UNDO_STATE).upsert({
+            "doc_id": f"{prefix_app}_{operator_name}",
+            "data": current_data,
+            "migrated_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="doc_id").execute()
     except Exception:
         pass
 
@@ -2154,7 +2177,7 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                                 'SisaSlot': int(row['SisaSlot'])
                             })
 
-                    draft_sig = f"{st.session_state.item}|{lot_aktif}|{qty_p_in}|{qty_c_in}|{sisi_masuk}|" + ",".join(
+                    draft_sig = f"S6|{st.session_state.item}|{lot_aktif}|{qty_p_in}|{qty_c_in}|{sisi_masuk}|" + ",".join(
                         f"{x['Kolom']}-{x['Baris']}:{x['qty_p']}:{x['qty_c']}" for x in rencana_alokasi
                     )
                     if st.session_state.get("_last_draft_sig") != draft_sig:
@@ -2169,7 +2192,8 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
                             "in_tipe_c": satuan_c,
                             "in_sisi_masuk": sisi_masuk,
                             "in_rak_skip": rak_skip_list,
-                            "alokasi_terpilih": rencana_alokasi
+                            "alokasi_terpilih": rencana_alokasi,
+                            "last_slide": 6
                         })
                         st.session_state["_last_draft_sig"] = draft_sig
 
@@ -2279,6 +2303,27 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
             st.rerun()
 
         st.session_state.alokasi_terpilih = alokasi_aktual
+
+        # Sinkronkan perubahan aktual Slide 7 ke draft Supabase agar tetap aman jika layar mati
+        draft_sig_s7 = f"S7|{st.session_state.item}|{lot_aktif}|{target_p_awal}|{target_c_awal}|{sisi_masuk}|" + ",".join(
+            f"{x['Kolom']}-{x['Baris']}:{x['qty_p']}:{x['qty_c']}" for x in alokasi_aktual
+        )
+        if st.session_state.get("_last_draft_sig") != draft_sig_s7:
+            simpan_draft_inbound(prefix_app, st.session_state.operator, {
+                "kategori": st.session_state.get("kategori") or "",
+                "gramasi": st.session_state.get("gramasi") or "",
+                "item": st.session_state.item,
+                "pilih_part": st.session_state.pilih_part,
+                "in_lot": lot_aktif,
+                "in_qty_p": target_p_awal,
+                "in_qty_c": target_c_awal,
+                "in_tipe_c": satuan_c,
+                "in_sisi_masuk": sisi_masuk,
+                "in_rak_skip": st.session_state.get("in_rak_skip") or [],
+                "alokasi_terpilih": alokasi_aktual,
+                "last_slide": 7
+            })
+            st.session_state["_last_draft_sig"] = draft_sig_s7
 
         total_p_aktual = sum(x['qty_p'] for x in alokasi_aktual)
         total_c_aktual = sum(x['qty_c'] for x in alokasi_aktual)
@@ -2629,7 +2674,7 @@ def render_login_operator(
     load_draft_type=None
 ):
     """
-    Komponen layar login standar (Slide 0) untuk LTIn, LTOut, dan LTOutb.
+    Komponen layar login standar (Slide 0) untuk LTInb, LTOut, dan LTOutb.
     Operator memilih nama dari grid tombol (atau ketik manual), lalu memasukkan PIN/Password.
     """
     st.markdown(f"""
