@@ -1,6 +1,7 @@
 import json
 import math
 import streamlit as st
+import pandas as pd
 import firebase_admin
 from firebase_admin import credentials, firestore
 from supabase import create_client, Client
@@ -9,12 +10,14 @@ from postgrest.exceptions import APIError
 st.set_page_config(page_title="Migrasi Full Firestore -> Supabase", page_icon="🚀", layout="centered")
 
 # ==========================================================
-# 1. INISIALISASI KONEKSI FIREBASE & SUPABASE
+# 1. INISIALISASI KONEKSI (CACHED)
 # ==========================================================
-if not firebase_admin._apps:
-    cred = credentials.Certificate(dict(st.secrets["firebase"]))
-    firebase_admin.initialize_app(cred)
-db_firebase = firestore.client()
+@st.cache_resource
+def init_firebase():
+    if not firebase_admin._apps:
+        cred = credentials.Certificate(dict(st.secrets["firebase"]))
+        firebase_admin.initialize_app(cred)
+    return firestore.client()
 
 @st.cache_resource
 def init_supabase() -> Client:
@@ -29,8 +32,6 @@ def init_supabase() -> Client:
         key = st.secrets["SUPABASE_KEY"]
     return create_client(url, key)
 
-supabase = init_supabase()
-
 KOLEKSI_JSONB = [
     "log_mutasi_rak",
     "log_transaksi",
@@ -41,7 +42,7 @@ KOLEKSI_JSONB = [
 ]
 
 # ==========================================================
-# 2. FUNGSI HELPER PEMBERSIH DATA
+# 2. HELPER PEMBERSIH DATA
 # ==========================================================
 def sanitize_json(obj):
     return json.loads(json.dumps(obj, default=str))
@@ -52,29 +53,24 @@ def clean_str(val):
     s = str(val).strip()
     return "" if s.lower() in ["nan", "none", "<na>"] else s
 
-def clean_int(val):
-    try:
-        if val is None or (isinstance(val, float) and math.isnan(val)):
-            return 0
-        return int(float(str(val).strip()))
-    except Exception:
-        return 0
-
 # ==========================================================
 # 3. ANTARMUKA MIGRASI STREAMLIT
 # ==========================================================
 st.title("🚀 Migrasi Full Database (Firestore ➔ Supabase)")
-st.info("Memindahkan **7 koleksi** (`uji_coba_rak`, `log_mutasi_rak`, `log_transaksi`, `master_rak`, `visualisasi_rak`, `wms_inbound_drafts`, `wms_undo_state`) secara utuh.")
+st.info("Memindahkan **7 koleksi** (`uji_coba_rak` dengan filter slot unik + 6 koleksi pendamping) secara utuh.")
 
 if st.button("▶️ Mulai Migrasi 7 Koleksi Sekarang", type="primary"):
     progress_bar = st.progress(0)
     status_box = st.empty()
 
     try:
-        # --- TAHAP 1: MIGRASI UJI_COBA_RAK ---
+        db_firebase = init_firebase()
+        supabase = init_supabase()
+
+        # --- TAHAP 1: MIGRASI UJI_COBA_RAK (DEDUPLIKASI SLOT UNIK) ---
         status_box.write("📥 Menarik koleksi **`uji_coba_rak`** dari Firestore...")
         docs_rak = db_firebase.collection("uji_coba_rak").stream()
-        payload_rak = []
+        rows_map = {}
 
         for doc in docs_rak:
             doc_dict = doc.to_dict() or {}
@@ -83,34 +79,36 @@ if st.button("▶️ Mulai Migrasi 7 Koleksi Sekarang", type="primary"):
             for r in items:
                 if not isinstance(r, dict):
                     continue
-                kolom_val = clean_str(r.get("Kolom", r.get("kolom", ""))).upper()
-                baris_val = clean_int(r.get("Baris", r.get("baris", 0)))
-                if not kolom_val or baris_val == 0:
+                kol = clean_str(r.get("Kolom", r.get("kolom", ""))).upper()
+                bar = int(pd.to_numeric(r.get("Baris", r.get("baris", 0)), errors="coerce") or 0)
+                plt_raw = r.get("Pallet Ke", r.get("Palet Ke", r.get("pallet_ke", 0)))
+                plt_ke = int(pd.to_numeric(plt_raw, errors="coerce") or 0)
+
+                if kol not in ["A", "B", "C", "D", "E", "F", "G"] or bar <= 0 or plt_ke <= 0:
                     continue
 
-                pallet_val = r.get("Pallet Ke", r.get("Palet Ke", r.get("pallet_ke", 0)))
-                nama_val = r.get("Nama Produk", r.get("Nama Barang", r.get("nama_produk", "")))
-
-                payload_rak.append({
+                rows_map[(kol, bar, plt_ke)] = {
                     "doc_id": doc.id,
-                    "kolom": kolom_val,
-                    "baris": baris_val,
-                    "pallet_ke": clean_int(pallet_val),
+                    "kolom": kol,
+                    "baris": bar,
+                    "pallet_ke": plt_ke,
                     "part_number": clean_str(r.get("Part Number", r.get("part_number", ""))).upper(),
-                    "nama_produk": clean_str(nama_val),
+                    "nama_produk": clean_str(r.get("Nama Produk") or r.get("Nama Barang") or r.get("nama_produk")),
                     "lot_number": clean_str(r.get("Lot Number", r.get("lot_number", ""))),
                     "keterangan": clean_str(r.get("Keterangan", r.get("keterangan", ""))),
                     "catatan": clean_str(r.get("Catatan", r.get("catatan", ""))),
-                })
+                }
 
-        # Bersihkan isi lama uji_coba_rak sebelum insert agar tidak ganda
+        payload_rak = list(rows_map.values())
+
+        # Bersihkan isi lama uji_coba_rak sebelum insert ulang
         supabase.table("uji_coba_rak").delete().neq("id", 0).execute()
 
         batch_size = 500
         for i in range(0, len(payload_rak), batch_size):
             supabase.table("uji_coba_rak").insert(payload_rak[i : i + batch_size]).execute()
 
-        st.write(f"✅ **`uji_coba_rak`**: Berhasil memindahkan **{len(payload_rak)}** baris palet.")
+        st.write(f"✅ **`uji_coba_rak`**: Berhasil memindahkan **{len(payload_rak)}** slot palet unik.")
         progress_bar.progress(1 / 7)
 
         # --- TAHAP 2: MIGRASI 6 KOLEKSI LAINNYA ---
