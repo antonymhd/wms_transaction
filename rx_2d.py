@@ -6,6 +6,30 @@ import re
 import io
 from datetime import datetime, timedelta
 import plotly.express as px
+from postgrest.exceptions import APIError
+
+@st.cache_data(ttl=300)
+def load_data_from_supabase():
+    semua_data = []
+    batch_size = 1000
+    offset = 0
+
+    try:
+        while True:
+            response = (
+                supabase.table(NAMA_TABEL)
+                .select("*")
+                .range(offset, offset + batch_size - 1)
+                .execute()
+            )
+            rows = response.data or []
+            semua_data.extend(rows)
+            if len(rows) < batch_size:
+                break
+            offset += batch_size
+    except APIError as e:
+        st.error(f"Detail Error Supabase -> Code: {e.code} | Message: {e.message} | Hint: {e.hint}")
+        st.stop()
 
 # ==========================================================
 # 1. KONFIGURASI HALAMAN
