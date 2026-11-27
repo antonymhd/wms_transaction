@@ -4,6 +4,7 @@ import wms_core as core
 st.set_page_config(page_title="Inbound & WIP - Rack Navigator", layout="centered", initial_sidebar_state="collapsed")
 core.inject_custom_css(accent_color="#10B981", accent_border="#059669", accent_bg_rgba="rgba(16, 185, 129, 0.1)")
 
+PREFIX_APP = "INB"
 OPERATOR_INBOUND = ["Fahmi", "Adip", "Didik", "Agung"]
 df_master = core.load_master_data()
 
@@ -17,8 +18,10 @@ for key in keys_state:
     if key not in st.session_state:
         st.session_state[key] = 0 if key == 'slide' else None
 
+
 def pindah_slide(tujuan):
     st.session_state.slide = tujuan
+
 
 def pulihkan_draft_ke_session(draft):
     st.session_state.mode_transaksi = "INBOUND"
@@ -33,7 +36,9 @@ def pulihkan_draft_ke_session(draft):
     st.session_state.in_sisi_masuk = draft.get("in_sisi_masuk") or "BELAKANG"
     st.session_state.in_rak_skip = draft.get("in_rak_skip") or []
     st.session_state.alokasi_terpilih = draft.get("alokasi_terpilih") or []
-    st.session_state.slide = 6
+    st.session_state.pop("_last_draft_sig", None)
+    st.session_state.slide = int(draft.get("last_slide") or 6)
+
 
 # ==========================================================
 # SLIDE 0: LOGIN OPERATOR BERTUGAS (USERNAME + PIN/PASSWORD)
@@ -43,7 +48,7 @@ if st.session_state.slide == 0:
         app_title="Inbound & WIP - Rack Navigator",
         subtitle="Pilih Operator Forklift & Masukkan PIN Tugas",
         accent_color="#10B981",
-        prefix_app="INB",
+        prefix_app=PREFIX_APP,
         operator_list=OPERATOR_INBOUND,
         slide_tujuan=1,
         load_draft_type="INBOUND"
@@ -62,9 +67,9 @@ elif st.session_state.mode_transaksi == "WIP":
 core.render_header_dan_undo(
     app_title="Inbound & WIP - Rack Navigator",
     accent_color="#10B981",
-    prefix_app="INB",
+    prefix_app=PREFIX_APP,
     mode_badge=mode_badge,
-    reset_keys=['mode_transaksi', 'inbound_draft', '_login_selected_user_INB']
+    reset_keys=['mode_transaksi', 'inbound_draft', '_last_draft_sig', f'_login_selected_user_{PREFIX_APP}']
 )
 core.render_progress_bar(st.session_state.slide, st.session_state.mode_transaksi)
 
@@ -73,40 +78,47 @@ core.render_progress_bar(st.session_state.slide, st.session_state.mode_transaksi
 # ==========================================================
 if st.session_state.slide == 1:
     st.session_state.mode_transaksi = None
-    
+
+    # Pastikan draft terbaru selalu ditarik dari Supabase jika session state kosong
+    if st.session_state.get("operator") and not st.session_state.get("inbound_draft"):
+        core.muat_draft_inbound(PREFIX_APP, st.session_state.operator)
+
     draft = st.session_state.get("inbound_draft")
     if draft and draft.get("item"):
         alok_draft = draft.get("alokasi_terpilih") or []
         ringkas_rak = ", ".join(f"{a['Kolom']}-{a['Baris']}" for a in alok_draft) or "-"
         pec_draft = f" + {draft.get('in_qty_c', 0)} {draft.get('in_tipe_c', '')}" if int(draft.get("in_qty_c") or 0) > 0 else ""
+        slide_tujuan_draft = int(draft.get("last_slide") or 6)
+        tahap_label = "Konfirmasi Aktual" if slide_tujuan_draft == 7 else "Rekomendasi Lokasi"
+
         with st.container(border=True):
             st.warning(
-                f"📋 **DRAFT INBOUND BELUM SELESAI** *(Disimpan {draft.get('saved_at', '')[-8:]} WIB)*\n\n"
+                f"📋 **DRAFT INBOUND BELUM SELESAI** *(Disimpan {draft.get('saved_at', '')[-8:]} WIB | Tahap: {tahap_label})*\n\n"
                 f"📦 **{draft.get('item')}** | Lot: `{draft.get('in_lot')}`\n\n"
                 f"📊 Total: **{draft.get('in_qty_p', 0)} Pallet{pec_draft}** ➔ Rak **{ringkas_rak}**"
             )
             c_dr1, c_dr2 = st.columns([2.6, 1.4])
             with c_dr1:
-                if st.button("➡️ LANJUTKAN DRAFT INBOUND", type="primary", use_container_width=True, key="btn_resume_draft"):
+                if st.button("➡️ LANJUTKAN DRAFT INBOUND", type="primary", use_container_width=True, key="btn_resume_draft_inb"):
                     pulihkan_draft_ke_session(draft)
                     st.rerun()
             with c_dr2:
                 st.markdown('<div class="btn-compact">', unsafe_allow_html=True)
-                if st.button("🗑️ Hapus Draft", use_container_width=True, key="btn_del_draft"):
-                    core.hapus_draft_inbound("INB", st.session_state.operator)
+                if st.button("🗑️ Hapus Draft", use_container_width=True, key="btn_del_draft_inb"):
+                    core.hapus_draft_inbound(PREFIX_APP, st.session_state.operator)
                     st.session_state.pop("_last_draft_sig", None)
                     st.rerun()
                 st.markdown('</div>', unsafe_allow_html=True)
         st.write("")
 
     st.markdown("### Pilih Jenis Aktivitas")
-    
+
     st.write("")
     if st.button("📥 INBOUND (Simpan Barang Masuk ke Rak)\nMemasukkan palet baru hasil produksi / datang ke dalam rak", type="primary", use_container_width=True):
         st.session_state.mode_transaksi = "INBOUND"
         pindah_slide(2)
         st.rerun()
-        
+
     st.write("")
     if st.button("🏭 AMBIL WIP (Suplai Bahan ke Produksi)\nMengeluarkan stok dari rak berdasarkan akses 2 pintu (Depan FIFO / Belakang LIFO)", use_container_width=True):
         st.session_state.mode_transaksi = "WIP"
@@ -124,7 +136,7 @@ elif st.session_state.slide in [2, 3, 4]:
 # ==========================================================
 elif st.session_state.mode_transaksi == "INBOUND":
     core.render_alur_inbound_terpadu(
-        prefix_app="INB",
+        prefix_app=PREFIX_APP,
         judul_inbound="Detail Barang Masuk (Inbound)",
         default_sisi_masuk="BELAKANG",
         jenis_log="INBOUND (Remote)",
@@ -142,11 +154,11 @@ elif st.session_state.mode_transaksi == "WIP":
             st.rerun()
         st.markdown("### Lokasi Target WIP (Akses 2 Pintu)")
         st.info(core.format_nama_warna_bold(st.session_state.item))
-        
+
         with st.spinner("🔍 Memindai posisi lorong depan & belakang..."):
             semua_data = core.get_all_racking_data()
             df_rekap = core.cari_lokasi_stok_hibrida(semua_data, st.session_state.item)
-            
+
             if df_rekap.empty:
                 st.error("❌ Stok WIP untuk item ini tidak ditemukan di seluruh rak!")
             else:
@@ -162,12 +174,12 @@ elif st.session_state.mode_transaksi == "WIP":
                         sisi_str = "Depan" if sisi_akses == "TERHALANG_DEPAN" else "Belakang"
                         akses_badge = f"⚠️ TERHALANG {row.get('MinPenghalang', 0)} PALET ({sisi_str})"
                         prioritas_label = f"🚧 PERLU LANGSIR ({row.get('InfoPenghalang', '-')})"
-                        
+
                     catatan_label = f"\n🔖 Catatan: {row['Catatan']}" if row['Catatan'] else ""
                     btn_label = f"📍 RAK {row['Kolom']}-{row['Baris']}  |  🏷️ Lot: {row['Lot Number']}\n"
                     btn_label += f"Stok: {row['Pallet']} Pallet, {row['Dus']} {row['Satuan']}  |  {akses_badge}\n"
                     btn_label += f"{prioritas_label}{catatan_label}"
-                    
+
                     if st.button(btn_label, use_container_width=True, key=f"btn_wip_loc_{idx}"):
                         st.session_state.wip_kolom = row['Kolom']
                         st.session_state.wip_baris = row['Baris']
@@ -184,7 +196,7 @@ elif st.session_state.mode_transaksi == "WIP":
             pindah_slide(5)
             st.rerun()
         core.render_alur_pengambilan_terpadu(
-            prefix_app="INB",
+            prefix_app=PREFIX_APP,
             df_master=df_master,
             judul_ambil="Ambil WIP (Suplai Produksi)",
             label_tombol_eksekusi="🏭 KONFIRMASI AMBIL WIP",
