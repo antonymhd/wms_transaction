@@ -36,52 +36,19 @@ def pulihkan_draft_ke_session(draft):
     st.session_state.slide = 6
 
 # ==========================================================
-# SLIDE 0: PILIH OPERATOR BERTUGAS
+# SLIDE 0: LOGIN OPERATOR BERTUGAS (VERIFIKASI PIN + MUAT DRAFT/UNDO SUPABASE)
 # ==========================================================
 if st.session_state.slide == 0:
-    st.markdown("""
-        <div class="db-info-box" style="text-align: center;">
-            <div style="font-size: 18px; font-weight: bold; color: #10B981;">
-                🧭 Inbound & WIP - Rack Navigator
-            </div>
-            <div style="font-size: 13px; opacity: 0.8; margin-top: 4px;">
-                Pilih Operator Forklift yang Bertugas
-            </div>
-        </div>
-    """, unsafe_allow_html=True)
-    
-    st.markdown('<div class="btn-center">', unsafe_allow_html=True)
-    for i in range(0, len(OPERATOR_INBOUND), 2):
-        cols = st.columns(2)
-        with cols[0]:
-            op1 = OPERATOR_INBOUND[i]
-            if st.button(f"👤 {op1}", key=f"op_{op1}", use_container_width=True):
-                st.session_state.operator = op1
-                core.muat_undo_firestore("IN", op1)
-                core.muat_draft_inbound("IN", op1)
-                pindah_slide(1); st.rerun()
-        if i + 1 < len(OPERATOR_INBOUND):
-            with cols[1]:
-                op2 = OPERATOR_INBOUND[i+1]
-                if st.button(f"👤 {op2}", key=f"op_{op2}", use_container_width=True):
-                    st.session_state.operator = op2
-                    core.muat_undo_firestore("IN", op2)
-                    core.muat_draft_inbound("IN", op2)
-                    pindah_slide(1); st.rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
-    
-    st.write("")
-    with st.expander("➕ Operator Pengganti / Lainnya"):
-        op_manual = st.text_input("Ketik Nama Operator", placeholder="Masukkan nama...")
-        if st.button("MASUK DENGAN NAMA INI", type="primary", use_container_width=True):
-            if op_manual.strip():
-                nama_fix = op_manual.strip().title()
-                st.session_state.operator = nama_fix
-                core.muat_undo_firestore("IN", nama_fix)
-                core.muat_draft_inbound("IN", nama_fix)
-                pindah_slide(1); st.rerun()
-            else:
-                st.warning("Nama operator tidak boleh kosong.")
+    core.render_login_operator(
+        app_title="Inbound & WIP - Rack Navigator",
+        subtitle="Pilih Operator Forklift & Masukkan PIN untuk Terhubung ke Supabase",
+        accent_color="#10B981",
+        prefix_app="IN",
+        operator_list=OPERATOR_INBOUND,
+        slide_tujuan=1,
+        default_mode=None,
+        load_draft_type="INBOUND"
+    )
     st.stop()
 
 # ==========================================================
@@ -107,7 +74,7 @@ core.render_progress_bar(st.session_state.slide, st.session_state.mode_transaksi
 # ==========================================================
 if st.session_state.slide == 1:
     st.session_state.mode_transaksi = None
-    
+
     draft = st.session_state.get("inbound_draft")
     if draft and draft.get("item"):
         alok_draft = draft.get("alokasi_terpilih") or []
@@ -134,16 +101,18 @@ if st.session_state.slide == 1:
         st.write("")
 
     st.markdown("### Pilih Jenis Aktivitas")
-    
+
     st.write("")
     if st.button("📥 INBOUND (Simpan Barang Masuk ke Rak)\nMemasukkan palet baru hasil produksi / datang ke dalam rak", type="primary", use_container_width=True):
         st.session_state.mode_transaksi = "INBOUND"
-        pindah_slide(2); st.rerun()
-        
+        pindah_slide(2)
+        st.rerun()
+
     st.write("")
     if st.button("🏭 AMBIL WIP (Suplai Bahan ke Produksi)\nMengeluarkan stok dari rak berdasarkan akses 2 pintu (Depan FIFO / Belakang LIFO)", use_container_width=True):
         st.session_state.mode_transaksi = "WIP"
-        pindah_slide(2); st.rerun()
+        pindah_slide(2)
+        st.rerun()
 
 # ==========================================================
 # SLIDE 2 - 4: PEMILIHAN PRODUK (KATEGORI -> GRAMASI -> ITEM)
@@ -169,14 +138,16 @@ elif st.session_state.mode_transaksi == "INBOUND":
 # ==========================================================
 elif st.session_state.mode_transaksi == "WIP":
     if st.session_state.slide == 5:
-        if st.button("🔙 GANTI ITEM"): pindah_slide(4); st.rerun()
+        if st.button("🔙 GANTI ITEM"):
+            pindah_slide(4)
+            st.rerun()
         st.markdown("### Lokasi Target WIP (Akses 2 Pintu)")
         st.info(core.format_nama_warna_bold(st.session_state.item))
-        
-        with st.spinner("🔍 Memindai posisi lorong depan & belakang..."):
+
+        with st.spinner("🔍 Memindai posisi lorong depan & belakang dari Supabase..."):
             semua_data = core.get_all_racking_data()
             df_rekap = core.cari_lokasi_stok_hibrida(semua_data, st.session_state.item)
-            
+
             if df_rekap.empty:
                 st.error("❌ Stok WIP untuk item ini tidak ditemukan di seluruh rak!")
             else:
@@ -192,12 +163,12 @@ elif st.session_state.mode_transaksi == "WIP":
                         sisi_str = "Depan" if sisi_akses == "TERHALANG_DEPAN" else "Belakang"
                         akses_badge = f"⚠️ TERHALANG {row.get('MinPenghalang', 0)} PALET ({sisi_str})"
                         prioritas_label = f"🚧 PERLU LANGSIR ({row.get('InfoPenghalang', '-')})"
-                        
+
                     catatan_label = f"\n🔖 Catatan: {row['Catatan']}" if row['Catatan'] else ""
                     btn_label = f"📍 RAK {row['Kolom']}-{row['Baris']}  |  🏷️ Lot: {row['Lot Number']}\n"
                     btn_label += f"Stok: {row['Pallet']} Pallet, {row['Dus']} {row['Satuan']}  |  {akses_badge}\n"
                     btn_label += f"{prioritas_label}{catatan_label}"
-                    
+
                     if st.button(btn_label, use_container_width=True, key=f"btn_wip_loc_{idx}"):
                         st.session_state.wip_kolom = row['Kolom']
                         st.session_state.wip_baris = row['Baris']
@@ -206,10 +177,13 @@ elif st.session_state.mode_transaksi == "WIP":
                         st.session_state.wip_catatan_rak = row['Catatan']
                         st.session_state.wip_max_pallet = row['Pallet']
                         st.session_state.wip_max_dus = row['Dus']
-                        pindah_slide(6); st.rerun()
+                        pindah_slide(6)
+                        st.rerun()
 
     elif st.session_state.slide == 6:
-        if st.button("🔙 BATAL"): pindah_slide(5); st.rerun()
+        if st.button("🔙 BATAL"):
+            pindah_slide(5)
+            st.rerun()
         core.render_alur_pengambilan_terpadu(
             prefix_app="IN",
             df_master=df_master,
