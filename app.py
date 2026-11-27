@@ -62,7 +62,7 @@ if not st.session_state['logged_in']:
 # ==========================================================
 # 2. KONSTANTA & INISIALISASI DATABASE (SUPABASE)
 # ==========================================================
-TBL_STOK_RAK = 'stok_rak'
+TBL_STOK_RAK = 'uji_coba_rak'
 TBL_LOG_MUTASI = 'log_mutasi_rak'
 KOLOM_OPTIONS = ["A", "B", "C", "D", "E", "F", "G", "S (Staging)"]
 KOLOM_IDS = ["A", "B", "C", "D", "E", "F", "G", "S"]
@@ -94,7 +94,7 @@ def clean_str(val):
     return re.sub(r'(\s*\|\s*nan\b|\bnan\s*\|\s*)', '', s, flags=re.IGNORECASE).strip()
 
 def db_row_to_app_dict(row: dict) -> dict:
-    """Mengonversi 1 baris tabel PostgreSQL stok_rak ke format dictionary aplikasi."""
+    """Mengonversi 1 baris tabel PostgreSQL uji_coba_rak ke format dictionary aplikasi."""
     return {
         'Kolom': clean_str(row.get('kolom')).upper(),
         'Baris': float(pd.to_numeric(row.get('baris', 0), errors='coerce') or 0),
@@ -111,7 +111,7 @@ def db_row_to_app_dict(row: dict) -> dict:
     }
 
 def app_dict_to_db_row(item: dict, kolom_fallback: str = "") -> dict:
-    """Mengonversi 1 dictionary aplikasi ke format kolom PostgreSQL stok_rak."""
+    """Mengonversi 1 dictionary aplikasi ke format kolom PostgreSQL uji_coba_rak."""
     kol = clean_str(item.get('Kolom') or kolom_fallback).upper()
     bar = int(float(pd.to_numeric(item.get('Baris', 0), errors='coerce') or 0))
     plt_ke = int(float(pd.to_numeric(item.get('Pallet Ke', 0), errors='coerce') or 0))
@@ -215,7 +215,6 @@ def save_kolom_to_supabase(kolom_id: str, records_list: list):
         supabase.table(TBL_STOK_RAK).upsert(batch, on_conflict="kolom,baris,pallet_ke").execute()
         log_sb_usage('write', 1)
 
-    # Bersihkan baris/slot lama yang terhapus akibat outbound/relokasi/koreksi
     existing_res = (
         supabase.table(TBL_STOK_RAK)
         .select("id,baris,pallet_ke")
@@ -953,8 +952,8 @@ def catat_log_mutasi(
 ):
     """Mencatat setiap pergerakan stok ke tabel log_mutasi_rak Supabase."""
     b_str = str(baris).strip()
-    lok_str = f"{kolom}-{b_str}" if b_str and b_str.upper() != "NONE" else str(kolom)
-    bar_int = int(float(b_str)) if b_str.isdigit() else 0
+    bar_int = int(float(pd.to_numeric(b_str, errors='coerce') or 0))
+    lok_str = f"{kolom}-{bar_int}" if bar_int > 0 else str(kolom)
     tujuan_clean = clean_str(tujuan_kategori) or clean_str(keterangan)
     detail_clean = clean_str(detail_sistem)
     ket_gabungan = f"{tujuan_clean} | {detail_clean}".strip(" |") if detail_clean else tujuan_clean
@@ -1043,7 +1042,7 @@ if 'total_rak_bytes' in st.session_state:
     persen_sb = (grand_tot_b / LIMIT_SUPABASE_BYTES) * 100
 
     st.sidebar.info(
-        f"**1. Rak Utama (`stok_rak`):** `{tot_rak:,}` B ({tot_rak / (1024*1024):.2f} MB)\n\n"
+        f"**1. Rak Utama (`{TBL_STOK_RAK}`):** `{tot_rak:,}` B ({tot_rak / (1024*1024):.2f} MB)\n\n"
         f"**2. Log Mutasi ({jml_log_docs:,} Baris):** ~`{tot_log:,}` B ({tot_log / (1024*1024):.2f} MB)\n\n"
         f"**Total Gabungan:** `{grand_tot_b / (1024*1024):.2f} MB` (**{persen_sb:.3f}%** dari 500 MB Supabase)"
     )
@@ -1055,7 +1054,7 @@ st.sidebar.button("🚪 Logout", on_click=lambda: st.session_state.update({'logg
 # 7. HEADER & NOTIFIKASI UNDO
 # ==========================================================
 st.title("📝 WMS Entry Form (Inbound, Outbound, Plotting & Relokasi)")
-st.caption("Alat khusus PPIC. Terhubung ke database: **Supabase PostgreSQL (`stok_rak`)**")
+st.caption(f"Alat khusus PPIC. Terhubung ke database: **Supabase PostgreSQL (`{TBL_STOK_RAK}`)**")
 
 if st.session_state['action_status'] in ['DONE', 'DONE_NO_UNDO']:
     st.toast(f"Berhasil: {st.session_state['action_msg']}", icon="✅")
