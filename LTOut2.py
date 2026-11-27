@@ -13,6 +13,7 @@ core.inject_custom_css(
     accent_bg_rgba="rgba(245, 158, 11, 0.12)"
 )
 
+PREFIX_APP = "OUTB"
 OPERATOR_OUTBOUND = ["Maheswara", "Amir", "Bakir", "Danny", "Joko", "Abdul"]
 df_master = core.load_master_data()
 
@@ -30,8 +31,10 @@ for k, v in DEFAULT_STATE.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
+
 def pindah_slide(tujuan):
     st.session_state.slide = tujuan
+
 
 def get_konversi_pcs_item(part_num, item_name):
     pn_c = core.clean_str(part_num).upper()
@@ -49,6 +52,7 @@ def get_konversi_pcs_item(part_num, item_name):
     pcs_pec = int(r.get('Pcs_Per_Sac', 0) or 0) if satuan == "Sak" else int(r.get('Pcs_Per_Box', 0) or 0)
     return isi_pal, pcs_pec
 
+
 # ==========================================================
 # SLIDE 0: LOGIN OPERATOR BERTUGAS (USERNAME + PIN/PASSWORD)
 # ==========================================================
@@ -57,7 +61,7 @@ if st.session_state.slide == 0:
         app_title="Outbound Plotting & QC - Rack Navigator",
         subtitle="Pengeluaran Barang Ter-Plot PPIC & Approved QC ke Staging (S-1)",
         accent_color="#F59E0B",
-        prefix_app="OUTB",
+        prefix_app=PREFIX_APP,
         operator_list=OPERATOR_OUTBOUND,
         slide_tujuan=1,
         default_mode="OUTBOUND_PLOT",
@@ -72,21 +76,26 @@ st.session_state.mode_transaksi = "OUTBOUND_PLOT"
 core.render_header_dan_undo(
     app_title="Outbound Plotting & QC - Rack Navigator",
     accent_color="#F59E0B",
-    prefix_app="OUTB",
+    prefix_app=PREFIX_APP,
     mode_badge="  |  <span style='color:#F59E0B;font-weight:bold;'>🚚 OUTBOUND STAGING</span>",
     reset_keys=[
         'out_jadwal_pilih',
         'out_customer_pilih',
         'out_last_summary',
         'outbound_draft',
-        '_login_selected_user_OUTB'
+        '_last_out_draft_sig',
+        f'_login_selected_user_{PREFIX_APP}'
     ]
 )
 core.render_progress_bar(st.session_state.slide, "OUTBOUND_PLOT")
 
 # ==========================================================
-# BANNER PEMULIHAN DRAFT OUTBOUND (JIKA ADA SESI TERTUNDA)
+# AUTO-RELOAD & BANNER PEMULIHAN DRAFT OUTBOUND
 # ==========================================================
+if st.session_state.slide == 1:
+    if st.session_state.get("operator") and not st.session_state.get("outbound_draft"):
+        core.muat_draft_outbound(PREFIX_APP, st.session_state.operator)
+
 draft_out = st.session_state.get("outbound_draft")
 if draft_out and st.session_state.slide == 1:
     with st.container(border=True):
@@ -99,11 +108,12 @@ if draft_out and st.session_state.slide == 1:
             if st.button("▶️ LANJUTKAN DRAFT", type="primary", use_container_width=True, key="btn_resume_out_draft"):
                 st.session_state.out_jadwal_pilih = draft_out.get('jadwal_kirim')
                 st.session_state.out_customer_pilih = draft_out.get('target_penerima')
+                st.session_state.pop("_last_out_draft_sig", None)
                 pindah_slide(2)
                 st.rerun()
         with c_dr2:
             if st.button("🗑️ Hapus Draft", use_container_width=True, key="btn_del_out_draft"):
-                core.hapus_draft_outbound("OUTB", st.session_state.operator)
+                core.hapus_draft_outbound(PREFIX_APP, st.session_state.operator)
                 st.session_state.outbound_draft = None
                 st.session_state.pop("_last_out_draft_sig", None)
                 st.rerun()
@@ -313,7 +323,7 @@ elif st.session_state.slide == 2:
 
         draft_sig = f"{jk_aktif}|{cust_aktif}|" + str(draft_items_to_save)
         if st.session_state.get("_last_out_draft_sig") != draft_sig:
-            core.simpan_draft_outbound("OUTB", st.session_state.operator, {
+            core.simpan_draft_outbound(PREFIX_APP, st.session_state.operator, {
                 "jadwal_kirim": jk_aktif,
                 "target_penerima": cust_aktif,
                 "items_state": draft_items_to_save
@@ -405,7 +415,7 @@ elif st.session_state.slide == 2:
                             pesan_tele += f"📝 <b>Catatan:</b> <i>{core.escape_html(catatan_muat.strip())}</i>\n"
                         core.kirim_notif_telegram(pesan_tele)
 
-                        core.hapus_draft_outbound("OUTB", st.session_state.operator)
+                        core.hapus_draft_outbound(PREFIX_APP, st.session_state.operator)
                         st.session_state.outbound_draft = None
                         st.session_state.pop("_last_out_draft_sig", None)
                         core.get_all_racking_data.clear()
@@ -416,7 +426,7 @@ elif st.session_state.slide == 2:
                             + f" untuk {cust_aktif} ke Staging (S-1)."
                         )
                         core.simpan_undo_firestore(
-                            "OUTB",
+                            PREFIX_APP,
                             st.session_state.operator,
                             backup_dict,
                             msg_sukses,
