@@ -9,17 +9,17 @@ from datetime import datetime, timedelta
 import plotly.express as px
 
 # ==========================================================
-# 1. KONFIGURASI HALAMAN (WAJIB PALING PERTAMA)
+# 1. KONFIGURASI HALAMAN
 # ==========================================================
 st.set_page_config(
-    page_title="Warehouse 2D Racking",
-    page_icon="📦",
-    layout="wide",
+    page_title="Warehouse 2D Racking", 
+    page_icon="📦", 
+    layout="wide", 
     initial_sidebar_state="expanded"
 )
 
 # ==========================================================
-# 2. INIT SUPABASE (POSTGRESQL)
+# 2. INIT SUPABASE (DATABASE UJI COBA)
 # ==========================================================
 NAMA_TABEL = 'uji_coba_rak'
 
@@ -39,7 +39,7 @@ def init_supabase() -> Client:
 supabase = init_supabase()
 
 # ==========================================================
-# 3. FUNGSI LOAD DATA (PAGINATION SAFE, ERROR HANDLED & MASTER)
+# 3. FUNGSI LOAD DATA (SMART CACHE, PAGINATION & MASTER PRODUK)
 # ==========================================================
 @st.cache_data(ttl=300)
 def load_data_from_supabase():
@@ -62,23 +62,22 @@ def load_data_from_supabase():
             offset += batch_size
     except APIError as e:
         st.error(
-            f"❌ **Gagal memuat data dari Supabase (`{NAMA_TABEL}`)**\n\n"
+            f"❌ **Gagal membaca tabel `{NAMA_TABEL}` di Supabase**\n\n"
             f"- **Code:** `{e.code}`\n"
             f"- **Message:** {e.message}\n"
-            f"- **Details:** {e.details}\n"
             f"- **Hint:** {e.hint}"
         )
         st.stop()
     except Exception as e:
-        st.error(f"❌ **Terjadi kesalahan koneksi Supabase:** {e}")
+        st.error(f"❌ **Kesalahan koneksi Supabase:** {e}")
         st.stop()
-
-    if not semua_data:
+            
+    if not semua_data: 
         return pd.DataFrame()
-
+        
     df = pd.DataFrame(semua_data)
 
-    # Normalisasi nama kolom (mendukung baik format snake_case PostgreSQL maupun Title Case)
+    # Normalisasi nama kolom dari PostgreSQL (snake_case) ke format Title Case aplikasi
     col_mapping = {
         'kolom': 'Kolom',
         'baris': 'Baris',
@@ -99,26 +98,26 @@ def load_data_from_supabase():
         if c.strip().lower() in col_mapping
     }
     df.rename(columns=rename_dict, inplace=True)
-
+            
     for col in ['Baris', 'Pallet Ke']:
-        if col in df.columns:
+        if col in df.columns: 
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
-
+            
     # Filter eksklusif hanya kolom Shuttle Racking (A - G)
     if 'Kolom' in df.columns:
         df['Kolom'] = df['Kolom'].astype(str).str.strip().str.upper()
         df = df[df['Kolom'].isin(['A', 'B', 'C', 'D', 'E', 'F', 'G'])].copy()
-
+            
     return df
 
 @st.cache_data(ttl=3600)
 def load_master_produk():
     try:
-        try:
+        try: 
             df_master = pd.read_csv("Master_Produk.csv", sep=";", encoding='utf-8-sig')
-        except Exception:
+        except Exception: 
             df_master = pd.read_csv("Master_Produk.csv", sep=",", encoding='utf-8-sig')
-
+        
         df_master.columns = df_master.columns.str.strip()
         if 'Part Number' in df_master.columns:
             df_master['Part Number Clean'] = df_master['Part Number'].astype(str).str.strip().str.upper()
@@ -130,10 +129,7 @@ def load_master_produk():
 df_master_global = load_master_produk()
 master_dict = {}
 if not df_master_global.empty and 'Part Number Clean' in df_master_global.columns:
-    kat_cols = [
-        c for c in df_master_global.columns
-        if any(k in c.lower() for k in ['kategori', 'jenis', 'group', 'tipe', 'nama'])
-    ]
+    kat_cols = [c for c in df_master_global.columns if any(k in c.lower() for k in ['kategori', 'jenis', 'group', 'tipe', 'nama'])]
     for _, row in df_master_global.iterrows():
         pn = row['Part Number Clean']
         ip = pd.to_numeric(row.get('Isi 1 Pallet (pcs)', 0), errors='coerce')
@@ -148,7 +144,7 @@ if not df_master_global.empty and 'Part Number Clean' in df_master_global.column
         }
 
 # ==========================================================
-# 4. FUNGSI HELPER, PARSER STOK AKURAT, & KLASIFIKASI PRODUK
+# FUNGSI HELPER, PARSER STOK AKURAT, & KLASIFIKASI PRODUK
 # ==========================================================
 def get_waktu_jkt():
     return datetime.utcnow() + timedelta(hours=7)
@@ -159,7 +155,7 @@ def parse_lot_date(lot_str):
         date_str = cleaned[-6:]
         shift_char = cleaned[-7] if len(cleaned) >= 7 and cleaned[-7].isdigit() else '9'
         shift_num = int(shift_char)
-
+        
         try:
             day = int(date_str[0:2])
             month = int(date_str[2:4])
@@ -181,7 +177,7 @@ def parse_keterangan_stok(row_ket):
     if not ket_str or ket_str in ['nan', 'none', '-', 'utuh', 'full']:
         return 1, 0, 0
 
-    if not any(k in ket_str for k in ['pecahan', 'eceran', 'dus', 'sak', 'pcs']):
+    if 'pecahan' not in ket_str and 'eceran' not in ket_str and 'dus' not in ket_str and 'sak' not in ket_str and 'pcs' not in ket_str:
         return 1, 0, 0
 
     val_pecahan = 0
@@ -213,10 +209,10 @@ def parse_keterangan_stok(row_ket):
 def hitung_pcs_baris(row_ket, part_num):
     pn = str(part_num).strip().upper()
     jml_utuh, val_pecahan, val_eceran = parse_keterangan_stok(row_ket)
-
+        
     master_info = master_dict.get(pn, {'ip': 0, 'pb': 0, 'ps': 0})
     pss = master_info['pb'] if pn.endswith(('D', 'G')) else master_info['ps']
-
+    
     return (jml_utuh * master_info['ip']) + (val_pecahan * pss) + val_eceran
 
 def klasifikasi_kategori_palet(part_num, nama_produk, baris=0):
@@ -235,8 +231,8 @@ def klasifikasi_kategori_palet(part_num, nama_produk, baris=0):
         return "Cup Printing"
 
     warna_keywords = [
-        "COLOR", "COLOUR", "MERAH", "BIRU", "HIJAU", "KUNING",
-        "COKLAT", "COKELAT", "PUTIH", "HITAM", "ORANGE", "UNGU",
+        "COLOR", "COLOUR", "MERAH", "BIRU", "HIJAU", "KUNING", 
+        "COKLAT", "COKELAT", "PUTIH", "HITAM", "ORANGE", "UNGU", 
         "PINK", "GOLD", "SILVER", "TOSCA", "MAROON", "RED", "BLUE", "GREEN", "YELLOW"
     ]
     if any(re.search(rf'\b{w}\b', combined) for w in warna_keywords):
@@ -286,19 +282,21 @@ def hitung_distribusi_produk_palet(df, prod_col, kapasitas_total=6548):
 def build_picking_cards(kolom, baris, df_sub, prod_col):
     lokasi_str = f"{kolom}-{baris}"
     area_str = "Area 1 (1–16)" if baris <= 16 else "Area 2 (17–28)"
-
-    empty_card = [{
-        'Lokasi': lokasi_str, 'Area': area_str, 'Part Number': '-',
-        'Nama Produk': 'RAK KOSONG', 'Total Fisik': '0', 'Total Pcs': 0,
-        'Rumus Konversi': '-', 'Detail Lot': [], 'Is_Empty': True
-    }]
-
+    
     if df_sub.empty or 'Part Number' not in df_sub.columns:
-        return empty_card
-
+        return [{
+            'Lokasi': lokasi_str, 'Area': area_str, 'Part Number': '-',
+            'Nama Produk': 'RAK KOSONG', 'Total Fisik': '0', 'Total Pcs': 0,
+            'Rumus Konversi': '-', 'Detail Lot': [], 'Is_Empty': True
+        }]
+        
     valid_df = df_sub[~df_sub['Part Number'].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>"])].copy()
     if valid_df.empty:
-        return empty_card
+        return [{
+            'Lokasi': lokasi_str, 'Area': area_str, 'Part Number': '-',
+            'Nama Produk': 'RAK KOSONG', 'Total Fisik': '0', 'Total Pcs': 0,
+            'Rumus Konversi': '-', 'Detail Lot': [], 'Is_Empty': True
+        }]
 
     valid_df['PN_Clean'] = valid_df['Part Number'].astype(str).str.strip().str.upper()
     if 'Pallet Ke' in valid_df.columns:
@@ -309,12 +307,8 @@ def build_picking_cards(kolom, baris, df_sub, prod_col):
 
     for pn in pn_order:
         df_item = valid_df[valid_df['PN_Clean'] == pn].copy()
-        prod_name = (
-            str(df_item[prod_col].dropna().values[0]).strip()
-            if prod_col in df_item.columns and len(df_item[prod_col].dropna().values) > 0
-            else "-"
-        )
-
+        prod_name = str(df_item[prod_col].dropna().values[0]).strip() if prod_col in df_item.columns and len(df_item[prod_col].dropna().values) > 0 else "-"
+        
         master_info = master_dict.get(pn, {'ip': 0, 'pb': 0, 'ps': 0})
         pss = master_info['pb'] if pn.endswith(('D', 'G')) else master_info['ps']
         satuan_pecahan = "Dus" if pn.endswith(('D', 'G')) else "Sak"
@@ -329,7 +323,7 @@ def build_picking_cards(kolom, baris, df_sub, prod_col):
         for lot_val, grp_lot in df_item.groupby('Lot_Clean', sort=False):
             pallets = sorted(grp_lot['Pallet Ke'].tolist())
             plt_range = f"{pallets[0]}–{pallets[-1]}" if len(pallets) > 1 else str(pallets[0])
-
+            
             u, p_val, e_val = 0, 0, 0
             catatan_set = set()
             for _, r in grp_lot.iterrows():
@@ -337,7 +331,7 @@ def build_picking_cards(kolom, baris, df_sub, prod_col):
                 u += du
                 p_val += dp
                 e_val += de
-
+                
                 cat_str = str(r.get('Catatan', '')).strip()
                 if cat_str and cat_str.lower() not in ['nan', 'none', '']:
                     catatan_set.add(cat_str)
@@ -536,7 +530,7 @@ def render_print_html(cards, judul_dok, waktu_cetak):
     """
 
 # ==========================================================
-# 5. SIDEBAR & PENGATURAN
+# 4. SIDEBAR & PENGATURAN
 # ==========================================================
 st.sidebar.header("🔄 Sinkronisasi Real-Time")
 st.sidebar.info("Data dikunci selama 5 menit (cache lokal) agar pemuatan grid seketika.")
@@ -548,12 +542,12 @@ if st.sidebar.button("🔄 Tarik Data Gudang Terbaru", use_container_width=True,
 st.sidebar.divider()
 st.sidebar.header("👁️ Mode Tampilan Kotak")
 mode_tampilan = st.sidebar.radio("Angka di dalam kotak rak mewakili:", [
-    "Variasi SKU (Jenis Barang)",
+    "Variasi SKU (Jenis Barang)", 
     "Sisa Slot Kosong"
 ])
 
 # ==========================================================
-# 6. MEMUAT DATA UTAMA & PENCARIAN
+# 5. MEMUAT DATA UTAMA & PENCARIAN
 # ==========================================================
 st.title("📦 Visualisasi Grid Gudang (Live Monitor)")
 st.caption(f"Layar pantau Read-Only. Terhubung ke Supabase: {NAMA_TABEL} (Area Shuttle A - G)")
@@ -572,17 +566,17 @@ search_query, search_lot = "", ""
 
 if tipe_cari in ["Berdasarkan Produk", "Berdasarkan Part Number"]:
     search_col = product_col if tipe_cari == "Berdasarkan Produk" else 'Part Number'
-
+    
     if search_col in df.columns:
         valid_mask = ~df[search_col].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>"])
         daftar_pilihan = sorted(df[valid_mask][search_col].dropna().astype(str).unique().tolist())
-    else:
+    else: 
         daftar_pilihan = []
-
+        
     label_selectbox = "Pilih Produk:" if tipe_cari == "Berdasarkan Produk" else "Pilih Part Number:"
     pilihan_pencarian = st.sidebar.selectbox(label_selectbox, options=["-- Tampilkan Semua --"] + daftar_pilihan)
     search_query = "" if pilihan_pencarian == "-- Tampilkan Semua --" else pilihan_pencarian
-
+    
     if search_query:
         st.markdown(f"### 🔎 Lokasi Pengambilan **{search_query}** (Urutan FIFO)")
         q_clean = search_query.strip().lower()
@@ -590,62 +584,62 @@ if tipe_cari in ["Berdasarkan Produk", "Berdasarkan Part Number"]:
             (df[search_col].astype(str).str.strip().str.lower() == q_clean) &
             (df['Kolom'].isin(['A', 'B', 'C', 'D', 'E', 'F', 'G']))
         ].copy()
-
+        
         if not df_search.empty:
             df_search['Tgl_Produksi'] = df_search['Lot Number'].apply(parse_lot_date)
             df_search = df_search.sort_values(by=['Tgl_Produksi', 'Kolom', 'Baris', 'Pallet Ke'], ascending=[True, True, True, True])
             fifo_summary = []
             grouped = df_search.groupby(['Kolom', 'Baris', 'Part Number', 'Lot Number', 'Tgl_Produksi'], dropna=False)
-            grand_total_search_pcs = 0
-
+            grand_total_search_pcs = 0 
+            
             for name, group in grouped:
                 kolom, baris, part_num, lot, tgl = name
                 pallets = sorted(group['Pallet Ke'].tolist())
                 pallet_range = f"{pallets[0]} - {pallets[-1]}" if len(pallets) > 1 else str(pallets[0]) if pallets else "-"
-
+                
                 pn_clean = str(part_num).strip().upper()
                 master_info = master_dict.get(pn_clean, {'ip': 0, 'pb': 0, 'ps': 0})
                 pss = master_info['pb'] if pn_clean.endswith(('D', 'G')) else master_info['ps']
-
+                
                 jml_utuh, val_pecahan, val_eceran = 0, 0, 0
                 for _, row in group.iterrows():
                     du, dp, de = parse_keterangan_stok(row.get('Keterangan', ''))
                     jml_utuh += du
                     val_pecahan += dp
                     val_eceran += de
-
+                
                 total_pcs_group = (jml_utuh * master_info['ip']) + (val_pecahan * pss) + val_eceran
                 grand_total_search_pcs += total_pcs_group
-
+                
                 stok_str = []
                 if jml_utuh > 0: stok_str.append(f"{jml_utuh} Plt")
                 if val_pecahan > 0: stok_str.append(f"{val_pecahan} Dus/Sak")
                 if val_eceran > 0: stok_str.append(f"{val_eceran} Pcs")
                 fisik_str = " + ".join(stok_str) if stok_str else "0"
-
+                
                 if master_info['ip'] > 0 or total_pcs_group > 0:
                     pcs_format = f"{total_pcs_group:,.0f}".replace(',', '.')
                     fisik_str += f" ➔ {pcs_format} Pcs"
-
+                
                 fifo_summary.append({
                     'Lokasi Rak': f"{kolom}-{baris}", 'Part Number': part_num, 'Lot Number': lot,
                     'Jumlah Stok (Fisik & Pcs)': fisik_str, 'Range Pallet Ke': pallet_range,
                     'Tanggal Produksi': tgl, 'Urutan_Sort': tgl
                 })
-
+                
             df_fifo = pd.DataFrame(fifo_summary).sort_values('Urutan_Sort').drop(columns=['Urutan_Sort'])
             df_fifo['Tanggal Produksi'] = df_fifo['Tanggal Produksi'].apply(lambda x: x.strftime('%d-%m-%Y') if x.year != 2099 else "Strip/Tidak Valid")
             df_fifo = df_fifo[['Lokasi Rak', 'Part Number', 'Lot Number', 'Jumlah Stok (Fisik & Pcs)', 'Range Pallet Ke', 'Tanggal Produksi']]
-
+            
             st.info(f"💡 **Rekomendasi Ambil Pertama (Paling Lama):** Rak **{df_fifo.iloc[0]['Lokasi Rak']}** (Lot: {df_fifo.iloc[0]['Lot Number']}) dengan {df_fifo.iloc[0]['Jumlah Stok (Fisik & Pcs)']}")
             st.dataframe(df_fifo, use_container_width=True, hide_index=True)
-
+            
             if grand_total_search_pcs > 0:
                 total_semua_format = f"{grand_total_search_pcs:,.0f}".replace(',', '.')
                 st.markdown(
                     f"<div style='text-align: right; padding-top: 8px; font-size: 16px; color: #475569;'>"
                     f"Total Kuantitas Keseluruhan (Rak A-G): <span style='color: #2563eb; font-weight: 900; font-size: 18px;'>{total_semua_format} Pcs</span>"
-                    f"</div>",
+                    f"</div>", 
                     unsafe_allow_html=True
                 )
             st.divider()
@@ -655,14 +649,14 @@ else:
     if 'Lot Number' in df.columns:
         valid_mask = ~df['Lot Number'].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>", "-", "0"])
         daftar_lot = sorted(df[valid_mask]['Lot Number'].dropna().astype(str).unique().tolist())
-    else:
+    else: 
         daftar_lot = []
-
+        
     pilihan_lot = st.sidebar.selectbox("Pilih No. Lot:", options=["-- Tampilkan Semua --"] + daftar_lot)
     search_lot = "" if pilihan_lot == "-- Tampilkan Semua --" else pilihan_lot
 
 # ==========================================================
-# 7. LOGIKA MATRIKS RAK (CACHED UNTUK POP-UP INSTAN)
+# 6. LOGIKA MATRIKS RAK (CACHED UNTUK POP-UP INSTAN)
 # ==========================================================
 def is_rack_exist(kolom, baris):
     if kolom == 'F' and baris < 5: return False
@@ -674,10 +668,10 @@ def process_matrix_data(df, search_term, search_lot_term, prod_col):
     kolom_list = ['G', 'F', 'E', 'D', 'C', 'B', 'A']
     baris_list = list(range(1, 29))
     matrix_info = {}
-
+    
     total_critical, total_warning, total_ideal, total_kosong = 0, 0, 0, 0
     total_slot_ideal, total_slot_warning = 0, 0
-
+    
     term_clean = search_term.strip().lower() if search_term else ""
     lot_term_clean = search_lot_term.strip().lower() if search_lot_term else ""
     grouped_racks = dict(tuple(df.groupby(['Kolom', 'Baris'])))
@@ -687,21 +681,21 @@ def process_matrix_data(df, search_term, search_lot_term, prod_col):
             if not is_rack_exist(k, b):
                 matrix_info[(k, b)] = {'exist': False}
                 continue
-
+                
             sub = grouped_racks.get((k, b), pd.DataFrame(columns=df.columns))
             is_all_box, filled, sku, is_match = False, 0, 0, False
-
+            
             if 'Part Number' in sub.columns and not sub.empty:
                 p_series = sub['Part Number'].astype(str).str.strip()
                 valid_mask = ~p_series.str.lower().isin(["", "nan", "none", "<na>"])
                 p_valid = p_series[valid_mask]
-
+                
                 filled = int(valid_mask.sum())
                 sku = len(p_valid.unique())
-
+                
                 if not p_valid.empty:
                     is_all_box = bool(p_valid.str.upper().str.endswith(('D', 'G')).all())
-
+                    
                 if term_clean:
                     m_part = (p_series.str.lower() == term_clean).any()
                     m_prod = (sub[prod_col].astype(str).str.strip().str.lower() == term_clean).any() if prod_col in sub.columns else False
@@ -709,27 +703,27 @@ def process_matrix_data(df, search_term, search_lot_term, prod_col):
                 elif lot_term_clean:
                     if 'Lot Number' in sub.columns:
                         is_match = (sub['Lot Number'].astype(str).str.strip().str.lower() == lot_term_clean).any()
-
+                        
             max_slot = int(32 if b <= 16 else 46) if is_all_box else int(31 if b <= 16 else 44)
             usable_space = max(0, max_slot - filled)
-
-            if sku >= 3:
+            
+            if sku >= 3: 
                 total_critical += 1
-            elif sku == 2:
+            elif sku == 2: 
                 total_warning += 1
                 if usable_space > 1: total_slot_warning += usable_space
             elif sku == 1:
                 total_ideal += 1
                 if usable_space > 1: total_slot_ideal += usable_space
-            elif sku == 0:
+            elif sku == 0: 
                 total_kosong += 1
-
+                
             matrix_info[(k, b)] = {
-                'exist': True, 'sku_cnt': sku, 'filled': filled,
-                'usable_space': usable_space, 'max_slot': max_slot,
+                'exist': True, 'sku_cnt': sku, 'filled': filled, 
+                'usable_space': usable_space, 'max_slot': max_slot, 
                 'df_sub': sub, 'is_match': is_match
             }
-
+            
     return matrix_info, total_critical, total_warning, total_ideal, total_kosong, total_slot_ideal, total_slot_warning, kolom_list, baris_list
 
 matrix_info, total_critical, total_warning, total_ideal, total_kosong, total_slot_ideal, total_slot_warning, kolom_list, baris_list = process_matrix_data(df, search_query, search_lot, product_col)
@@ -750,7 +744,7 @@ for (k, b), info in matrix_info.items():
             anomali = df_sub[df_sub['Catatan'].astype(str).str.contains('BAYANGAN', case=False, na=False)]
             if not anomali.empty:
                 rak_bermasalah.add(f"{k}-{b}")
-                for _, row in anomali.iterrows():
+                for _, row in anomali.iterrows(): 
                     bayangan_data.append(row.to_dict())
 
 if bayangan_data:
@@ -760,17 +754,17 @@ if bayangan_data:
     df_bayangan = df_bayangan[cols_tersedia].sort_values(by=['Kolom', 'Baris', 'Pallet Ke'])
     csv = df_bayangan.to_csv(index=False, sep=";").encode('utf-8-sig')
     st.sidebar.download_button(
-        label="📥 Unduh Daftar Pallet Bayangan",
-        data=csv,
-        file_name=f"Cek_Lapangan_Overlimit_{get_waktu_jkt().strftime('%Y%m%d_%H%M')}.csv",
-        mime="text/csv",
+        label="📥 Unduh Daftar Pallet Bayangan", 
+        data=csv, 
+        file_name=f"Cek_Lapangan_Overlimit_{get_waktu_jkt().strftime('%Y%m%d_%H%M')}.csv", 
+        mime="text/csv", 
         type="primary"
     )
 else:
     st.sidebar.success("✅ Seluruh rak dalam batas kapasitas normal.")
 
 # ==========================================================
-# 8. POP-UP DETAIL RAK (+ CETAK KARTU CEPAT)
+# 7. POP-UP DETAIL RAK (+ CETAK KARTU CEPAT)
 # ==========================================================
 @st.dialog("📦 Rincian Detail Rak", width="large")
 def show_rack_detail(k, b, info):
@@ -787,18 +781,18 @@ def show_rack_detail(k, b, info):
     c3.metric("Space Kosong", f"{info['usable_space']} Slot")
     c4.metric("Total Kuantitas", format_compact_number(grand_total_pcs) + " Pcs")
     st.divider()
-
+    
     if info['sku_cnt'] > 0:
         df_terisi = info['df_sub'][~info['df_sub']['Part Number'].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>"])]
-
+        
         rekap_data = []
         for part_num in df_terisi['Part Number'].astype(str).str.strip().unique():
             df_prod = df_terisi[df_terisi['Part Number'].astype(str).str.strip() == part_num]
             prod_name = str(df_prod[product_col].dropna().values[0]) if product_col in df_prod.columns and len(df_prod[product_col].dropna().values) > 0 else "-"
-
-            pnc = str(part_num).strip().upper()
+            
+            pnc = str(part_num).strip().upper() 
             master_info = master_dict.get(pnc, {'ip': 0, 'pb': 0, 'ps': 0})
-
+            
             jml_utuh, val_pecahan, val_eceran = 0, 0, 0
             for _, row in df_prod.iterrows():
                 du, dp, de = parse_keterangan_stok(row.get('Keterangan', ''))
@@ -808,34 +802,34 @@ def show_rack_detail(k, b, info):
 
             sc = "Dus" if pnc.endswith(('D', 'G')) else "Sak"
             pss = master_info['pb'] if pnc.endswith(('D', 'G')) else master_info['ps']
-
+            
             if master_info['ip'] > 0:
                 tot = (jml_utuh * master_info['ip']) + (val_pecahan * pss) + val_eceran
                 teks_rincian = f"{jml_utuh} Pallet * {master_info['ip']:,.0f}"
                 if val_pecahan > 0: teks_rincian += f" + {val_pecahan} {sc} * {pss:,.0f}"
                 if val_eceran > 0: teks_rincian += f" + {val_eceran} Pcs"
                 teks_rincian += f" = **Total {tot:,.0f} Pcs**"
-            else:
+            else: 
                 teks_rincian = f"{jml_utuh} Pallet"
 
             rekap_data.append({'Part Number': pnc, 'Nama Produk': prod_name, 'Pallet Utuh': jml_utuh, 'Konversi Total Pcs': teks_rincian})
-
+        
         st.markdown("#### 📊 Rekapitulasi Stok (Otomatis)")
         st.dataframe(pd.DataFrame(rekap_data), use_container_width=True, hide_index=True)
-        st.write("")
-
+        st.write("") 
+        
         st.markdown("#### 📑 Rincian Posisi per Pallet")
         avail = [c for c in ['Pallet Ke', 'Part Number', 'Lot Number', product_col, 'Keterangan', 'Catatan'] if c in df_terisi.columns]
         df_tampil = df_terisi[avail].copy()
-        if 'Pallet Ke' in df_tampil.columns:
+        if 'Pallet Ke' in df_tampil.columns: 
             df_tampil = df_tampil.sort_values(by='Pallet Ke', ascending=True)
-
+            
         def highlight_bayangan(row):
             cat = str(row.get('Catatan', '')).upper()
             if 'BAYANGAN' in cat: return ['background-color: #fef2f2; color: #991b1b; font-weight: bold;'] * len(row)
             elif 'BOOKED' in cat: return ['background-color: #eff6ff; color: #1e3a8a; font-weight: bold; border-left: 4px solid #2563eb;'] * len(row)
             return [''] * len(row)
-
+            
         try:
             st.dataframe(df_tampil.style.apply(highlight_bayangan, axis=1), use_container_width=True, hide_index=True)
         except Exception:
@@ -850,7 +844,7 @@ def show_rack_detail(k, b, info):
         components.html(html_single, height=420, scrolling=True)
 
 # ==========================================================
-# 9. METRIK ATAS & TABS UTAMA
+# 8. METRIK ATAS & TABS UTAMA
 # ==========================================================
 col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
 total_baris_hitung = total_ideal + total_warning + total_critical + total_kosong
@@ -879,36 +873,36 @@ with tab_grid:
             'Status': ['🟢 Ideal', '🟡 Campur', '🔴 Kritis', '⚪ Kosong'],
             'Jumlah': [total_ideal, total_warning, total_critical, total_kosong]
         })
-
+        
         warna_pie = {
-            '🟢 Ideal': 'palegreen',
-            '🟡 Campur': 'gold',
-            '🔴 Kritis': 'crimson',
+            '🟢 Ideal': 'palegreen', 
+            '🟡 Campur': 'gold', 
+            '🔴 Kritis': 'crimson', 
             '⚪ Kosong': 'gainsboro'
         }
 
         fig_status = px.pie(
-            df_pie,
-            values='Jumlah',
-            names='Status',
+            df_pie, 
+            values='Jumlah', 
+            names='Status', 
             color='Status',
-            color_discrete_map=warna_pie,
+            color_discrete_map=warna_pie, 
             hole=0.4
         )
-
+        
         fig_status.update_traces(
-            textposition='inside',
+            textposition='inside', 
             textinfo='percent+label',
             hovertemplate="<b>%{label}</b><br>Jumlah: %{value} Rak<br>Persentase: %{percent}<extra></extra>",
-            textfont_size=13,
+            textfont_size=13, 
             textfont_color='black'
         )
-
+        
         fig_status.update_layout(
-            margin=dict(t=15, b=15, l=10, r=10),
-            height=300,
+            margin=dict(t=15, b=15, l=10, r=10), 
+            height=300, 
             showlegend=False,
-            plot_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)', 
             paper_bgcolor='rgba(0,0,0,0)'
         )
         st.plotly_chart(fig_status, use_container_width=True)
@@ -920,7 +914,7 @@ with tab_grid:
         st.markdown(
             f"<div style='text-align:center; font-weight:800; font-size:15px; color:#334155;'>"
             f"📦 Komposisi Palet Produk vs Free Space ({total_palet_terisi:,} / {KAPASITAS_IDEAL_TOTAL:,} Plt • {persen_isi:.1f}%)"
-            f"</div>".replace(',', '.'),
+            f"</div>".replace(',', '.'), 
             unsafe_allow_html=True
         )
 
@@ -979,10 +973,10 @@ with tab_grid:
     '''
     dynamic_css = f"{css_block_1}\n{css_block_2}\n{css_block_3}\n{css_block_4}\n{css_btn}"
     color_map = {
-        'match': {"bg": "deepskyblue", "txt": "black", "sel": []},
-        'critical': {"bg": "crimson", "txt": "white", "sel": []},
-        'warning': {"bg": "gold", "txt": "black", "sel": []},
-        'ideal': {"bg": "palegreen", "txt": "black", "sel": []},
+        'match': {"bg": "deepskyblue", "txt": "black", "sel": []}, 
+        'critical': {"bg": "crimson", "txt": "white", "sel": []}, 
+        'warning': {"bg": "gold", "txt": "black", "sel": []}, 
+        'ideal': {"bg": "palegreen", "txt": "black", "sel": []}, 
         'empty': {"bg": "gainsboro", "txt": "gray", "sel": []}
     }
 
@@ -992,7 +986,7 @@ with tab_grid:
             if not info or not info['exist']: continue
             sku = info['sku_cnt']
             sel = f".st-key-btn_{k}_{b} button"
-
+            
             if info['is_match']: color_map['match']['sel'].append(sel)
             elif sku >= 3: color_map['critical']['sel'].append(sel)
             elif sku == 2: color_map['warning']['sel'].append(sel)
@@ -1000,30 +994,29 @@ with tab_grid:
             else: color_map['empty']['sel'].append(sel)
 
     for group in color_map.values():
-        if group['sel']:
-            dynamic_css += f"\n{', '.join(group['sel'])} {{ background-color: {group['bg']} !important; color: {group['txt']} !important; }}"
+        if group['sel']: dynamic_css += f"\n{', '.join(group['sel'])} {{ background-color: {group['bg']} !important; color: {group['txt']} !important; }}"
 
     st.markdown(f"<style>{dynamic_css}</style>", unsafe_allow_html=True)
 
     def render_grid_area(title, start_baris, end_baris):
         st.markdown(f"### {title}")
         header_cols = st.columns([0.6] + [1] * 16, gap="small")
-        with header_cols[0]: st.empty()
-
+        with header_cols[0]: st.empty() 
+            
         for idx, b in enumerate(list(range(start_baris, end_baris + 1))):
-            with header_cols[idx + 1]:
+            with header_cols[idx + 1]: 
                 st.markdown(f"<div style='text-align:center; font-weight:900; font-size:14px; color:#94a3b8; margin-bottom:4px;'>{b}</div>", unsafe_allow_html=True)
-
+        
         for k in kolom_list:
             cols = st.columns([0.6] + [1] * 16, gap="small")
             with cols[0]: st.markdown(f"<div style='font-weight:900;'>{k}</div>", unsafe_allow_html=True)
-
+                
             for idx, b in enumerate(list(range(start_baris, end_baris + 1))):
                 info = matrix_info[(k, b)]
                 with cols[idx + 1]:
                     if info['exist']:
                         lbl = str(info['usable_space']) if mode_tampilan == "Sisa Slot Kosong" else str(info['sku_cnt'])
-                        if st.button(lbl, key=f"btn_{k}_{b}", use_container_width=True):
+                        if st.button(lbl, key=f"btn_{k}_{b}", use_container_width=True): 
                             show_rack_detail(k, b, info)
 
     render_grid_area("📍 Area 1 (Rak 1 - 16)", 1, 16)
@@ -1039,7 +1032,7 @@ with tab_grid:
             k, b = r.split('-')
             if k not in grouped: grouped[k] = []
             grouped[k].append(r)
-
+        
         res = ""
         for k in sorted(grouped.keys()):
             res += f"**Blok {k}:** {', '.join(grouped[k])}<br>"
@@ -1053,7 +1046,7 @@ with tab_grid:
             if info and info['exist']:
                 sku = info['sku_cnt']
                 lokasi = f"{k}-{b}"
-
+                
                 if sku >= 3: list_merah.append(lokasi)
                 elif sku == 2: list_kuning.append(lokasi)
                 elif sku == 1: list_hijau.append(lokasi)
@@ -1080,7 +1073,7 @@ with tab_grid:
 # ==========================================================
 with tab_cetak:
     st.markdown("### 🖨️ Cetak Kartu Racking / Petunjuk Pengambilan (A-1 s/d G-28)")
-    st.caption("Kartu disusun langsung dari cache memori aktif. 1 kartu mewakili 1 Part Number (memuat seluruh Lot sejenis di rak tersebut).")
+    st.caption("0 Kuota Database tambahan: kartu disusun langsung dari cache memori aktif. 1 kartu mewakili 1 Part Number (memuat seluruh Lot sejenis di rak tersebut).")
 
     KOLOM_URUT_AG = ['A', 'B', 'C', 'D', 'E', 'F', 'G']
     daftar_semua_lokasi = [
