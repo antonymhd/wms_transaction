@@ -7,6 +7,17 @@ import hmac
 from datetime import datetime, timedelta
 import firebase_admin
 from firebase_admin import credentials, firestore
+import streamlit as st
+from supabase import create_client, Client
+
+@st.cache_resource
+def init_supabase() -> Client:
+    return create_client(
+        st.secrets["supabase"]["url"],
+        st.secrets["supabase"]["key"]
+    )
+
+supabase = init_supabase()
 
 
 # ==========================================================
