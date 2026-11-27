@@ -36,19 +36,55 @@ def pulihkan_draft_ke_session(draft):
     st.session_state.slide = 6
 
 # ==========================================================
-# SLIDE 0: LOGIN OPERATOR BERTUGAS (VERIFIKASI PIN + MUAT DRAFT/UNDO SUPABASE)
+# SLIDE 0: PILIH OPERATOR BERTUGAS (1-TAP TANPA PIN)
 # ==========================================================
 if st.session_state.slide == 0:
-    core.render_login_operator(
-        app_title="Inbound & WIP - Rack Navigator",
-        subtitle="Pilih Operator Forklift & Masukkan PIN untuk Terhubung ke Supabase",
-        accent_color="#10B981",
-        prefix_app="IN",
-        operator_list=OPERATOR_INBOUND,
-        slide_tujuan=1,
-        default_mode=None,
-        load_draft_type="INBOUND"
-    )
+    st.markdown("""
+        <div class="db-info-box" style="text-align: center;">
+            <div style="font-size: 18px; font-weight: bold; color: #10B981;">
+                🧭 Inbound & WIP - Rack Navigator
+            </div>
+            <div style="font-size: 13px; opacity: 0.8; margin-top: 4px;">
+                Pilih Operator Forklift yang Bertugas
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown('<div class="btn-center">', unsafe_allow_html=True)
+    for i in range(0, len(OPERATOR_INBOUND), 2):
+        cols = st.columns(2)
+        with cols[0]:
+            op1 = OPERATOR_INBOUND[i]
+            if st.button(f"👤 {op1}", key=f"op_{op1}", use_container_width=True):
+                st.session_state.operator = op1
+                core.muat_undo_firestore("IN", op1)
+                core.muat_draft_inbound("IN", op1)
+                pindah_slide(1)
+                st.rerun()
+        if i + 1 < len(OPERATOR_INBOUND):
+            with cols[1]:
+                op2 = OPERATOR_INBOUND[i + 1]
+                if st.button(f"👤 {op2}", key=f"op_{op2}", use_container_width=True):
+                    st.session_state.operator = op2
+                    core.muat_undo_firestore("IN", op2)
+                    core.muat_draft_inbound("IN", op2)
+                    pindah_slide(1)
+                    st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.write("")
+    with st.expander("➕ Operator Pengganti / Lainnya"):
+        op_manual = st.text_input("Ketik Nama Operator", placeholder="Masukkan nama...")
+        if st.button("MASUK DENGAN NAMA INI", type="primary", use_container_width=True):
+            if op_manual.strip():
+                nama_fix = op_manual.strip().title()
+                st.session_state.operator = nama_fix
+                core.muat_undo_firestore("IN", nama_fix)
+                core.muat_draft_inbound("IN", nama_fix)
+                pindah_slide(1)
+                st.rerun()
+            else:
+                st.warning("Nama operator tidak boleh kosong.")
     st.stop()
 
 # ==========================================================
@@ -144,7 +180,7 @@ elif st.session_state.mode_transaksi == "WIP":
         st.markdown("### Lokasi Target WIP (Akses 2 Pintu)")
         st.info(core.format_nama_warna_bold(st.session_state.item))
 
-        with st.spinner("🔍 Memindai posisi lorong depan & belakang dari Supabase..."):
+        with st.spinner("🔍 Memindai posisi lorong depan & belakang..."):
             semua_data = core.get_all_racking_data()
             df_rekap = core.cari_lokasi_stok_hibrida(semua_data, st.session_state.item)
 
