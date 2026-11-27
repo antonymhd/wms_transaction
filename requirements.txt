@@ -1,6 +1,10 @@
 firebase-admin
 supabase
-plotly
 requests
 google-genai
 pillow
+streamlit
+pandas
+openpyxl
+st-gsheets-connection
+plotly
