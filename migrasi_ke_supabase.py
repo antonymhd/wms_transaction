@@ -1,31 +1,38 @@
-import tomllib
+import json
 import math
+import tomllib
 import firebase_admin
 from firebase_admin import credentials, firestore
 from supabase import create_client
 
-# 1. Baca kredensial langsung dari .streamlit/secrets.toml
+# 1. Baca kredensial dari .streamlit/secrets.toml
 with open(".streamlit/secrets.toml", "rb") as f:
     secrets = tomllib.load(f)
 
-# 2. Koneksi ke Firebase Firestore
 if not firebase_admin._apps:
     cred = credentials.Certificate(dict(secrets["firebase"]))
     firebase_admin.initialize_app(cred)
 db_firebase = firestore.client()
 
-# 3. Koneksi ke Supabase
-sb_url = secrets["supabase"]["url"]
-sb_key = secrets["supabase"]["key"]
+sb_url = secrets["supabase"]["url"] if "supabase" in secrets else secrets["SUPABASE_URL"]
+sb_key = secrets["supabase"]["key"] if "supabase" in secrets else secrets["SUPABASE_KEY"]
 supabase = create_client(sb_url, sb_key)
 
-NAMA_KOLEKSI = "uji_coba_rak"
-NAMA_TABEL = "uji_coba_rak"
+KOLEKSI_JSONB = [
+    "log_mutasi_rak",
+    "log_transaksi",
+    "master_rak",
+    "visualisasi_rak",
+    "wms_inbound_drafts",
+    "wms_undo_state",
+]
+
+def sanitize_json(obj):
+    """Konversi tipe data khusus Firestore (misal DatetimeWithNanoseconds) agar aman masuk JSONB."""
+    return json.loads(json.dumps(obj, default=str))
 
 def clean_str(val):
-    if val is None:
-        return ""
-    if isinstance(val, float) and math.isnan(val):
+    if val is None or (isinstance(val, float) and math.isnan(val)):
         return ""
     s = str(val).strip()
     return "" if s.lower() in ["nan", "none", "<na>"] else s
@@ -38,61 +45,70 @@ def clean_int(val):
     except Exception:
         return 0
 
-def main():
-    print(f"📥 Menarik seluruh dokumen dari Firestore '{NAMA_KOLEKSI}'...")
-    docs = db_firebase.collection(NAMA_KOLEKSI).stream()
+def migrate_uji_coba_rak():
+    print("\n📦 Memigrasi koleksi 'uji_coba_rak' (format tabular per palet)...")
+    docs = db_firebase.collection("uji_coba_rak").stream()
+    payload = []
 
-    raw_rows = []
-    doc_count = 0
     for doc in docs:
-        doc_count += 1
-        doc_data = doc.to_dict()
-        if "data" in doc_data and isinstance(doc_data["data"], list):
-            raw_rows.extend(doc_data["data"])
+        doc_dict = doc.to_dict() or {}
+        items = doc_dict.get("data") if isinstance(doc_dict.get("data"), list) else [doc_dict]
 
-    print(f"✅ Ditemukan {doc_count} dokumen dengan total {len(raw_rows)} baris palet.")
+        for r in items:
+            if not isinstance(r, dict):
+                continue
+            kolom_val = clean_str(r.get("Kolom", r.get("kolom", ""))).upper()
+            baris_val = clean_int(r.get("Baris", r.get("baris", 0)))
+            if not kolom_val or baris_val == 0:
+                continue
 
-    if not raw_rows:
-        print("⚠️ Tidak ada data untuk dimigrasi.")
+            pallet_val = r.get("Pallet Ke", r.get("Palet Ke", r.get("pallet_ke", 0)))
+            nama_val = r.get("Nama Produk", r.get("Nama Barang", r.get("nama_produk", "")))
+
+            payload.append({
+                "doc_id": doc.id,
+                "kolom": kolom_val,
+                "baris": baris_val,
+                "pallet_ke": clean_int(pallet_val),
+                "part_number": clean_str(r.get("Part Number", r.get("part_number", ""))).upper(),
+                "nama_produk": clean_str(nama_val),
+                "lot_number": clean_str(r.get("Lot Number", r.get("lot_number", ""))),
+                "keterangan": clean_str(r.get("Keterangan", r.get("keterangan", ""))),
+                "catatan": clean_str(r.get("Catatan", r.get("catatan", ""))),
+            })
+
+    if not payload:
+        print("   ⚠️ Koleksi 'uji_coba_rak' kosong di Firebase.")
         return
 
-    # Normalisasi struktur kolom agar seragam
+    batch_size = 500
+    for i in range(0, len(payload), batch_size):
+        supabase.table("uji_coba_rak").insert(payload[i : i + batch_size]).execute()
+    print(f"   ✅ Selesai: {len(payload)} baris palet masuk ke 'uji_coba_rak'.")
+
+def migrate_collection_jsonb(nama_koleksi):
+    print(f"\n📂 Memigrasi koleksi '{nama_koleksi}'...")
+    docs = db_firebase.collection(nama_koleksi).stream()
     payload = []
-    for r in raw_rows:
-        # Handle variasi penamaan kolom di Firebase
-        pallet_val = r.get("Pallet Ke", r.get("Palet Ke", r.get("pallet_ke", 0)))
-        nama_val = r.get("Nama Produk", r.get("Nama Barang", r.get("nama_produk", "")))
 
-        kolom_clean = clean_str(r.get("Kolom", r.get("kolom", ""))).upper()
-        baris_clean = clean_int(r.get("Baris", r.get("baris", 0)))
-
-        if not kolom_clean or baris_clean == 0:
-            continue
-
+    for doc in docs:
         payload.append({
-            "kolom": kolom_clean,
-            "baris": baris_clean,
-            "pallet_ke": clean_int(pallet_val),
-            "part_number": clean_str(r.get("Part Number", r.get("part_number", ""))).upper(),
-            "nama_produk": clean_str(nama_val),
-            "lot_number": clean_str(r.get("Lot Number", r.get("lot_number", ""))),
-            "keterangan": clean_str(r.get("Keterangan", r.get("keterangan", ""))),
-            "catatan": clean_str(r.get("Catatan", r.get("catatan", "")))
+            "doc_id": doc.id,
+            "data": sanitize_json(doc.to_dict() or {})
         })
 
-    print(f"🧹 Membersihkan tabel '{NAMA_TABEL}' di Supabase sebelum insert ulang...")
-    supabase.table(NAMA_TABEL).delete().neq("id", 0).execute()
+    if not payload:
+        print(f"   ℹ️ Koleksi '{nama_koleksi}' kosong (0 dokumen).")
+        return
 
-    # Upload bertahap per 500 baris agar stabil & cepat
     batch_size = 500
-    total_inserted = 0
     for i in range(0, len(payload), batch_size):
-        chunk = payload[i : i + batch_size]
-        supabase.table(NAMA_TABEL).insert(chunk).execute()
-        total_inserted += len(chunk)
-        print(f"🚀 Terkirim: {total_inserted} / {len(payload)} baris...")
-
-    print("🎉 Re-migrasi selesai 100%!")
+        supabase.table(nama_koleksi).upsert(payload[i : i + batch_size]).execute()
+    print(f"   ✅ Selesai: {len(payload)} dokumen masuk ke '{nama_koleksi}'.")
 
 if __name__ == "__main__":
-    main()
+    print("🚀 Memulai migrasi penuh 7 koleksi Firestore -> Supabase...")
+    migrate_uji_coba_rak()
+    for col_name in KOLEKSI_JSONB:
+        migrate_collection_jsonb(col_name)
+    print("\n🎉 Seluruh database berhasil dimigrasi 100% ke Supabase!")
