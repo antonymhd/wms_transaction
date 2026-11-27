@@ -53,15 +53,6 @@ if st.button("▶️ Mulai Migrasi Sekarang", type="primary"):
 
         progress = st.progress(0)
         BATCH_SIZE = 500
-        for i in range(0, len(payload), BATCH_SIZE):
-            batch = payload[i : i + BATCH_SIZE]
-            sb.table("stok_rak").upsert(batch, on_conflict="kolom,baris,pallet_ke").execute()
-            progress.progress(min(1.0, (i + BATCH_SIZE) / max(1, len(payload))))
-
-    st.success(f"✅ Berhasil memindahkan {len(payload)} baris ke tabel `stok_rak` di Supabase!")
-
-progress = st.progress(0)
-        BATCH_SIZE = 500
         try:
             for i in range(0, len(payload), BATCH_SIZE):
                 batch = payload[i : i + BATCH_SIZE]
