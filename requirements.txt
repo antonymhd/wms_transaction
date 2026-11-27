@@ -1,4 +1,6 @@
 firebase-admin
+supabase
+plotly
 requests
 google-genai
 pillow
