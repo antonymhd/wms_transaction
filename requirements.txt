@@ -1,4 +1,3 @@
-firebase-admin
 supabase
 requests
 google-genai
