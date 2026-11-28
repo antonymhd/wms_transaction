@@ -18,6 +18,7 @@ DEFAULT_SESSION_STATE = {
     'logged_in': False,
     'sb_usage': {'read': 0, 'write': 0, 'delete': 0},
     'doc_sizes': {},
+    'kolom_versions': {},
     'undo_dict': {},
     'action_msg': "",
     'action_status': None,
@@ -40,9 +41,11 @@ for k, v in DEFAULT_SESSION_STATE.items():
     if k not in st.session_state:
         st.session_state[k] = copy.deepcopy(v)
 
+
 def log_sb_usage(op_type, count=1):
     if op_type in st.session_state['sb_usage']:
         st.session_state['sb_usage'][op_type] += count
+
 
 if not st.session_state['logged_in']:
     st.title("🔒 WMS Security Login")
@@ -69,20 +72,23 @@ KOLOM_IDS = ["A", "B", "C", "D", "E", "F", "G", "S"]
 KOLOM_RACKING_AG = ["A", "B", "C", "D", "E", "F", "G"]
 LIMIT_SUPABASE_BYTES = 524_288_000  # 500 MiB Free Plan Supabase
 
+
 @st.cache_resource
 def init_supabase() -> Client:
     url = str(st.secrets["supabase"]["url"]).strip().rstrip("/")
     key = str(st.secrets["supabase"]["key"]).strip()
     return create_client(url, key)
 
+
 supabase = init_supabase()
 
 # ==========================================================
-# 3. FUNGSI BANTUAN TERPUSAT & ADAPTER SUPABASE
+# 3. FUNGSI SANITASI & ADAPTER SUPABASE ANTI-NaN
 # ==========================================================
 def get_waktu_jkt():
     """Mendapatkan waktu saat ini di zona WIB (UTC+7)."""
     return datetime.now(timezone.utc) + timedelta(hours=7)
+
 
 def clean_str(val):
     """Membersihkan nilai None/NaN maupun tempelan '| nan' secara konsisten."""
@@ -93,12 +99,26 @@ def clean_str(val):
         return ""
     return re.sub(r'(\s*\|\s*nan\b|\bnan\s*\|\s*)', '', s, flags=re.IGNORECASE).strip()
 
+
+def safe_float(val, default=0.0):
+    """Konversi aman ke float tanpa jebakan np.nan truthiness."""
+    if val is None or isinstance(val, bool):
+        return float(default)
+    num = pd.to_numeric(val, errors='coerce')
+    return float(default) if pd.isna(num) else float(num)
+
+
+def safe_int(val, default=0):
+    """Konversi aman ke integer tanpa risiko ValueError pada NaN/string."""
+    return int(round(safe_float(val, float(default))))
+
+
 def db_row_to_app_dict(row: dict) -> dict:
     """Mengonversi 1 baris tabel PostgreSQL uji_coba_rak ke format dictionary aplikasi."""
     return {
         'Kolom': clean_str(row.get('kolom')).upper(),
-        'Baris': float(pd.to_numeric(row.get('baris', 0), errors='coerce') or 0),
-        'Pallet Ke': float(pd.to_numeric(row.get('pallet_ke', 0), errors='coerce') or 0),
+        'Baris': safe_float(row.get('baris'), 0.0),
+        'Pallet Ke': safe_float(row.get('pallet_ke'), 0.0),
         'Part Number': clean_str(row.get('part_number')).upper(),
         'Lot Number': clean_str(row.get('lot_number')),
         'Nama Produk': clean_str(row.get('nama_produk')),
@@ -108,13 +128,15 @@ def db_row_to_app_dict(row: dict) -> dict:
         'Jadwal Kirim': clean_str(row.get('jadwal_kirim')),
         'Target Penerima': clean_str(row.get('target_penerima')),
         'Status': clean_str(row.get('status')) or 'Terisi',
+        'Updated At': clean_str(row.get('updated_at')),
     }
+
 
 def app_dict_to_db_row(item: dict, kolom_fallback: str = "") -> dict:
     """Mengonversi 1 dictionary aplikasi ke format kolom PostgreSQL uji_coba_rak."""
     kol = clean_str(item.get('Kolom') or kolom_fallback).upper()
-    bar = int(float(pd.to_numeric(item.get('Baris', 0), errors='coerce') or 0))
-    plt_ke = int(float(pd.to_numeric(item.get('Pallet Ke', 0), errors='coerce') or 0))
+    bar = safe_int(item.get('Baris'), 0)
+    plt_ke = safe_int(item.get('Pallet Ke'), 0)
     return {
         'kolom': kol,
         'baris': bar,
@@ -130,6 +152,28 @@ def app_dict_to_db_row(item: dict, kolom_fallback: str = "") -> dict:
         'status': clean_str(item.get('Status')) or 'Terisi',
         'updated_at': datetime.now(timezone.utc).isoformat(),
     }
+
+
+def _extract_max_updated_at(records: list) -> str:
+    stamps = [clean_str(r.get('Updated At') or r.get('updated_at')) for r in records if clean_str(r.get('Updated At') or r.get('updated_at'))]
+    return max(stamps) if stamps else ""
+
+
+def get_kolom_db_version(kolom_id: str) -> str:
+    """Mengambil timestamp updated_at terbaru pada 1 kolom di Supabase (untuk deteksi bentrok)."""
+    kol = clean_str(kolom_id).upper()
+    res = (
+        supabase.table(TBL_STOK_RAK)
+        .select("updated_at")
+        .eq("kolom", kol)
+        .order("updated_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    log_sb_usage('read', 1)
+    rows = res.data or []
+    return clean_str(rows[0].get('updated_at')) if rows else ""
+
 
 def load_kolom_from_supabase(kolom_id: str) -> list:
     """Mengambil seluruh slot aktif pada 1 Kolom (A-G atau S) dari Supabase."""
@@ -153,8 +197,10 @@ def load_kolom_from_supabase(kolom_id: str) -> list:
         if len(batch) < step:
             break
         start += step
+    st.session_state['kolom_versions'][kol] = _extract_max_updated_at(semua)
     record_doc_size(f"Kolom_{kol}", semua)
     return semua
+
 
 def load_all_rak_from_supabase() -> list:
     """Mengambil seluruh slot aktif di seluruh gudang dari Supabase."""
@@ -184,16 +230,27 @@ def load_all_rak_from_supabase() -> list:
         if k in by_kol:
             by_kol[k].append(d)
     for k, arr in by_kol.items():
+        st.session_state['kolom_versions'][k] = _extract_max_updated_at(arr)
         record_doc_size(f"Kolom_{k}", arr)
     return semua
 
-def save_kolom_to_supabase(kolom_id: str, records_list: list):
+
+def save_kolom_to_supabase(kolom_id: str, records_list: list, expected_version: str = None):
     """
     Menyimpan kondisi terbaru seluruh slot pada 1 Kolom ke Supabase secara atomik:
-    1. Upsert seluruh slot valid terbaru.
-    2. Hapus slot sisa lama di kolom tersebut yang sudah keluar/kosong.
+    1. Validasi optimistic lock jika expected_version diberikan.
+    2. Upsert seluruh slot valid terbaru.
+    3. Hapus slot sisa lama di kolom tersebut yang sudah keluar/kosong.
     """
     kol = clean_str(kolom_id).upper()
+    if expected_version is not None:
+        current_ver = get_kolom_db_version(kol)
+        if current_ver and expected_version and current_ver != expected_version:
+            raise RuntimeError(
+                f"Konflik konkuren pada Kolom {kol}: data baru saja diubah oleh user/modul lain. "
+                f"Muat ulang data rak terlebih dahulu sebelum menyimpan."
+            )
+
     rows_map = {}
     for item in records_list:
         if not is_valid_item(item):
@@ -206,6 +263,7 @@ def save_kolom_to_supabase(kolom_id: str, records_list: list):
     if not payload:
         supabase.table(TBL_STOK_RAK).delete().eq("kolom", kol).execute()
         log_sb_usage('delete', 1)
+        st.session_state['kolom_versions'][kol] = ""
         record_doc_size(f"Kolom_{kol}", [])
         return
 
@@ -224,18 +282,22 @@ def save_kolom_to_supabase(kolom_id: str, records_list: list):
     log_sb_usage('read', 1)
     ids_to_delete = [
         r['id'] for r in (existing_res.data or [])
-        if (int(r['baris']), int(r['pallet_ke'])) not in rows_map
+        if (safe_int(r['baris']), safe_int(r['pallet_ke'])) not in rows_map
     ]
     if ids_to_delete:
         for i in range(0, len(ids_to_delete), 200):
             supabase.table(TBL_STOK_RAK).delete().in_("id", ids_to_delete[i : i + 200]).execute()
             log_sb_usage('delete', 1)
 
-    record_doc_size(f"Kolom_{kol}", [db_row_to_app_dict(r) for r in payload])
+    converted = [db_row_to_app_dict(r) for r in payload]
+    st.session_state['kolom_versions'][kol] = _extract_max_updated_at(converted)
+    record_doc_size(f"Kolom_{kol}", converted)
+
 
 def make_g_key(lot, prod, cat, jk="", tp=""):
     """Membuat kunci pengelompokan yang 100% identik antara UI dan Transaksi."""
     return f"{clean_str(lot)}_{clean_str(prod)}_{clean_str(cat)}_{clean_str(jk)}_{clean_str(tp)}"
+
 
 def match_g_key(d, target_key):
     """Mencocokkan dictionary record dengan target Group_Key."""
@@ -244,13 +306,16 @@ def match_g_key(d, target_key):
         d.get('Jadwal Kirim'), d.get('Target Penerima')
     ) == target_key
 
+
 def is_valid_item(d):
     """Mengecek apakah slot memiliki Part Number yang valid."""
     return clean_str(d.get('Part Number')) != ""
 
+
 def is_same_baris(d, baris_num):
     """Mengecek kesesuaian nomor baris secara aman."""
-    return float(d.get('Baris', 0) or 0) == float(baris_num)
+    return safe_int(d.get('Baris'), 0) == safe_int(baris_num, 0)
+
 
 def get_baris_records(data_list, baris_num, only_valid=True):
     """Menyaring salinan record pada satu nomor baris tertentu secara aman."""
@@ -259,6 +324,7 @@ def get_baris_records(data_list, baris_num, only_valid=True):
         if is_same_baris(d, baris_num) and (not only_valid or is_valid_item(d))
     ]
 
+
 def parse_keterangan(ket_str):
     """Membaca jumlah Pecahan (Dus/Sak) dan Eceran (Pcs) dari string Keterangan."""
     s = clean_str(ket_str).lower()
@@ -266,14 +332,16 @@ def parse_keterangan(ket_str):
     m_ec = re.search(r'eceran:\s*(\d+)', s)
     return (int(m_pec.group(1)) if m_pec else 0, int(m_ec.group(1)) if m_ec else 0)
 
+
 def format_keterangan(pecahan, eceran):
     """Membentuk string Keterangan standar dari nilai Pecahan dan Eceran."""
     parts = []
     if pecahan > 0:
-        parts.append(f"Pecahan: {int(pecahan)} qty")
+        parts.append(f"Pecahan: {safe_int(pecahan)} qty")
     if eceran > 0:
-        parts.append(f"Eceran: {int(eceran)} pcs")
+        parts.append(f"Eceran: {safe_int(eceran)} pcs")
     return " | ".join(parts)
+
 
 def get_satuan_kemasan(part_number):
     """Menentukan label satuan pecahan berdasarkan akhiran Part Number."""
@@ -285,6 +353,7 @@ def get_satuan_kemasan(part_number):
     if pn.endswith('A'):
         return "nictainer"
     return "qty"
+
 
 def set_kategori_produk(nama):
     """Mengelompokkan nama produk ke kategori standar."""
@@ -301,6 +370,7 @@ def set_kategori_produk(nama):
         return 'CAP'
     return 'LAINNYA'
 
+
 def parse_fifo_lot_key(lot_str):
     """Kunci urut FIFO murni dari nomor lot (YYMMDD + Shift)."""
     s = clean_str(lot_str)
@@ -314,16 +384,18 @@ def parse_fifo_lot_key(lot_str):
         return f"{yy}{mm}{dd}0"
     return "9999999"
 
+
 def get_master_konversi(df_master, part_num):
     """Mengambil (Isi 1 Pallet pcs, Pcs per Dus/Sak) dari Master_Produk.csv."""
     pn = clean_str(part_num).upper()
     if df_master.empty or 'Part Number Clean' not in df_master.columns or pn not in df_master['Part Number Clean'].values:
         return 0, 0
     m_row = df_master[df_master['Part Number Clean'] == pn].iloc[0]
-    isi_pallet = int(pd.to_numeric(m_row.get('Isi 1 Pallet (pcs)', 0), errors='coerce') or 0)
+    isi_pallet = safe_int(m_row.get('Isi 1 Pallet (pcs)'), 0)
     col_satuan = 'Sac / Pallet' if pn.endswith('C') else 'Box / Pallet'
-    pcs_per_satuan = int(pd.to_numeric(m_row.get(col_satuan, 0), errors='coerce') or 0)
+    pcs_per_satuan = safe_int(m_row.get(col_satuan), 0)
     return isi_pallet, pcs_per_satuan
+
 
 def hitung_konversi_mutasi_pcs(df_master, part_num, awal_p, awal_d, awal_pcs, sisa_p, sisa_d, sisa_pcs):
     """
@@ -349,6 +421,7 @@ def hitung_konversi_mutasi_pcs(df_master, part_num, awal_p, awal_d, awal_pcs, si
     if diff_p < 0 or (diff_p == 0 and diff_d < 0) or (diff_p == 0 and diff_d == 0 and diff_ec < 0):
         return None, None, None, -1
     return diff_p, diff_d, diff_ec, 0
+
 
 def hitung_ringkasan_stok_lot(records_list, df_master):
     """
@@ -384,6 +457,7 @@ def hitung_ringkasan_stok_lot(records_list, df_master):
             vals['tot_pcs'] = vals['pcs_ec']
     return summary
 
+
 def hitung_ulang_pcs_log(df_log, df_master):
     """Menghitung ulang Total Pcs mutasi secara dinamis berdasarkan Master_Produk.csv terbaru."""
     if df_log.empty:
@@ -394,9 +468,9 @@ def hitung_ulang_pcs_log(df_log, df_master):
 
     for _, row in df_log.iterrows():
         pn = clean_str(row.get('Part Number')).upper()
-        m_pallet = float(pd.to_numeric(row.get('Mutasi Pallet', 0), errors='coerce') or 0)
-        m_pecahan = float(pd.to_numeric(row.get('Mutasi Pecahan (Dus/Sak)', 0), errors='coerce') or 0)
-        m_eceran_lama = float(pd.to_numeric(row.get('Mutasi Eceran (Pcs)', 0), errors='coerce') or 0)
+        m_pallet = safe_float(row.get('Mutasi Pallet'), 0.0)
+        m_pecahan = safe_float(row.get('Mutasi Pecahan (Dus/Sak)'), 0.0)
+        m_eceran_lama = safe_float(row.get('Mutasi Eceran (Pcs)'), 0.0)
 
         isi_pallet, pcs_per_satuan = get_master_konversi(df_master, pn)
 
@@ -416,6 +490,7 @@ def hitung_ulang_pcs_log(df_log, df_master):
     df_log['Status Konversi'] = selisih_info_list
     return df_log
 
+
 def tentukan_arus_log(jenis_transaksi):
     """Menentukan kategori arus stok standar (MASUK / KELUAR / PINDAH / KOREKSI)."""
     jt = clean_str(jenis_transaksi).upper()
@@ -426,6 +501,7 @@ def tentukan_arus_log(jenis_transaksi):
     if "RELOKASI" in jt:
         return "PINDAH"
     return "KOREKSI"
+
 
 def scan_stok_bebas_untuk_plotting(semua_data, target_part_num, strict_fifo_shift=True):
     """Memindai seluruh rak (A-G) untuk Part Number tertentu yang BELUM memiliki Jadwal Kirim."""
@@ -518,8 +594,9 @@ def scan_stok_bebas_untuk_plotting(semua_data, target_part_num, strict_fifo_shif
         ascending=[True] * len(sort_cols)
     ).reset_index(drop=True)
 
-def evaluasi_akses_dinamis_plot(df_kandidat, all_rak_records, target_part_num):
-    """Menghitung ulang status 'Akses Pintu' secara dinamis dengan memperhitungkan rombongan yang ter-plot."""
+
+def evaluasi_akses_dinamis_plot(df_kandidat, all_rak_records, target_part_num, satuan_col_name):
+    """Menghitung ulang status 'Akses Pintu' secara dinamis (termasuk slot pecahan ter-plot)."""
     if df_kandidat.empty:
         return df_kandidat
 
@@ -532,12 +609,15 @@ def evaluasi_akses_dinamis_plot(df_kandidat, all_rak_records, target_part_num):
 
     plot_map = {}
     for _, r in df_kandidat.iterrows():
-        plot_map[(r['Kolom'], int(r['Baris']), clean_str(r['Lot Number']))] = int(r['Plot Utuh'])
+        slot_pec_diambil = 1 if safe_int(r.get(satuan_col_name), 0) > 0 else 0
+        plot_map[(r['Kolom'], safe_int(r['Baris']), clean_str(r['Lot Number']))] = (
+            safe_int(r['Plot Utuh']) + slot_pec_diambil
+        )
 
     akses_dinamis_list = []
     for _, r in df_kandidat.iterrows():
         kol = r['Kolom']
-        bar = int(r['Baris'])
+        bar = safe_int(r['Baris'])
         lot = clean_str(r['Lot Number'])
 
         df_aisle = df_all[
@@ -604,15 +684,16 @@ def evaluasi_akses_dinamis_plot(df_kandidat, all_rak_records, target_part_num):
     df_out['Akses Pintu'] = akses_dinamis_list
     return df_out
 
+
 # ==========================================================
 # 4. CETAK KARTU RACKING / PICKING LIST
 # ==========================================================
 def build_picking_cards(baris_num, kolom_id, baris_records):
     """Membentuk daftar blok kartu picking list (run-length grouping) untuk 1 lokasi rak."""
-    lokasi_label = f"Baris {int(baris_num)}{kolom_id}"
+    lokasi_label = f"Baris {safe_int(baris_num)}{kolom_id}"
     valid_items = sorted(
         [d for d in baris_records if is_valid_item(d)],
-        key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0))
+        key=lambda x: safe_float(x.get('Pallet Ke'), 0.0)
     )
 
     if not valid_items:
@@ -632,7 +713,7 @@ def build_picking_cards(baris_num, kolom_id, baris_records):
         pn = clean_str(item.get('Part Number')).upper()
         lot = clean_str(item.get('Lot Number'))
         nama = clean_str(item.get('Nama Produk'))
-        p_idx = int(pd.to_numeric(item.get('Pallet Ke', 0)) or 0)
+        p_idx = safe_int(item.get('Pallet Ke'), 0)
         ket = clean_str(item.get('Keterangan'))
         qc_val = clean_str(item.get('Approval QC'))
 
@@ -679,6 +760,7 @@ def build_picking_cards(baris_num, kolom_id, baris_records):
             'Is_Empty': False
         })
     return cards
+
 
 def render_print_html(cards_list, judul_cetak, waktu_cetak):
     """Merender HTML siap cetak A4 dengan tombol Print langsung di browser."""
@@ -768,6 +850,7 @@ def render_print_html(cards_list, judul_cetak, waktu_cetak):
     </html>
     """
 
+
 # ==========================================================
 # 5. OPERASI SLOT RAK, CACHE & MONITOR STORAGE
 # ==========================================================
@@ -816,6 +899,7 @@ def summarize_lot_groups(baris_records):
         })
     return groups
 
+
 def apply_slot_reduction(records_list, baris_num, g_key, sisa_utuh, sisa_dus, sisa_pcs, catatan_tambahan=""):
     """Mengurangi slot dari baris rak secara immutable."""
     df_lot = pd.DataFrame([
@@ -825,7 +909,7 @@ def apply_slot_reduction(records_list, baris_num, g_key, sisa_utuh, sisa_dus, si
     if df_lot.empty:
         return None, "empty"
 
-    df_lot['Pallet Ke'] = pd.to_numeric(df_lot['Pallet Ke'])
+    df_lot['Pallet Ke'] = pd.to_numeric(df_lot['Pallet Ke'], errors='coerce').fillna(0)
     df_lot = df_lot.sort_values('Pallet Ke', ascending=False)
 
     slot_tambahan = 1 if (sisa_dus > 0 or sisa_pcs > 0) else 0
@@ -842,7 +926,7 @@ def apply_slot_reduction(records_list, baris_num, g_key, sisa_utuh, sisa_dus, si
     for orig_d in records_list:
         d = copy.deepcopy(orig_d)
         if match_g_key(d, g_key) and is_same_baris(d, baris_num):
-            p_val = pd.to_numeric(d.get('Pallet Ke', 0))
+            p_val = safe_float(d.get('Pallet Ke'), 0.0)
             if p_val in pallets_to_remove:
                 continue
 
@@ -862,6 +946,7 @@ def apply_slot_reduction(records_list, baris_num, g_key, sisa_utuh, sisa_dus, si
 
     return updated_records, ""
 
+
 def get_max_slot(kolom_id, baris_num, records_baris, extra_part=""):
     """Menghitung kapasitas maksimal slot pada satu baris rak."""
     if kolom_id == 'S':
@@ -873,6 +958,7 @@ def get_max_slot(kolom_id, baris_num, records_baris, extra_part=""):
     if is_all_box:
         return 32 if baris_num <= 16 else 46
     return 31 if baris_num <= 16 else 44
+
 
 def update_bayangan_baris(records_baris, kolom_id, baris_num):
     """Mengevaluasi ulang indeks Pallet Ke (1..N), sanitasi string, dan tag [BAYANGAN - OVERCAPACITY]."""
@@ -895,6 +981,7 @@ def update_bayangan_baris(records_baris, kolom_id, baris_num):
         result.append(item)
     return result
 
+
 def hitung_estimasi_bytes(val):
     """Menghitung estimasi ukuran byte data tabel PostgreSQL."""
     if val is None or isinstance(val, bool):
@@ -909,9 +996,11 @@ def hitung_estimasi_bytes(val):
         return sum((len(str(k).encode('utf-8')) + 1) + hitung_estimasi_bytes(v) for k, v in val.items())
     return 0
 
+
 def record_doc_size(doc_name, data_list):
     """Memperbarui catatan estimasi ukuran byte per kolom di session_state."""
     st.session_state['doc_sizes'][doc_name] = hitung_estimasi_bytes(data_list)
+
 
 def fetch_kolom_cached(kolom_id, state_key, force_refresh=False):
     """Membaca data Kolom sekali saja saat diminta dari Supabase dan menyimpannya di cache sesi."""
@@ -919,6 +1008,7 @@ def fetch_kolom_cached(kolom_id, state_key, force_refresh=False):
         data_list = load_kolom_from_supabase(kolom_id)
         st.session_state[state_key] = copy.deepcopy(data_list)
     return st.session_state[state_key]
+
 
 def clear_all_rak_caches():
     """Membersihkan seluruh cache lokal rak setiap kali ada mutasi tersimpan."""
@@ -928,6 +1018,7 @@ def clear_all_rak_caches():
     st.session_state['print_ready'] = False
     st.session_state['plot_all_records_cache'] = []
     st.session_state['active_plots_list'] = None
+
 
 @st.cache_data(ttl=300)
 def load_master_produk():
@@ -945,18 +1036,28 @@ def load_master_produk():
         st.toast(f"Gagal memuat master produk: {e}", icon="🚨")
         return pd.DataFrame()
 
+
 def catat_log_mutasi(
     jenis, kolom, baris, produk, part_num, no_lot,
     pallet_utuh, pecahan, eceran, keterangan="",
-    tujuan_kategori="", detail_sistem=""
+    tujuan_kategori="", detail_sistem="", total_pcs=None
 ):
-    """Mencatat setiap pergerakan stok ke tabel log_mutasi_rak Supabase."""
-    b_str = str(baris).strip()
-    bar_int = int(float(pd.to_numeric(b_str, errors='coerce') or 0))
-    lok_str = f"{kolom}-{bar_int}" if bar_int > 0 else str(kolom)
+    """Mencatat setiap pergerakan stok ke tabel log_mutasi_rak Supabase secara aman anti-NaN."""
+    b_str = clean_str(baris)
+    bar_int = safe_int(b_str, 0)
+    if bar_int > 0:
+        lok_str = f"{clean_str(kolom)}-{bar_int}"
+    elif b_str and b_str.upper() not in ["ALL", "NONE", "PLOT"]:
+        lok_str = b_str
+    else:
+        lok_str = clean_str(kolom)
+
     tujuan_clean = clean_str(tujuan_kategori) or clean_str(keterangan)
     detail_clean = clean_str(detail_sistem)
     ket_gabungan = f"{tujuan_clean} | {detail_clean}".strip(" |") if detail_clean else tujuan_clean
+
+    ec_int = safe_int(eceran, 0)
+    tot_pcs_int = safe_int(total_pcs, ec_int) if total_pcs is not None else ec_int
 
     row_insert = {
         "waktu_transaksi": datetime.now(timezone.utc).isoformat(),
@@ -968,10 +1069,10 @@ def catat_log_mutasi(
         "part_number": clean_str(part_num),
         "nama_produk": clean_str(produk),
         "lot_number": clean_str(no_lot) or "-",
-        "mutasi_pallet": int(round(float(pallet_utuh))),
-        "mutasi_pecahan": int(round(float(pecahan))),
-        "mutasi_eceran": int(round(float(eceran))),
-        "total_pcs": int(round(float(eceran))),
+        "mutasi_pallet": safe_int(pallet_utuh, 0),
+        "mutasi_pecahan": safe_int(pecahan, 0),
+        "mutasi_eceran": ec_int,
+        "total_pcs": tot_pcs_int,
         "tujuan_kategori": tujuan_clean,
         "detail_sistem": detail_clean,
         "operator": "Admin PPIC",
@@ -985,6 +1086,7 @@ def catat_log_mutasi(
             st.session_state['total_log_docs'] += 1
     except Exception as e:
         st.toast(f"⚠️ Peringatan: Gagal mencatat log mutasi ({e})", icon="⚠️")
+
 
 # ==========================================================
 # 6. SIDEBAR NAVIGASI, KUOTA & MONITOR STORAGE SUPABASE
@@ -1018,14 +1120,14 @@ else:
     st.sidebar.caption("Belum ada kolom rak yang diakses pada sesi ini.")
 
 if st.sidebar.button("📏 Cek Total Storage (Rak + Log)", use_container_width=True):
-    all_rows = load_all_rak_from_supabase()
+    load_all_rak_from_supabase()
     total_rak_b = sum(st.session_state['doc_sizes'].values())
     st.session_state['total_rak_bytes'] = total_rak_b
 
     try:
         cnt_res = supabase.table(TBL_LOG_MUTASI).select("id", count="exact").limit(1).execute()
         log_sb_usage('read', 1)
-        jml_log = int(cnt_res.count or 0)
+        jml_log = safe_int(cnt_res.count, 0)
         st.session_state['total_log_docs'] = jml_log
         st.session_state['total_log_bytes'] = jml_log * 450
     except Exception:
@@ -1069,6 +1171,7 @@ if st.session_state['action_status'] == 'DONE' and st.session_state.get('undo_di
             if st.button("🔙 UNDO AKSI INI", type="primary", use_container_width=True):
                 with st.spinner("Memulihkan data ke kondisi semula..."):
                     snapshot_restore = copy.deepcopy(st.session_state['undo_dict'])
+                    pesan_batal = st.session_state['action_msg']
                     kolom_terdampak = []
                     for kol, dat in snapshot_restore.items():
                         save_kolom_to_supabase(kol, dat)
@@ -1079,9 +1182,9 @@ if st.session_state['action_status'] == 'DONE' and st.session_state.get('undo_di
                     catat_log_mutasi(
                         "PEMBATALAN (UNDO)", ",".join(kolom_terdampak), "ALL",
                         "Koreksi Sistem", "-", "-", 0, 0, 0,
-                        keterangan=f"Membatalkan: {st.session_state['action_msg']}",
+                        keterangan=f"Membatalkan: {pesan_batal}",
                         tujuan_kategori="UNDO TRANSAKSI",
-                        detail_sistem=f"Membatalkan: {st.session_state['action_msg']}"
+                        detail_sistem=f"Membatalkan: {pesan_batal}"
                     )
                     st.rerun()
         with c3:
@@ -1194,81 +1297,86 @@ with tab1:
                     st.error("⚠️ Masukkan minimal 1 Qty!")
                 else:
                     with st.spinner("Menyusun data ke dalam rak (Supabase)..."):
-                        fresh_raw = load_kolom_from_supabase(k_pilih)
-                        working_raw = copy.deepcopy(fresh_raw)
+                        try:
+                            fresh_raw = load_kolom_from_supabase(k_pilih)
+                            ver_kol = st.session_state['kolom_versions'].get(k_pilih)
+                            working_raw = copy.deepcopy(fresh_raw)
 
-                        all_data = [
-                            d for d in working_raw
-                            if not (is_same_baris(d, b_pilih) and not is_valid_item(d))
-                        ]
-                        baris_data_actual = get_baris_records(all_data, b_pilih, only_valid=False)
-                        lain_data_actual = [d for d in all_data if not is_same_baris(d, b_pilih)]
+                            all_data = [
+                                d for d in working_raw
+                                if not (is_same_baris(d, b_pilih) and not is_valid_item(d))
+                            ]
+                            baris_data_actual = get_baris_records(all_data, b_pilih, only_valid=False)
+                            lain_data_actual = [d for d in all_data if not is_same_baris(d, b_pilih)]
 
-                        existing_fraction_row = None
-                        if not in_dari_depan:
-                            for d in baris_data_actual:
-                                if (clean_str(d.get('Part Number')).upper() == in_part_clean
-                                        and clean_str(d.get('Lot Number')) == in_lot_final
-                                        and clean_str(d.get('Jadwal Kirim')) == ""):
-                                    ket = clean_str(d.get('Keterangan'))
-                                    if 'Pecahan' in ket or 'Eceran' in ket:
-                                        existing_fraction_row = d
+                            existing_fraction_row = None
+                            if not in_dari_depan:
+                                for d in baris_data_actual:
+                                    if (clean_str(d.get('Part Number')).upper() == in_part_clean
+                                            and clean_str(d.get('Lot Number')) == in_lot_final
+                                            and clean_str(d.get('Jadwal Kirim')) == ""):
+                                        ket = clean_str(d.get('Keterangan'))
+                                        if 'Pecahan' in ket or 'Eceran' in ket:
+                                            existing_fraction_row = d
 
-                        slot_tambahan_in = 1 if ((in_pecahan > 0 or in_eceran > 0) and not existing_fraction_row) else 0
-                        total_inbound_slots = int(in_qty) + slot_tambahan_in
+                            slot_tambahan_in = 1 if ((in_pecahan > 0 or in_eceran > 0) and not existing_fraction_row) else 0
+                            total_inbound_slots = int(in_qty) + slot_tambahan_in
 
-                        new_records = [
-                            {
-                                'Kolom': k_pilih, 'Baris': float(b_pilih), 'Pallet Ke': 0.0,
-                                'Part Number': in_part_clean, 'Lot Number': in_lot_final, 'Nama Produk': in_produk_clean,
-                                'Status': 'Terisi', 'Keterangan': '', 'Catatan': in_cat_final,
-                                'Approval QC': '', 'Jadwal Kirim': '', 'Target Penerima': ''
-                            }
-                            for _ in range(int(in_qty))
-                        ]
-
-                        if in_pecahan > 0 or in_eceran > 0:
-                            if existing_fraction_row and not in_dari_depan:
-                                ex_pec, ex_ec = parse_keterangan(existing_fraction_row.get('Keterangan'))
-                                existing_fraction_row['Keterangan'] = format_keterangan(ex_pec + in_pecahan, ex_ec + in_eceran)
-                            else:
-                                new_records.append({
+                            new_records = [
+                                {
                                     'Kolom': k_pilih, 'Baris': float(b_pilih), 'Pallet Ke': 0.0,
                                     'Part Number': in_part_clean, 'Lot Number': in_lot_final, 'Nama Produk': in_produk_clean,
-                                    'Status': 'Terisi', 'Keterangan': format_keterangan(in_pecahan, in_eceran),
-                                    'Catatan': in_cat_final, 'Approval QC': '', 'Jadwal Kirim': '', 'Target Penerima': ''
-                                })
+                                    'Status': 'Terisi', 'Keterangan': '', 'Catatan': in_cat_final,
+                                    'Approval QC': '', 'Jadwal Kirim': '', 'Target Penerima': ''
+                                }
+                                for _ in range(int(in_qty))
+                            ]
 
-                        baris_sorted = sorted(baris_data_actual, key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
-                        combined_baris = (new_records + baris_sorted) if in_dari_depan else (baris_sorted + new_records)
-                        combined_baris = update_bayangan_baris(combined_baris, k_pilih, b_pilih)
+                            if in_pecahan > 0 or in_eceran > 0:
+                                if existing_fraction_row and not in_dari_depan:
+                                    ex_pec, ex_ec = parse_keterangan(existing_fraction_row.get('Keterangan'))
+                                    existing_fraction_row['Keterangan'] = format_keterangan(ex_pec + in_pecahan, ex_ec + in_eceran)
+                                else:
+                                    new_records.append({
+                                        'Kolom': k_pilih, 'Baris': float(b_pilih), 'Pallet Ke': 0.0,
+                                        'Part Number': in_part_clean, 'Lot Number': in_lot_final, 'Nama Produk': in_produk_clean,
+                                        'Status': 'Terisi', 'Keterangan': format_keterangan(in_pecahan, in_eceran),
+                                        'Catatan': in_cat_final, 'Approval QC': '', 'Jadwal Kirim': '', 'Target Penerima': ''
+                                    })
 
-                        final_kolom_data = lain_data_actual + combined_baris
-                        save_kolom_to_supabase(k_pilih, final_kolom_data)
+                            baris_sorted = sorted(baris_data_actual, key=lambda x: safe_float(x.get('Pallet Ke'), 0.0))
+                            combined_baris = (new_records + baris_sorted) if in_dari_depan else (baris_sorted + new_records)
+                            combined_baris = update_bayangan_baris(combined_baris, k_pilih, b_pilih)
 
-                        isi_p, pcs_s = get_master_konversi(df_master, in_part_clean)
-                        tot_in_pcs = ((in_qty * isi_p) + (in_pecahan * pcs_s) + in_eceran) if isi_p > 0 else in_eceran
+                            final_kolom_data = lain_data_actual + combined_baris
+                            save_kolom_to_supabase(k_pilih, final_kolom_data, expected_version=ver_kol)
 
-                        sisi_lbl = "Push-Back (Depan)" if in_dari_depan else "Normal (Belakang)"
-                        det_in = f"Masuk Rak {k_pilih}-{b_pilih} | Sisi: {sisi_lbl}" + (f" | Catatan: {in_cat_final}" if in_cat_final else "")
-                        catat_log_mutasi(
-                            "INBOUND (Admin)", k_pilih, b_pilih, in_produk_clean, in_part_clean, in_lot_final,
-                            in_qty, in_pecahan, tot_in_pcs,
-                            keterangan=det_in,
-                            tujuan_kategori="INBOUND PRODUKSI",
-                            detail_sistem=det_in
-                        )
-                        clear_all_rak_caches()
+                            isi_p, pcs_s = get_master_konversi(df_master, in_part_clean)
+                            tot_in_pcs = ((in_qty * isi_p) + (in_pecahan * pcs_s) + in_eceran) if isi_p > 0 else in_eceran
 
-                        st.session_state.update({
-                            'undo_dict': {k_pilih: copy.deepcopy(fresh_raw)},
-                            'action_msg': f"Inbound {total_inbound_slots} Slot '{in_produk_clean}' ke Rak {k_pilih}-{b_pilih} {'(Push-back)' if in_dari_depan else ''}",
-                            'action_status': 'DONE',
-                            'kor_dicari': False,
-                            'relok_dicari': False
-                        })
-                        st.session_state['form_reset_counter'] += 1
-                        st.rerun()
+                            sisi_lbl = "Push-Back (Depan)" if in_dari_depan else "Normal (Belakang)"
+                            det_in = f"Masuk Rak {k_pilih}-{b_pilih} | Sisi: {sisi_lbl}" + (f" | Catatan: {in_cat_final}" if in_cat_final else "")
+                            catat_log_mutasi(
+                                "INBOUND (Admin)", k_pilih, b_pilih, in_produk_clean, in_part_clean, in_lot_final,
+                                in_qty, in_pecahan, in_eceran,
+                                keterangan=det_in,
+                                tujuan_kategori="INBOUND PRODUKSI",
+                                detail_sistem=det_in,
+                                total_pcs=tot_in_pcs
+                            )
+                            clear_all_rak_caches()
+
+                            st.session_state.update({
+                                'undo_dict': {k_pilih: copy.deepcopy(fresh_raw)},
+                                'action_msg': f"Inbound {total_inbound_slots} Slot '{in_produk_clean}' ke Rak {k_pilih}-{b_pilih} {'(Push-back)' if in_dari_depan else ''}",
+                                'action_status': 'DONE',
+                                'kor_dicari': False,
+                                'relok_dicari': False
+                            })
+                            st.session_state['form_reset_counter'] += 1
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Gagal menyimpan inbound: {e}")
 
 # ----------------------------------------------------------
 # TAB 2: OUTBOUND MULTI-LOT (ANTI-MINUS + UNDO SNAPSHOT AMAN)
@@ -1351,6 +1459,7 @@ with tab2:
 
             if st.button("🚜 Simpan Penyesuaian Massal (OUTBOUND)", type="primary", use_container_width=True):
                 fresh_out_data = load_kolom_from_supabase(k_pilih)
+                ver_out = st.session_state['kolom_versions'].get(k_pilih)
                 working_out_data = copy.deepcopy(fresh_out_data)
 
                 has_changes = False
@@ -1364,8 +1473,8 @@ with tab2:
                     g_key = str(row['Group_Key'])
                     l = clean_str(row['Lot Number'])
                     pn = clean_str(row['Part Number']).upper()
-                    sisa_utuh, sisa_dus, sisa_pcs = int(row['Sisa Utuh Baru']), int(row['Sisa Dus Baru']), int(row['Sisa Pcs Baru'])
-                    awal_utuh, awal_dus, awal_pcs = int(row['Awal Utuh']), int(row['Awal Dus']), int(row['Awal Pcs'])
+                    sisa_utuh, sisa_dus, sisa_pcs = safe_int(row['Sisa Utuh Baru']), safe_int(row['Sisa Dus Baru']), safe_int(row['Sisa Pcs Baru'])
+                    awal_utuh, awal_dus, awal_pcs = safe_int(row['Awal Utuh']), safe_int(row['Awal Dus']), safe_int(row['Awal Pcs'])
                     kat_keluar = clean_str(row['Kategori']) or "OUT"
                     teks_tujuan = clean_str(row['Tujuan / Alasan'])
 
@@ -1423,29 +1532,33 @@ with tab2:
                         logs_to_write.append((
                             jenis_tx, k_pilih, b_pilih,
                             clean_str(row['Produk']), pn, l,
-                            kel_p, kel_d, diff_pcs if diff_pcs > 0 else kel_pcs,
-                            tujuan_final, tujuan_final, detail_sys
+                            kel_p, kel_d, kel_pcs,
+                            tujuan_final, tujuan_final, detail_sys,
+                            diff_pcs if diff_pcs > 0 else kel_pcs
                         ))
 
                 if error_msg:
                     st.error(error_msg)
                 elif has_changes:
-                    data_rak_ini = sorted(data_rak_ini, key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
-                    data_rak_ini = update_bayangan_baris(data_rak_ini, k_pilih, b_pilih)
+                    try:
+                        data_rak_ini = sorted(data_rak_ini, key=lambda x: safe_float(x.get('Pallet Ke'), 0.0))
+                        data_rak_ini = update_bayangan_baris(data_rak_ini, k_pilih, b_pilih)
 
-                    final_kolom_data = data_rak_lain + data_rak_ini
-                    save_kolom_to_supabase(k_pilih, final_kolom_data)
-                    for lg in logs_to_write:
-                        catat_log_mutasi(*lg)
-                    clear_all_rak_caches()
-                    st.session_state.update({
-                        'undo_dict': {k_pilih: copy.deepcopy(fresh_out_data)},
-                        'action_msg': f"Penyesuaian Outbound Massal di Rak {k_pilih}-{b_pilih}",
-                        'action_status': 'DONE',
-                        'kor_dicari': False,
-                        'relok_dicari': False
-                    })
-                    st.rerun()
+                        final_kolom_data = data_rak_lain + data_rak_ini
+                        save_kolom_to_supabase(k_pilih, final_kolom_data, expected_version=ver_out)
+                        for lg in logs_to_write:
+                            catat_log_mutasi(*lg[:12], total_pcs=lg[12])
+                        clear_all_rak_caches()
+                        st.session_state.update({
+                            'undo_dict': {k_pilih: copy.deepcopy(fresh_out_data)},
+                            'action_msg': f"Penyesuaian Outbound Massal di Rak {k_pilih}-{b_pilih}",
+                            'action_status': 'DONE',
+                            'kor_dicari': False,
+                            'relok_dicari': False
+                        })
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ Gagal menyimpan outbound: {e}")
                 else:
                     st.info("Tidak ada perubahan angka pada tabel. Outbound dibatalkan.")
         else:
@@ -1477,8 +1590,8 @@ with tab3:
                         continue
 
                     df_col = pd.DataFrame(valid_records)
-                    df_col['Baris'] = pd.to_numeric(df_col['Baris'], errors='coerce')
-                    df_col['Pallet Ke'] = pd.to_numeric(df_col['Pallet Ke'], errors='coerce')
+                    df_col['Baris'] = pd.to_numeric(df_col['Baris'], errors='coerce').fillna(0)
+                    df_col['Pallet Ke'] = pd.to_numeric(df_col['Pallet Ke'], errors='coerce').fillna(0)
                     new_doc_data = []
 
                     for baris, group in df_col.groupby('Baris'):
@@ -1494,7 +1607,7 @@ with tab3:
                             r['Jadwal Kirim'] = clean_str(r.get('Jadwal Kirim'))
                             r['Target Penerima'] = clean_str(r.get('Target Penerima'))
                             r['Status'] = 'Terisi'
-                        baris_records = update_bayangan_baris(baris_records, kol_huruf, int(baris))
+                        baris_records = update_bayangan_baris(baris_records, kol_huruf, safe_int(baris))
                         new_doc_data.extend(baris_records)
 
                     save_kolom_to_supabase(kol_huruf, new_doc_data)
@@ -1642,9 +1755,9 @@ with tab4:
                         'Part Number': clean_str(r.get('part_number')),
                         'Nama Produk': clean_str(r.get('nama_produk')),
                         'No Lot': clean_str(r.get('lot_number')) or "-",
-                        'Mutasi Pallet': float(r.get('mutasi_pallet') or 0),
-                        'Mutasi Pecahan (Dus/Sak)': float(r.get('mutasi_pecahan') or 0),
-                        'Mutasi Eceran (Pcs)': float(r.get('mutasi_eceran') or r.get('total_pcs') or 0),
+                        'Mutasi Pallet': safe_float(r.get('mutasi_pallet'), 0.0),
+                        'Mutasi Pecahan (Dus/Sak)': safe_float(r.get('mutasi_pecahan'), 0.0),
+                        'Mutasi Eceran (Pcs)': safe_float(r.get('total_pcs') or r.get('mutasi_eceran'), 0.0),
                         'Tujuan / Kategori': tuj_val,
                         'Detail Sistem': det_val,
                         'Keterangan': clean_str(r.get('keterangan')),
@@ -1702,9 +1815,9 @@ with tab4:
                 lok_r = clean_str(r_log.get('Lokasi Rak'))
                 pn_r = clean_str(r_log.get('Part Number')).upper()
                 jenis_r = clean_str(r_log.get('Jenis Transaksi'))
-                m_pal = int(float(pd.to_numeric(r_log.get('Mutasi Pallet', 0), errors='coerce') or 0))
-                m_pec = int(float(pd.to_numeric(r_log.get('Mutasi Pecahan (Dus/Sak)', 0), errors='coerce') or 0))
-                m_pcs = int(float(pd.to_numeric(r_log.get('Mutasi Eceran (Pcs)', 0), errors='coerce') or 0))
+                m_pal = safe_int(r_log.get('Mutasi Pallet'), 0)
+                m_pec = safe_int(r_log.get('Mutasi Pecahan (Dus/Sak)'), 0)
+                m_pcs = safe_int(r_log.get('Mutasi Eceran (Pcs)'), 0)
 
                 if (arus_r in ["KELUAR", "MASUK"]
                         and re.fullmatch(r'[A-GS]-\d{1,2}', lok_r)
@@ -1737,14 +1850,14 @@ with tab4:
                         st.error("⚠️ Alasan reversal wajib diisi untuk jejak audit!")
                     else:
                         lok_parts = clean_str(target_log.get('Lokasi Rak')).split("-")
-                        rk_kol, rk_baris = lok_parts[0], int(lok_parts[1])
+                        rk_kol, rk_baris = lok_parts[0], safe_int(lok_parts[1])
                         rk_pn = clean_str(target_log.get('Part Number')).upper()
                         rk_nama = clean_str(target_log.get('Nama Produk'))
                         rk_lot = clean_str(target_log.get('No Lot'))
                         rk_arus = clean_str(target_log.get('Arus')) or tentukan_arus_log(target_log.get('Jenis Transaksi'))
-                        rk_pal = int(float(pd.to_numeric(target_log.get('Mutasi Pallet', 0), errors='coerce') or 0))
-                        rk_pec = int(float(pd.to_numeric(target_log.get('Mutasi Pecahan (Dus/Sak)', 0), errors='coerce') or 0))
-                        rk_pcs_tot = int(float(pd.to_numeric(target_log.get('Mutasi Eceran (Pcs)', 0), errors='coerce') or 0))
+                        rk_pal = safe_int(target_log.get('Mutasi Pallet'), 0)
+                        rk_pec = safe_int(target_log.get('Mutasi Pecahan (Dus/Sak)'), 0)
+                        rk_pcs_tot = safe_int(target_log.get('Mutasi Eceran (Pcs)'), 0)
 
                         isi_p_rev, pcs_s_rev = get_master_konversi(df_master_log, rk_pn)
                         if isi_p_rev > 0 and pcs_s_rev > 0:
@@ -1754,11 +1867,13 @@ with tab4:
                             rk_ec_only = rk_pcs_tot if (rk_pal == 0 and rk_pec == 0) else 0
 
                         fresh_rev = load_kolom_from_supabase(rk_kol)
+                        ver_rev = st.session_state['kolom_versions'].get(rk_kol)
                         working_rev = copy.deepcopy(fresh_rev)
                         baris_rev = get_baris_records(working_rev, rk_baris, only_valid=True)
                         lain_rev = [d for d in working_rev if not is_same_baris(d, rk_baris)]
 
                         sukses_rev, err_rev = True, ""
+                        combined_baris = []
                         if rk_arus == "KELUAR":
                             rest_records = [
                                 {
@@ -1786,7 +1901,7 @@ with tab4:
                                         'Status': 'Terisi', 'Keterangan': format_keterangan(rk_pec, rk_ec_only),
                                         'Catatan': '', 'Approval QC': '', 'Jadwal Kirim': '', 'Target Penerima': ''
                                     })
-                            baris_sorted = sorted(baris_rev, key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
+                            baris_sorted = sorted(baris_rev, key=lambda x: safe_float(x.get('Pallet Ke'), 0.0))
                             combined_baris = update_bayangan_baris(baris_sorted + rest_records, rk_kol, rk_baris)
                         else:
                             stok_lot = hitung_ringkasan_stok_lot(baris_rev, df_master_log).get((rk_pn, rk_lot))
@@ -1828,31 +1943,35 @@ with tab4:
                                         sukses_rev, err_rev = False, f"❌ Gagal mengurangi slot: {err_c}"
                                     else:
                                         combined_baris = update_bayangan_baris(
-                                            sorted(updated_baris, key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0))),
+                                            sorted(updated_baris, key=lambda x: safe_float(x.get('Pallet Ke'), 0.0)),
                                             rk_kol, rk_baris
                                         )
 
                         if not sukses_rev:
                             st.error(err_rev)
                         else:
-                            save_kolom_to_supabase(rk_kol, lain_rev + combined_baris)
-                            jenis_jurnal_rev = "REVERSAL OUTBOUND (Pengembalian Stok)" if rk_arus == "KELUAR" else "REVERSAL INBOUND (Tarik Stok)"
-                            det_jurnal_rev = f"Membalikkan transaksi [{clean_str(target_log.get('Waktu Transaksi'))}] | Alasan: {clean_str(alasan_rev)}"
-                            catat_log_mutasi(
-                                jenis_jurnal_rev, rk_kol, rk_baris, rk_nama, rk_pn, rk_lot,
-                                rk_pal, rk_pec, rk_pcs_tot,
-                                keterangan=det_jurnal_rev,
-                                tujuan_kategori=f"REVERSAL: {clean_str(alasan_rev)}",
-                                detail_sistem=det_jurnal_rev
-                            )
-                            clear_all_rak_caches()
-                            st.session_state['log_loaded_records'] = []
-                            st.session_state.update({
-                                'undo_dict': {rk_kol: copy.deepcopy(fresh_rev)},
-                                'action_msg': f"Reversal berhasil di Rak {rk_kol}-{rk_baris} ({rk_nama} Lot {rk_lot})",
-                                'action_status': 'DONE'
-                            })
-                            st.rerun()
+                            try:
+                                save_kolom_to_supabase(rk_kol, lain_rev + combined_baris, expected_version=ver_rev)
+                                jenis_jurnal_rev = "REVERSAL OUTBOUND (Pengembalian Stok)" if rk_arus == "KELUAR" else "REVERSAL INBOUND (Tarik Stok)"
+                                det_jurnal_rev = f"Membalikkan transaksi [{clean_str(target_log.get('Waktu Transaksi'))}] | Alasan: {clean_str(alasan_rev)}"
+                                catat_log_mutasi(
+                                    jenis_jurnal_rev, rk_kol, rk_baris, rk_nama, rk_pn, rk_lot,
+                                    rk_pal, rk_pec, rk_ec_only,
+                                    keterangan=det_jurnal_rev,
+                                    tujuan_kategori=f"REVERSAL: {clean_str(alasan_rev)}",
+                                    detail_sistem=det_jurnal_rev,
+                                    total_pcs=rk_pcs_tot
+                                )
+                                clear_all_rak_caches()
+                                st.session_state['log_loaded_records'] = []
+                                st.session_state.update({
+                                    'undo_dict': {rk_kol: copy.deepcopy(fresh_rev)},
+                                    'action_msg': f"Reversal berhasil di Rak {rk_kol}-{rk_baris} ({rk_nama} Lot {rk_lot})",
+                                    'action_status': 'DONE'
+                                })
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"❌ Gagal menyimpan reversal: {e}")
             else:
                 st.info("Tidak ada transaksi MASUK/KELUAR pada lokasi rak spesifik dalam daftar di atas yang dapat di-reversal.")
 
@@ -1907,29 +2026,37 @@ with tab5:
                     if not all(col in df_sync.columns for col in req_cols):
                         st.error("❌ Format CSV tidak valid! Kolom wajib tidak ditemukan.")
                     else:
+                        df_sync['Baris_Num'] = pd.to_numeric(df_sync['Baris'], errors='coerce').fillna(0).astype(int)
+                        df_sync['Pallet_Num'] = pd.to_numeric(df_sync['Pallet Ke'], errors='coerce').fillna(0).astype(int)
+
                         for kol in KOLOM_IDS:
-                            df_kol = df_sync[df_sync['Kolom'].apply(clean_str) == kol]
+                            df_kol = df_sync[df_sync['Kolom'].apply(clean_str).str.upper() == kol]
                             new_data = []
                             if not df_kol.empty:
-                                df_kol = df_kol.sort_values(by=['Baris', 'Pallet Ke'])
-                                for _, row in df_kol.iterrows():
-                                    pn = clean_str(row['Part Number']).upper()
-                                    if not pn:
+                                for b_val, grp_b in df_kol.groupby('Baris_Num'):
+                                    if b_val <= 0:
                                         continue
-                                    new_data.append({
-                                        'Kolom': kol,
-                                        'Baris': float(row['Baris']),
-                                        'Pallet Ke': float(row['Pallet Ke']),
-                                        'Part Number': pn,
-                                        'Lot Number': clean_str(row['Lot Number']),
-                                        'Nama Produk': clean_str(row['Nama Produk']),
-                                        'Keterangan': clean_str(row.get('Keterangan')),
-                                        'Catatan': clean_str(row.get('Catatan')),
-                                        'Approval QC': clean_str(row.get('Approval QC')),
-                                        'Jadwal Kirim': clean_str(row.get('Jadwal Kirim')),
-                                        'Target Penerima': clean_str(row.get('Target Penerima')),
-                                        'Status': 'Terisi'
-                                    })
+                                    grp_b = grp_b.sort_values('Pallet_Num')
+                                    baris_items = []
+                                    for _, row in grp_b.iterrows():
+                                        pn = clean_str(row['Part Number']).upper()
+                                        if not pn:
+                                            continue
+                                        baris_items.append({
+                                            'Kolom': kol,
+                                            'Baris': float(b_val),
+                                            'Pallet Ke': float(row['Pallet_Num']),
+                                            'Part Number': pn,
+                                            'Lot Number': clean_str(row['Lot Number']),
+                                            'Nama Produk': clean_str(row['Nama Produk']),
+                                            'Keterangan': clean_str(row.get('Keterangan')),
+                                            'Catatan': clean_str(row.get('Catatan')),
+                                            'Approval QC': clean_str(row.get('Approval QC')),
+                                            'Jadwal Kirim': clean_str(row.get('Jadwal Kirim')),
+                                            'Target Penerima': clean_str(row.get('Target Penerima')),
+                                            'Status': 'Terisi'
+                                        })
+                                    new_data.extend(update_bayangan_baris(baris_items, kol, int(b_val)))
                             save_kolom_to_supabase(kol, new_data)
 
                         clear_all_rak_caches()
@@ -2040,7 +2167,9 @@ with tab6:
                     st.error("❌ Rak asal dan tujuan sama! Aktifkan checkbox Push-back jika ingin memutar posisi Lot ke depan.")
                 else:
                     fresh_asal = load_kolom_from_supabase(ak)
+                    ver_asal = st.session_state['kolom_versions'].get(ak)
                     fresh_tuj = load_kolom_from_supabase(tk) if ak != tk else copy.deepcopy(fresh_asal)
+                    ver_tuj = st.session_state['kolom_versions'].get(tk)
 
                     has_changes = False
                     error_msg = ""
@@ -2056,7 +2185,7 @@ with tab6:
                     all_moved_records = []
 
                     for _, row in edited_relok.iterrows():
-                        pindah_utuh, pindah_dus, pindah_pcs = int(row['PINDAH UTUH']), int(row['PINDAH DUS']), int(row['PINDAH PCS'])
+                        pindah_utuh, pindah_dus, pindah_pcs = safe_int(row['PINDAH UTUH']), safe_int(row['PINDAH DUS']), safe_int(row['PINDAH PCS'])
                         if pindah_utuh == 0 and pindah_dus == 0 and pindah_pcs == 0:
                             continue
 
@@ -2069,9 +2198,9 @@ with tab6:
                         jk_awal = clean_str(row.get('Jadwal Kirim'))
                         tp_awal = clean_str(row.get('Target Penerima'))
 
-                        sisa_utuh = int(row['Tersedia Utuh']) - pindah_utuh
-                        sisa_dus = int(row['Tersedia Dus']) - pindah_dus
-                        sisa_pcs = int(row['Tersedia Pcs']) - pindah_pcs
+                        sisa_utuh = safe_int(row['Tersedia Utuh']) - pindah_utuh
+                        sisa_dus = safe_int(row['Tersedia Dus']) - pindah_dus
+                        sisa_pcs = safe_int(row['Tersedia Pcs']) - pindah_pcs
 
                         if sisa_utuh < 0 or sisa_dus < 0 or sisa_pcs < 0:
                             error_msg = f"❌ Jumlah pindah Lot {l} melebihi stok tersedia!"
@@ -2123,49 +2252,53 @@ with tab6:
                         rute_relok = f"{ak}-{ab} -> {tk}-{tb}"
                         logs_to_write.append((
                             jenis_log, rute_relok, "NONE", nama_prod, part_num, l,
-                            pindah_utuh, pindah_dus, tot_pindah_pcs,
+                            pindah_utuh, pindah_dus, pindah_pcs,
                             f"Pindah ke {tk}-{tb}", f"Pindah ke {tk}-{tb}",
-                            f"Asal: {ak}-{ab} | Tujuan: {tk}-{tb}"
+                            f"Asal: {ak}-{ab} | Tujuan: {tk}-{tb}",
+                            tot_pindah_pcs
                         ))
 
                     if error_msg:
                         st.error(error_msg)
                     elif has_changes:
-                        if ak == tk and ab == tb:
-                            existing_tb = sorted(get_baris_records(data_rak_tujuan, tb), key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
-                            lain_tb = [d for d in data_rak_tujuan if not is_same_baris(d, tb)]
-                            combined_tb = update_bayangan_baris((all_moved_records + existing_tb) if relok_dari_depan else (existing_tb + all_moved_records), tk, tb)
-                            save_kolom_to_supabase(ak, lain_tb + combined_tb)
+                        try:
+                            if ak == tk and ab == tb:
+                                existing_tb = sorted(get_baris_records(data_rak_tujuan, tb), key=lambda x: safe_float(x.get('Pallet Ke'), 0.0))
+                                lain_tb = [d for d in data_rak_tujuan if not is_same_baris(d, tb)]
+                                combined_tb = update_bayangan_baris((all_moved_records + existing_tb) if relok_dari_depan else (existing_tb + all_moved_records), tk, tb)
+                                save_kolom_to_supabase(ak, lain_tb + combined_tb, expected_version=ver_asal)
 
-                        elif ak == tk and ab != tb:
-                            baris_asal_sisa = update_bayangan_baris(sorted(get_baris_records(data_rak_asal, ab), key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0))), ak, ab)
-                            existing_tb = sorted(get_baris_records(data_rak_asal, tb), key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
-                            combined_tb = update_bayangan_baris((all_moved_records + existing_tb) if relok_dari_depan else (existing_tb + all_moved_records), tk, tb)
-                            lain_bars = [d for d in data_rak_asal if not (is_same_baris(d, ab) or is_same_baris(d, tb))]
-                            save_kolom_to_supabase(ak, lain_bars + baris_asal_sisa + combined_tb)
+                            elif ak == tk and ab != tb:
+                                baris_asal_sisa = update_bayangan_baris(sorted(get_baris_records(data_rak_asal, ab), key=lambda x: safe_float(x.get('Pallet Ke'), 0.0)), ak, ab)
+                                existing_tb = sorted(get_baris_records(data_rak_asal, tb), key=lambda x: safe_float(x.get('Pallet Ke'), 0.0))
+                                combined_tb = update_bayangan_baris((all_moved_records + existing_tb) if relok_dari_depan else (existing_tb + all_moved_records), tk, tb)
+                                lain_bars = [d for d in data_rak_asal if not (is_same_baris(d, ab) or is_same_baris(d, tb))]
+                                save_kolom_to_supabase(ak, lain_bars + baris_asal_sisa + combined_tb, expected_version=ver_asal)
 
-                        else:
-                            baris_asal_sisa = update_bayangan_baris(sorted(get_baris_records(data_rak_asal, ab), key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0))), ak, ab)
-                            lain_asal = [d for d in data_rak_asal if not is_same_baris(d, ab)]
-                            save_kolom_to_supabase(ak, lain_asal + baris_asal_sisa)
+                            else:
+                                baris_asal_sisa = update_bayangan_baris(sorted(get_baris_records(data_rak_asal, ab), key=lambda x: safe_float(x.get('Pallet Ke'), 0.0)), ak, ab)
+                                lain_asal = [d for d in data_rak_asal if not is_same_baris(d, ab)]
+                                save_kolom_to_supabase(ak, lain_asal + baris_asal_sisa, expected_version=ver_asal)
 
-                            existing_tb = sorted(get_baris_records(data_rak_tujuan, tb), key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)))
-                            combined_tb = update_bayangan_baris((all_moved_records + existing_tb) if relok_dari_depan else (existing_tb + all_moved_records), tk, tb)
-                            lain_tuj = [d for d in data_rak_tujuan if not is_same_baris(d, tb)]
-                            save_kolom_to_supabase(tk, lain_tuj + combined_tb)
+                                existing_tb = sorted(get_baris_records(data_rak_tujuan, tb), key=lambda x: safe_float(x.get('Pallet Ke'), 0.0))
+                                combined_tb = update_bayangan_baris((all_moved_records + existing_tb) if relok_dari_depan else (existing_tb + all_moved_records), tk, tb)
+                                lain_tuj = [d for d in data_rak_tujuan if not is_same_baris(d, tb)]
+                                save_kolom_to_supabase(tk, lain_tuj + combined_tb, expected_version=ver_tuj)
 
-                        for lg in logs_to_write:
-                            catat_log_mutasi(*lg)
-                        clear_all_rak_caches()
-                        mode_txt = " (Push-Back ke Depan)" if relok_dari_depan else ""
-                        st.session_state.update({
-                            'undo_dict': copy.deepcopy(undo_dict_setup),
-                            'action_msg': f"Berhasil memindahkan item dari Rak {ak}-{ab} ke {tk}-{tb}{mode_txt}",
-                            'action_status': 'DONE',
-                            'relok_dicari': False,
-                            'kor_dicari': False
-                        })
-                        st.rerun()
+                            for lg in logs_to_write:
+                                catat_log_mutasi(*lg[:12], total_pcs=lg[12])
+                            clear_all_rak_caches()
+                            mode_txt = " (Push-Back ke Depan)" if relok_dari_depan else ""
+                            st.session_state.update({
+                                'undo_dict': copy.deepcopy(undo_dict_setup),
+                                'action_msg': f"Berhasil memindahkan item dari Rak {ak}-{ab} ke {tk}-{tb}{mode_txt}",
+                                'action_status': 'DONE',
+                                'relok_dicari': False,
+                                'kor_dicari': False
+                            })
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Gagal menyimpan relokasi: {e}")
                     else:
                         st.info("Tidak ada jumlah yang dipindah.")
         else:
@@ -2210,7 +2343,7 @@ with tab7:
         st.markdown(f"**Data Baris {kk}-{kb}** *(Anda dapat menambah/menghapus baris di tabel bawah ini)*")
 
         config_kor = {
-            'Kolom': None, 'Baris': None, 'Status': None,
+            'Kolom': None, 'Baris': None, 'Status': None, 'Updated At': None,
             'Pallet Ke': st.column_config.NumberColumn("Idx Pallet", disabled=True),
             'Part Number': st.column_config.TextColumn("Part Number", required=True),
             'Lot Number': st.column_config.TextColumn("Lot Number", required=True),
@@ -2248,139 +2381,145 @@ with tab7:
                     st.error("❌ Baris baru wajib memiliki Part Number yang valid!")
                 else:
                     with st.spinner("Menyimpan koreksi & menyeimbangkan jurnal mutasi..."):
-                        new_baris_data = []
-                        for d in raw_edited_records:
-                            pn_clean = clean_str(d.get('Part Number')).upper()
-                            if not pn_clean:
-                                continue
-                            nama_clean = clean_str(d.get('Nama Produk'))
-                            if not nama_clean and not df_master_kor.empty and 'Part Number Clean' in df_master_kor.columns:
-                                m_nm = df_master_kor[df_master_kor['Part Number Clean'] == pn_clean]['Nama Barang'].values
-                                if len(m_nm) > 0:
-                                    nama_clean = clean_str(m_nm[0])
+                        try:
+                            new_baris_data = []
+                            for d in raw_edited_records:
+                                pn_clean = clean_str(d.get('Part Number')).upper()
+                                if not pn_clean:
+                                    continue
+                                nama_clean = clean_str(d.get('Nama Produk'))
+                                if not nama_clean and not df_master_kor.empty and 'Part Number Clean' in df_master_kor.columns:
+                                    m_nm = df_master_kor[df_master_kor['Part Number Clean'] == pn_clean]['Nama Barang'].values
+                                    if len(m_nm) > 0:
+                                        nama_clean = clean_str(m_nm[0])
 
-                            new_baris_data.append({
-                                'Kolom': kk,
-                                'Baris': float(kb),
-                                'Pallet Ke': float(pd.to_numeric(d.get('Pallet Ke', 0), errors='coerce') or 0),
-                                'Status': 'Terisi',
-                                'Part Number': pn_clean,
-                                'Lot Number': clean_str(d.get('Lot Number')) or "-",
-                                'Nama Produk': nama_clean,
-                                'Keterangan': clean_str(d.get('Keterangan')),
-                                'Catatan': clean_str(d.get('Catatan')),
-                                'Approval QC': clean_str(d.get('Approval QC')),
-                                'Jadwal Kirim': clean_str(d.get('Jadwal Kirim')),
-                                'Target Penerima': clean_str(d.get('Target Penerima'))
-                            })
+                                new_baris_data.append({
+                                    'Kolom': kk,
+                                    'Baris': float(kb),
+                                    'Pallet Ke': safe_float(d.get('Pallet Ke'), 0.0),
+                                    'Status': 'Terisi',
+                                    'Part Number': pn_clean,
+                                    'Lot Number': clean_str(d.get('Lot Number')) or "-",
+                                    'Nama Produk': nama_clean,
+                                    'Keterangan': clean_str(d.get('Keterangan')),
+                                    'Catatan': clean_str(d.get('Catatan')),
+                                    'Approval QC': clean_str(d.get('Approval QC')),
+                                    'Jadwal Kirim': clean_str(d.get('Jadwal Kirim')),
+                                    'Target Penerima': clean_str(d.get('Target Penerima'))
+                                })
 
-                        new_baris_data = update_bayangan_baris(new_baris_data, kk, kb)
+                            new_baris_data = update_bayangan_baris(new_baris_data, kk, kb)
 
-                        fresh_kor = load_kolom_from_supabase(kk)
-                        lain_kor_fresh = [d for d in fresh_kor if not is_same_baris(d, kb)]
-                        final_kolom_data = lain_kor_fresh + new_baris_data
-                        save_kolom_to_supabase(kk, final_kolom_data)
+                            fresh_kor = load_kolom_from_supabase(kk)
+                            ver_kor = st.session_state['kolom_versions'].get(kk)
+                            lain_kor_fresh = [d for d in fresh_kor if not is_same_baris(d, kb)]
+                            final_kolom_data = lain_kor_fresh + new_baris_data
+                            save_kolom_to_supabase(kk, final_kolom_data, expected_version=ver_kor)
 
-                        stok_sebelum = hitung_ringkasan_stok_lot(df_kor.to_dict('records'), df_master_kor)
-                        stok_sesudah = hitung_ringkasan_stok_lot(new_baris_data, df_master_kor)
-                        semua_kunci_lot = sorted(set(stok_sebelum.keys()) | set(stok_sesudah.keys()))
+                            stok_sebelum = hitung_ringkasan_stok_lot(df_kor.to_dict('records'), df_master_kor)
+                            stok_sesudah = hitung_ringkasan_stok_lot(new_baris_data, df_master_kor)
+                            semua_kunci_lot = sorted(set(stok_sebelum.keys()) | set(stok_sesudah.keys()))
 
-                        alasan_txt = clean_str(alasan_koreksi_input) or "Penyesuaian Koreksi Rak"
-                        jurnal_kuantitas_tercatat = 0
+                            alasan_txt = clean_str(alasan_koreksi_input) or "Penyesuaian Koreksi Rak"
+                            jurnal_kuantitas_tercatat = 0
 
-                        for (pn_k, lot_k) in semua_kunci_lot:
-                            s_old = stok_sebelum.get((pn_k, lot_k), {'nama': '', 'utuh': 0, 'dus': 0, 'pcs_ec': 0, 'tot_pcs': 0})
-                            s_new = stok_sesudah.get((pn_k, lot_k), {'nama': '', 'utuh': 0, 'dus': 0, 'pcs_ec': 0, 'tot_pcs': 0})
-                            nama_k = s_new['nama'] or s_old['nama']
-                            isi_p_k, pcs_s_k = get_master_konversi(df_master_kor, pn_k)
+                            for (pn_k, lot_k) in semua_kunci_lot:
+                                s_old = stok_sebelum.get((pn_k, lot_k), {'nama': '', 'utuh': 0, 'dus': 0, 'pcs_ec': 0, 'tot_pcs': 0})
+                                s_new = stok_sesudah.get((pn_k, lot_k), {'nama': '', 'utuh': 0, 'dus': 0, 'pcs_ec': 0, 'tot_pcs': 0})
+                                nama_k = s_new['nama'] or s_old['nama']
+                                isi_p_k, pcs_s_k = get_master_konversi(df_master_kor, pn_k)
 
-                            if isi_p_k > 0 and pcs_s_k > 0:
-                                delta_pcs = s_new['tot_pcs'] - s_old['tot_pcs']
-                                if delta_pcs != 0:
-                                    jurnal_kuantitas_tercatat += 1
-                                    abs_pcs = abs(delta_pcs)
-                                    d_pal = abs_pcs // isi_p_k
-                                    rem_k = abs_pcs % isi_p_k
-                                    d_dus = rem_k // pcs_s_k
-                                    sat_k = get_satuan_kemasan(pn_k)
-                                    if delta_pcs > 0:
-                                        j_jenis = "MASUK (Koreksi / Retur)"
-                                        j_tujuan = f"KOREKSI MASUK: {alasan_txt}"
-                                    else:
-                                        j_jenis = "KELUAR (Koreksi Stok)"
-                                        j_tujuan = f"KOREKSI KELUAR: {alasan_txt}"
+                                if isi_p_k > 0 and pcs_s_k > 0:
+                                    delta_pcs = s_new['tot_pcs'] - s_old['tot_pcs']
+                                    if delta_pcs != 0:
+                                        jurnal_kuantitas_tercatat += 1
+                                        abs_pcs = abs(delta_pcs)
+                                        d_pal = abs_pcs // isi_p_k
+                                        rem_k = abs_pcs % isi_p_k
+                                        d_dus = rem_k // pcs_s_k
+                                        d_ec = rem_k % pcs_s_k
+                                        sat_k = get_satuan_kemasan(pn_k)
+                                        if delta_pcs > 0:
+                                            j_jenis = "MASUK (Koreksi / Retur)"
+                                            j_tujuan = f"KOREKSI MASUK: {alasan_txt}"
+                                        else:
+                                            j_jenis = "KELUAR (Koreksi Stok)"
+                                            j_tujuan = f"KOREKSI KELUAR: {alasan_txt}"
 
-                                    j_detail = (
-                                        f"Awal: {s_old['utuh']}P {s_old['dus']}{sat_k} ({s_old['tot_pcs']:,} pcs) -> "
-                                        f"Akhir: {s_new['utuh']}P {s_new['dus']}{sat_k} ({s_new['tot_pcs']:,} pcs) | "
-                                        f"Selisih: {delta_pcs:+,} pcs"
-                                    )
+                                        j_detail = (
+                                            f"Awal: {s_old['utuh']}P {s_old['dus']}{sat_k} ({s_old['tot_pcs']:,} pcs) -> "
+                                            f"Akhir: {s_new['utuh']}P {s_new['dus']}{sat_k} ({s_new['tot_pcs']:,} pcs) | "
+                                            f"Selisih: {delta_pcs:+,} pcs"
+                                        )
+                                        catat_log_mutasi(
+                                            j_jenis, kk, kb, nama_k, pn_k, lot_k,
+                                            d_pal, d_dus, d_ec,
+                                            keterangan=j_detail,
+                                            tujuan_kategori=j_tujuan,
+                                            detail_sistem=j_detail,
+                                            total_pcs=abs_pcs
+                                        )
+                                else:
+                                    delta_u = s_new['utuh'] - s_old['utuh']
+                                    delta_d = s_new['dus'] - s_old['dus']
+                                    delta_e = s_new['pcs_ec'] - s_old['pcs_ec']
+                                    if delta_u != 0 or delta_d != 0 or delta_e != 0:
+                                        jurnal_kuantitas_tercatat += 1
+                                        is_plus = (delta_u > 0) or (delta_u == 0 and delta_d > 0) or (delta_u == 0 and delta_d == 0 and delta_e > 0)
+                                        j_jenis = "MASUK (Koreksi / Retur)" if is_plus else "KELUAR (Koreksi Stok)"
+                                        j_tujuan = f"{'KOREKSI MASUK' if is_plus else 'KOREKSI KELUAR'}: {alasan_txt}"
+                                        j_detail = f"Delta: {delta_u:+}P, {delta_d:+} qty, {delta_e:+} pcs"
+                                        catat_log_mutasi(
+                                            j_jenis, kk, kb, nama_k, pn_k, lot_k,
+                                            abs(delta_u), abs(delta_d), abs(delta_e),
+                                            keterangan=j_detail,
+                                            tujuan_kategori=j_tujuan,
+                                            detail_sistem=j_detail
+                                        )
+
+                            if jurnal_kuantitas_tercatat == 0:
+                                perubahan_atribut = 0
+                                min_len = min(len(df_kor), len(new_baris_data))
+                                for idx_k in range(min_len):
+                                    r_lama = df_kor.iloc[idx_k]
+                                    r_baru = new_baris_data[idx_k]
+                                    diff_fields = []
+                                    for col_cek in ['Part Number', 'Lot Number', 'Nama Produk', 'Keterangan', 'Catatan', 'Approval QC', 'Jadwal Kirim', 'Target Penerima']:
+                                        v_lama = clean_str(r_lama.get(col_cek))
+                                        v_baru = clean_str(r_baru.get(col_cek))
+                                        if v_lama != v_baru:
+                                            diff_fields.append(f"{col_cek}: '{v_lama}' -> '{v_baru}'")
+                                    if diff_fields:
+                                        perubahan_atribut += 1
+                                        det_kor = f"Pallet #{safe_int(r_baru.get('Pallet Ke'))} | " + "; ".join(diff_fields)
+                                        catat_log_mutasi(
+                                            "ERROR CORRECTION (Edit Slot)", kk, kb,
+                                            clean_str(r_baru.get('Nama Produk')),
+                                            clean_str(r_baru.get('Part Number')),
+                                            clean_str(r_baru.get('Lot Number')),
+                                            0, 0, 0,
+                                            keterangan=det_kor,
+                                            tujuan_kategori=f"EC: {alasan_txt}",
+                                            detail_sistem=det_kor
+                                        )
+
+                                if perubahan_atribut == 0:
                                     catat_log_mutasi(
-                                        j_jenis, kk, kb, nama_k, pn_k, lot_k,
-                                        d_pal, d_dus, abs_pcs,
-                                        keterangan=j_detail,
-                                        tujuan_kategori=j_tujuan,
-                                        detail_sistem=j_detail
-                                    )
-                            else:
-                                delta_u = s_new['utuh'] - s_old['utuh']
-                                delta_d = s_new['dus'] - s_old['dus']
-                                delta_e = s_new['pcs_ec'] - s_old['pcs_ec']
-                                if delta_u != 0 or delta_d != 0 or delta_e != 0:
-                                    jurnal_kuantitas_tercatat += 1
-                                    is_plus = (delta_u > 0) or (delta_u == 0 and delta_d > 0) or (delta_u == 0 and delta_d == 0 and delta_e > 0)
-                                    j_jenis = "MASUK (Koreksi / Retur)" if is_plus else "KELUAR (Koreksi Stok)"
-                                    j_tujuan = f"{'KOREKSI MASUK' if is_plus else 'KOREKSI KELUAR'}: {alasan_txt}"
-                                    j_detail = f"Delta: {delta_u:+}P, {delta_d:+} qty, {delta_e:+} pcs"
-                                    catat_log_mutasi(
-                                        j_jenis, kk, kb, nama_k, pn_k, lot_k,
-                                        abs(delta_u), abs(delta_d), abs(delta_e),
-                                        keterangan=j_detail,
-                                        tujuan_kategori=j_tujuan,
-                                        detail_sistem=j_detail
-                                    )
-
-                        if jurnal_kuantitas_tercatat == 0:
-                            perubahan_atribut = 0
-                            min_len = min(len(df_kor), len(new_baris_data))
-                            for idx_k in range(min_len):
-                                r_lama = df_kor.iloc[idx_k]
-                                r_baru = new_baris_data[idx_k]
-                                diff_fields = []
-                                for col_cek in ['Part Number', 'Lot Number', 'Nama Produk', 'Keterangan', 'Catatan', 'Approval QC', 'Jadwal Kirim', 'Target Penerima']:
-                                    v_lama = clean_str(r_lama.get(col_cek))
-                                    v_baru = clean_str(r_baru.get(col_cek))
-                                    if v_lama != v_baru:
-                                        diff_fields.append(f"{col_cek}: '{v_lama}' -> '{v_baru}'")
-                                if diff_fields:
-                                    perubahan_atribut += 1
-                                    det_kor = f"Pallet #{int(r_baru.get('Pallet Ke', 0))} | " + "; ".join(diff_fields)
-                                    catat_log_mutasi(
-                                        "ERROR CORRECTION (Edit Slot)", kk, kb,
-                                        clean_str(r_baru.get('Nama Produk')),
-                                        clean_str(r_baru.get('Part Number')),
-                                        clean_str(r_baru.get('Lot Number')),
-                                        0, 0, 0,
-                                        keterangan=det_kor,
+                                        "KOREKSI DATA", kk, kb, "Koreksi Rak", "-", "-", 0, 0, 0,
+                                        keterangan=alasan_txt,
                                         tujuan_kategori=f"EC: {alasan_txt}",
-                                        detail_sistem=det_kor
+                                        detail_sistem=alasan_txt
                                     )
 
-                            if perubahan_atribut == 0:
-                                catat_log_mutasi(
-                                    "KOREKSI DATA", kk, kb, "Koreksi Rak", "-", "-", 0, 0, 0,
-                                    keterangan=alasan_txt,
-                                    tujuan_kategori=f"EC: {alasan_txt}",
-                                    detail_sistem=alasan_txt
-                                )
-
-                        clear_all_rak_caches()
-                        st.session_state.update({
-                            'undo_dict': {kk: copy.deepcopy(fresh_kor)},
-                            'action_msg': f"Koreksi data di Rak {kk}-{kb} tersimpan ({jurnal_kuantitas_tercatat} jurnal kuantitas dicatat).",
-                            'action_status': 'DONE'
-                        })
-                        st.rerun()
+                            clear_all_rak_caches()
+                            st.session_state.update({
+                                'undo_dict': {kk: copy.deepcopy(fresh_kor)},
+                                'action_msg': f"Koreksi data di Rak {kk}-{kb} tersimpan ({jurnal_kuantitas_tercatat} jurnal kuantitas dicatat).",
+                                'action_status': 'DONE'
+                            })
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Gagal menyimpan koreksi: {e}")
             else:
                 st.info("Tidak ada perubahan yang dilakukan pada tabel.")
 
@@ -2644,7 +2783,9 @@ with tab9:
                 total_pcs_dari_pecahan = 0
                 if ikut_pecahan_fifo:
                     for idx_r, r_k in df_kandidat.iterrows():
-                        avail_d = int(r_k['Stok Dus/Sak'])
+                        if mode_input_plot.startswith("🔢") and total_pcs_dari_pecahan >= int(qty_plot_pcs):
+                            break
+                        avail_d = safe_int(r_k['Stok Dus/Sak'])
                         if avail_d > 0:
                             auto_pecahan_map[idx_r] = avail_d
                             if pcs_satuan_master > 0:
@@ -2660,8 +2801,8 @@ with tab9:
                 plot_p_list, plot_d_list = [], []
 
                 for idx_r, r_k in df_kandidat.iterrows():
-                    avail_p = int(r_k['Stok Utuh'])
-                    avail_d = int(r_k['Stok Dus/Sak'])
+                    avail_p = safe_int(r_k['Stok Utuh'])
+                    avail_d = safe_int(r_k['Stok Dus/Sak'])
 
                     take_p = min(avail_p, sisa_p_need)
                     sisa_p_need -= take_p
@@ -2675,15 +2816,16 @@ with tab9:
                     plot_p_list.append(take_p)
                     plot_d_list.append(take_d)
 
+                col_plot_satuan = f'Plot {satuan_plot.title()}'
                 df_kandidat['Plot Utuh'] = plot_p_list
-                df_kandidat[f'Plot {satuan_plot.title()}'] = plot_d_list
-                df_kandidat = evaluasi_akses_dinamis_plot(df_kandidat, all_rak_records, part_plot_clean)
+                df_kandidat[col_plot_satuan] = plot_d_list
+                df_kandidat = evaluasi_akses_dinamis_plot(df_kandidat, all_rak_records, part_plot_clean, col_plot_satuan)
 
                 st.divider()
                 st.markdown(f"**5. Hasil Kandidat Lot & Lokasi Rak untuk `{pilih_item_plot}` (`{part_plot_clean}`)**")
 
                 tot_plot_p_prev = int(df_kandidat['Plot Utuh'].sum())
-                tot_plot_d_prev = int(df_kandidat[f'Plot {satuan_plot.title()}'].sum())
+                tot_plot_d_prev = int(df_kandidat[col_plot_satuan].sum())
 
                 info_target_str = f"Rencana Ter-plot: **{tot_plot_p_prev} Palet Utuh**"
                 if tot_plot_d_prev > 0:
@@ -2705,7 +2847,7 @@ with tab9:
 
                 cols_tampil = [
                     'Lokasi', 'Lot Number', 'Akses Pintu', 'Stok Utuh', 'Stok Dus/Sak',
-                    'Plot Utuh', f'Plot {satuan_plot.title()}', 'Status QC', 'Catatan Rak'
+                    'Plot Utuh', col_plot_satuan, 'Status QC', 'Catatan Rak'
                 ]
                 edited_plot_df = st.data_editor(
                     df_kandidat[cols_tampil],
@@ -2716,7 +2858,7 @@ with tab9:
                         'Stok Utuh': st.column_config.NumberColumn("Stok Palet", disabled=True),
                         'Stok Dus/Sak': st.column_config.NumberColumn(f"Stok {satuan_plot.title()}", disabled=True),
                         'Plot Utuh': st.column_config.NumberColumn("🎯 PLOT PALET", min_value=0, required=True),
-                        f'Plot {satuan_plot.title()}': st.column_config.NumberColumn(f"🎯 PLOT {satuan_plot.upper()}", min_value=0, required=True),
+                        col_plot_satuan: st.column_config.NumberColumn(f"🎯 PLOT {satuan_plot.upper()}", min_value=0, required=True),
                         'Status QC': st.column_config.TextColumn("Status QC", disabled=True),
                         'Catatan Rak': st.column_config.TextColumn("Catatan Rak", disabled=True),
                     },
@@ -2751,17 +2893,17 @@ with tab9:
                         alokasi_valid = []
                         err_plot = ""
                         for _, r_ed in edited_plot_df.iterrows():
-                            p_ambil = int(r_ed['Plot Utuh'])
-                            d_ambil = int(r_ed[f'Plot {satuan_plot.title()}'])
+                            p_ambil = safe_int(r_ed['Plot Utuh'])
+                            d_ambil = safe_int(r_ed[col_plot_satuan])
                             if p_ambil == 0 and d_ambil == 0:
                                 continue
-                            if p_ambil > int(r_ed['Stok Utuh']) or d_ambil > int(r_ed['Stok Dus/Sak']):
+                            if p_ambil > safe_int(r_ed['Stok Utuh']) or d_ambil > safe_int(r_ed['Stok Dus/Sak']):
                                 err_plot = f"❌ Jumlah plot pada Rak {r_ed['Lokasi']} (Lot {r_ed['Lot Number']}) melebihi stok bebas tersedia!"
                                 break
                             alokasi_valid.append({
                                 'Lokasi': r_ed['Lokasi'],
                                 'Kolom': r_ed['Lokasi'].split("-")[0],
-                                'Baris': int(r_ed['Lokasi'].split("-")[1]),
+                                'Baris': safe_int(r_ed['Lokasi'].split("-")[1]),
                                 'Lot': clean_str(r_ed['Lot Number']),
                                 'Akses': clean_str(r_ed['Akses Pintu']),
                                 'Plot_P': p_ambil,
@@ -2774,88 +2916,93 @@ with tab9:
                             st.warning("⚠️ Tidak ada palet/pecahan yang di-plot (semua bernilai 0).")
                         else:
                             with st.spinner("Menyematkan Jadwal Kirim & Target Penerima ke slot rak..."):
-                                kolom_terlibat = sorted({x['Kolom'] for x in alokasi_valid})
-                                fresh_map = {}
-                                work_map = {}
-                                for k in kolom_terlibat:
-                                    arr = load_kolom_from_supabase(k)
-                                    fresh_map[k] = copy.deepcopy(arr)
-                                    work_map[k] = copy.deepcopy(arr)
+                                try:
+                                    kolom_terlibat = sorted({x['Kolom'] for x in alokasi_valid})
+                                    fresh_map = {}
+                                    ver_map = {}
+                                    work_map = {}
+                                    for k in kolom_terlibat:
+                                        arr = load_kolom_from_supabase(k)
+                                        fresh_map[k] = copy.deepcopy(arr)
+                                        ver_map[k] = st.session_state['kolom_versions'].get(k)
+                                        work_map[k] = copy.deepcopy(arr)
 
-                                ok_pl = True
-                                err_tx_pl = ""
-                                for al in alokasi_valid:
-                                    k_id, b_num, lot_id = al['Kolom'], al['Baris'], al['Lot']
-                                    need_p, need_d = al['Plot_P'], al['Plot_D']
-                                    dari_belakang = "BELAKANG" in al['Akses'].upper()
+                                    ok_pl = True
+                                    err_tx_pl = ""
+                                    for al in alokasi_valid:
+                                        k_id, b_num, lot_id = al['Kolom'], al['Baris'], al['Lot']
+                                        need_p, need_d = al['Plot_P'], al['Plot_D']
+                                        dari_belakang = "BELAKANG" in al['Akses'].upper()
 
-                                    baris_items = [
-                                        d for d in work_map[k_id]
-                                        if is_same_baris(d, b_num)
-                                        and clean_str(d.get('Part Number')).upper() == part_plot_clean
-                                        and clean_str(d.get('Lot Number')) == lot_id
-                                        and clean_str(d.get('Jadwal Kirim')) == ""
-                                        and clean_str(d.get('Target Penerima')) == ""
-                                    ]
-                                    baris_items.sort(
-                                        key=lambda x: pd.to_numeric(x.get('Pallet Ke', 0)),
-                                        reverse=dari_belakang
-                                    )
+                                        baris_items = [
+                                            d for d in work_map[k_id]
+                                            if is_same_baris(d, b_num)
+                                            and clean_str(d.get('Part Number')).upper() == part_plot_clean
+                                            and clean_str(d.get('Lot Number')) == lot_id
+                                            and clean_str(d.get('Jadwal Kirim')) == ""
+                                            and clean_str(d.get('Target Penerima')) == ""
+                                        ]
+                                        baris_items.sort(
+                                            key=lambda x: safe_float(x.get('Pallet Ke'), 0.0),
+                                            reverse=dari_belakang
+                                        )
 
-                                    tagged_p = 0
-                                    slot_pecahan_butuh = 1 if need_d > 0 else 0
-                                    tagged_slot_pec = 0
+                                        tagged_p = 0
+                                        slot_pecahan_butuh = 1 if need_d > 0 else 0
+                                        tagged_slot_pec = 0
 
-                                    for slot_d in baris_items:
-                                        ket_s = clean_str(slot_d.get('Keterangan')).lower()
-                                        is_pec = ('pecahan' in ket_s or 'eceran' in ket_s)
-                                        if not is_pec and tagged_p < need_p:
-                                            slot_d['Jadwal Kirim'] = tgl_kirim_str
-                                            slot_d['Target Penerima'] = cust_clean
-                                            tagged_p += 1
-                                        elif is_pec and tagged_slot_pec < slot_pecahan_butuh:
-                                            slot_d['Jadwal Kirim'] = tgl_kirim_str
-                                            slot_d['Target Penerima'] = cust_clean
-                                            tagged_slot_pec += 1
+                                        for slot_d in baris_items:
+                                            ket_s = clean_str(slot_d.get('Keterangan')).lower()
+                                            is_pec = ('pecahan' in ket_s or 'eceran' in ket_s)
+                                            if not is_pec and tagged_p < need_p:
+                                                slot_d['Jadwal Kirim'] = tgl_kirim_str
+                                                slot_d['Target Penerima'] = cust_clean
+                                                tagged_p += 1
+                                            elif is_pec and tagged_slot_pec < slot_pecahan_butuh:
+                                                slot_d['Jadwal Kirim'] = tgl_kirim_str
+                                                slot_d['Target Penerima'] = cust_clean
+                                                tagged_slot_pec += 1
 
-                                    if tagged_p < need_p or tagged_slot_pec < slot_pecahan_butuh:
-                                        ok_pl = False
-                                        err_tx_pl = f"❌ Stok bebas di Rak {k_id}-{b_num} (Lot {lot_id}) berubah sebelum disimpan. Silakan klik 'Cari Lot & Lokasi Racking' ulang."
-                                        break
+                                        if tagged_p < need_p or tagged_slot_pec < slot_pecahan_butuh:
+                                            ok_pl = False
+                                            err_tx_pl = f"❌ Stok bebas di Rak {k_id}-{b_num} (Lot {lot_id}) berubah sebelum disimpan. Silakan klik 'Cari Lot & Lokasi Racking' ulang."
+                                            break
 
-                                if not ok_pl:
-                                    st.error(err_tx_pl)
-                                else:
-                                    for k_u in kolom_terlibat:
-                                        save_kolom_to_supabase(k_u, work_map[k_u])
+                                    if not ok_pl:
+                                        st.error(err_tx_pl)
+                                    else:
+                                        for k_u in kolom_terlibat:
+                                            save_kolom_to_supabase(k_u, work_map[k_u], expected_version=ver_map[k_u])
 
-                                    tot_pl_p = sum(x['Plot_P'] for x in alokasi_valid)
-                                    tot_pl_d = sum(x['Plot_D'] for x in alokasi_valid)
-                                    ringkas_lok = ", ".join(
-                                        f"{x['Lokasi']} ({x['Lot']}: {x['Plot_P']}P"
-                                        + (f"+{x['Plot_D']}{satuan_plot}" if x['Plot_D'] > 0 else "")
-                                        + ")"
-                                        for x in alokasi_valid
-                                    )
-                                    req_pcs_note = f" | Req: {qty_plot_pcs:,} pcs" if mode_input_plot.startswith("🔢") else ""
-                                    det_pl = f"Jadwal: {tgl_kirim_str} | Customer: {cust_clean}{req_pcs_note} | Lokasi: {ringkas_lok}"
+                                        tot_pl_p = sum(x['Plot_P'] for x in alokasi_valid)
+                                        tot_pl_d = sum(x['Plot_D'] for x in alokasi_valid)
+                                        ringkas_lok = ", ".join(
+                                            f"{x['Lokasi']} ({x['Lot']}: {x['Plot_P']}P"
+                                            + (f"+{x['Plot_D']}{satuan_plot}" if x['Plot_D'] > 0 else "")
+                                            + ")"
+                                            for x in alokasi_valid
+                                        )
+                                        req_pcs_note = f" | Req: {qty_plot_pcs:,} pcs" if mode_input_plot.startswith("🔢") else ""
+                                        det_pl = f"Jadwal: {tgl_kirim_str} | Customer: {cust_clean}{req_pcs_note} | Lokasi: {ringkas_lok}"
 
-                                    catat_log_mutasi(
-                                        "PLOTTING OUTBOUND (PPIC)", ",".join(kolom_terlibat), "PLOT",
-                                        pilih_item_plot, part_plot_clean, "-",
-                                        tot_pl_p, tot_pl_d, 0,
-                                        keterangan=det_pl,
-                                        tujuan_kategori=f"PLOT: {cust_clean} ({tgl_kirim_str})",
-                                        detail_sistem=det_pl
-                                    )
-                                    clear_all_rak_caches()
-                                    st.session_state['plot_search_ready'] = False
-                                    st.session_state.update({
-                                        'undo_dict': copy.deepcopy(fresh_map),
-                                        'action_msg': f"Plotting {tot_pl_p}P {tot_pl_d} {satuan_plot} '{pilih_item_plot}' untuk {cust_clean} (Jadwal {tgl_kirim_str}) tersimpan!",
-                                        'action_status': 'DONE'
-                                    })
-                                    st.rerun()
+                                        catat_log_mutasi(
+                                            "PLOTTING OUTBOUND (PPIC)", ",".join(kolom_terlibat), "PLOT",
+                                            pilih_item_plot, part_plot_clean, "-",
+                                            tot_pl_p, tot_pl_d, 0,
+                                            keterangan=det_pl,
+                                            tujuan_kategori=f"PLOT: {cust_clean} ({tgl_kirim_str})",
+                                            detail_sistem=det_pl
+                                        )
+                                        clear_all_rak_caches()
+                                        st.session_state['plot_search_ready'] = False
+                                        st.session_state.update({
+                                            'undo_dict': copy.deepcopy(fresh_map),
+                                            'action_msg': f"Plotting {tot_pl_p}P {tot_pl_d} {satuan_plot} '{pilih_item_plot}' untuk {cust_clean} (Jadwal {tgl_kirim_str}) tersimpan!",
+                                            'action_status': 'DONE'
+                                        })
+                                        st.rerun()
+                                except Exception as e:
+                                    st.error(f"❌ Gagal menyimpan plotting: {e}")
 
     # --- MONITOR & BATALKAN PLOTTING AKTIF ---
     st.divider()
@@ -2873,7 +3020,7 @@ with tab9:
                 active_rows.append({
                     'Jadwal Kirim': jk,
                     'Target Penerima': tp,
-                    'Lokasi': f"{clean_str(item_ac.get('Kolom'))}-{int(float(item_ac.get('Baris', 0) or 0))}",
+                    'Lokasi': f"{clean_str(item_ac.get('Kolom'))}-{safe_int(item_ac.get('Baris'))}",
                     'Part Number': clean_str(item_ac.get('Part Number')),
                     'Nama Produk': clean_str(item_ac.get('Nama Produk')),
                     'Lot Number': clean_str(item_ac.get('Lot Number')),
@@ -2912,39 +3059,43 @@ with tab9:
                     if not pilih_batal_list:
                         st.warning("Pilih minimal 1 baris plotting yang akan dibatalkan.")
                     else:
-                        rows_to_cancel = df_act_grp[df_act_grp['Label_Batal'].isin(pilih_batal_list)]
-                        kol_batal = sorted({r['Lokasi'].split("-")[0] for _, r in rows_to_cancel.iterrows()})
-                        fresh_b, work_b = {}, {}
-                        for k in kol_batal:
-                            arr = load_kolom_from_supabase(k)
-                            fresh_b[k] = copy.deepcopy(arr)
-                            work_b[k] = copy.deepcopy(arr)
+                        try:
+                            rows_to_cancel = df_act_grp[df_act_grp['Label_Batal'].isin(pilih_batal_list)]
+                            kol_batal = sorted({r['Lokasi'].split("-")[0] for _, r in rows_to_cancel.iterrows()})
+                            fresh_b, ver_b, work_b = {}, {}, {}
+                            for k in kol_batal:
+                                arr = load_kolom_from_supabase(k)
+                                fresh_b[k] = copy.deepcopy(arr)
+                                ver_b[k] = st.session_state['kolom_versions'].get(k)
+                                work_b[k] = copy.deepcopy(arr)
 
-                        for _, rc in rows_to_cancel.iterrows():
-                            k_b, b_b = rc['Lokasi'].split("-")[0], int(rc['Lokasi'].split("-")[1])
-                            for slot in work_b[k_b]:
-                                if (is_same_baris(slot, b_b)
-                                        and clean_str(slot.get('Part Number')).upper() == clean_str(rc['Part Number']).upper()
-                                        and clean_str(slot.get('Lot Number')) == clean_str(rc['Lot Number'])
-                                        and clean_str(slot.get('Jadwal Kirim')) == clean_str(rc['Jadwal Kirim'])
-                                        and clean_str(slot.get('Target Penerima')) == clean_str(rc['Target Penerima'])):
-                                    slot['Jadwal Kirim'] = ""
-                                    slot['Target Penerima'] = ""
+                            for _, rc in rows_to_cancel.iterrows():
+                                k_b, b_b = rc['Lokasi'].split("-")[0], safe_int(rc['Lokasi'].split("-")[1])
+                                for slot in work_b[k_b]:
+                                    if (is_same_baris(slot, b_b)
+                                            and clean_str(slot.get('Part Number')).upper() == clean_str(rc['Part Number']).upper()
+                                            and clean_str(slot.get('Lot Number')) == clean_str(rc['Lot Number'])
+                                            and clean_str(slot.get('Jadwal Kirim')) == clean_str(rc['Jadwal Kirim'])
+                                            and clean_str(slot.get('Target Penerima')) == clean_str(rc['Target Penerima'])):
+                                        slot['Jadwal Kirim'] = ""
+                                        slot['Target Penerima'] = ""
 
-                        for k_u in kol_batal:
-                            save_kolom_to_supabase(k_u, work_b[k_u])
+                            for k_u in kol_batal:
+                                save_kolom_to_supabase(k_u, work_b[k_u], expected_version=ver_b[k_u])
 
-                        catat_log_mutasi(
-                            "BATAL PLOTTING (PPIC)", ",".join(kol_batal), "PLOT",
-                            "Pembatalan Plotting Outbound", "-", "-", 0, 0, 0,
-                            keterangan=f"Membatalkan {len(rows_to_cancel)} grup plotting",
-                            tujuan_kategori="BATAL PLOTTING",
-                            detail_sistem="; ".join(pilih_batal_list)
-                        )
-                        clear_all_rak_caches()
-                        st.session_state.update({
-                            'undo_dict': copy.deepcopy(fresh_b),
-                            'action_msg': f"Berhasil membatalkan {len(rows_to_cancel)} grup plotting (kembali ke stok bebas).",
-                            'action_status': 'DONE'
-                        })
-                        st.rerun()
+                            catat_log_mutasi(
+                                "BATAL PLOTTING (PPIC)", ",".join(kol_batal), "PLOT",
+                                "Pembatalan Plotting Outbound", "-", "-", 0, 0, 0,
+                                keterangan=f"Membatalkan {len(rows_to_cancel)} grup plotting",
+                                tujuan_kategori="BATAL PLOTTING",
+                                detail_sistem="; ".join(pilih_batal_list)
+                            )
+                            clear_all_rak_caches()
+                            st.session_state.update({
+                                'undo_dict': copy.deepcopy(fresh_b),
+                                'action_msg': f"Berhasil membatalkan {len(rows_to_cancel)} grup plotting (kembali ke stok bebas).",
+                                'action_status': 'DONE'
+                            })
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Gagal membatalkan plotting: {e}")
