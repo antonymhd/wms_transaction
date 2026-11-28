@@ -4,7 +4,6 @@ import pandas as pd
 import streamlit as st
 from app import (
     supabase,
-    TBL_STOK_RAK,
     TBL_LOG_MUTASI,
     KOLOM_IDS,
     clean_str,
@@ -19,10 +18,10 @@ from app import (
     update_bayangan_baris,
 )
 
-st.set_page_config(page_title="Pemulihan Stok Rak (Replay Log)", page_icon="🛠️", layout="wide")
+st.set_page_config(page_title="Pemulihan Stok Rak (Replay Presisi)", page_icon="🛠️", layout="wide")
 st.title("🛠️ Pemulihan Posisi Stok Rak dari Log Mutasi (`id >= 6133`)")
 
-if st.button("1️⃣ Simulasikan Replay 107 Transaksi", type="primary"):
+if st.button("1️⃣ Simulasikan & Validasi Replay 107 Transaksi", type="primary"):
     with st.spinner("Membaca snapshot awal uji_coba_rak dan log_mutasi_rak (id >= 6133)..."):
         all_rak = load_all_rak_from_supabase()
         df_master = load_master_produk()
@@ -36,7 +35,6 @@ if st.button("1️⃣ Simulasikan Replay 107 Transaksi", type="primary"):
         )
         logs = res_logs.data or []
 
-        # Kelompokkan rak per Kolom (A-G dan S)
         rak_by_kol = {k: [] for k in KOLOM_IDS}
         for r in all_rak:
             k = clean_str(r.get("Kolom")).upper()
@@ -44,6 +42,7 @@ if st.button("1️⃣ Simulasikan Replay 107 Transaksi", type="primary"):
                 rak_by_kol[k].append(copy.deepcopy(r))
 
         audit_trail = []
+        mismatch_count = 0
 
         for lg in logs:
             tx_id = lg["id"]
@@ -63,10 +62,13 @@ if st.button("1️⃣ Simulasikan Replay 107 Transaksi", type="primary"):
             isi_p, pcs_s = get_master_konversi(df_master, pn)
             m_ec = max(0, tot_pcs - (m_pal * isi_p) - (m_pec * pcs_s)) if isi_p > 0 else tot_pcs
 
-            # A. TRANSAKSI MASUK (INBOUND / KOREKSI MASUK)
+            # ==========================================================
+            # A. TRANSAKSI MASUK (INBOUND / MASUK KOREKSI)
+            # ==========================================================
             if arus == "MASUK" or "MASUK (KOREKSI" in jenis:
                 if kol not in rak_by_kol or bar <= 0:
-                    audit_trail.append((tx_id, jenis, lok, "SKIP (lokasi tidak valid)"))
+                    mismatch_count += 1
+                    audit_trail.append((tx_id, jenis, lok, lot, "❌ Lokasi tidak valid"))
                     continue
 
                 dari_depan = "DEPAN" in det.upper() or "PUSH-BACK" in det.upper()
@@ -74,11 +76,14 @@ if st.button("1️⃣ Simulasikan Replay 107 Transaksi", type="primary"):
                 lain_items = [d for d in rak_by_kol[kol] if not is_same_baris(d, bar)]
                 baris_items.sort(key=lambda x: pd.to_numeric(x.get("Pallet Ke", 0)))
 
+                m_cat = re.search(r"Catatan:\s*(.+)$", det)
+                cat_in = clean_str(m_cat.group(1)) if m_cat else ""
+
                 new_recs = [
                     {
                         "Kolom": kol, "Baris": float(bar), "Pallet Ke": 0.0,
                         "Part Number": pn, "Lot Number": lot, "Nama Produk": nama,
-                        "Status": "Terisi", "Keterangan": "", "Catatan": "",
+                        "Status": "Terisi", "Keterangan": "", "Catatan": cat_in,
                         "Approval QC": "", "Jadwal Kirim": "", "Target Penerima": "",
                     }
                     for _ in range(m_pal)
@@ -91,6 +96,7 @@ if st.button("1️⃣ Simulasikan Replay 107 Transaksi", type="primary"):
                             if (
                                 clean_str(d.get("Part Number")).upper() == pn
                                 and clean_str(d.get("Lot Number")) == lot
+                                and clean_str(d.get("Jadwal Kirim")) == ""
                                 and ("Pecahan" in clean_str(d.get("Keterangan")) or "Eceran" in clean_str(d.get("Keterangan")))
                             ):
                                 ex_p, ex_e = parse_keterangan(d.get("Keterangan"))
@@ -102,58 +108,77 @@ if st.button("1️⃣ Simulasikan Replay 107 Transaksi", type="primary"):
                             "Kolom": kol, "Baris": float(bar), "Pallet Ke": 0.0,
                             "Part Number": pn, "Lot Number": lot, "Nama Produk": nama,
                             "Status": "Terisi", "Keterangan": format_keterangan(m_pec, m_ec),
-                            "Catatan": "", "Approval QC": "", "Jadwal Kirim": "", "Target Penerima": "",
+                            "Catatan": cat_in, "Approval QC": "", "Jadwal Kirim": "", "Target Penerima": "",
                         })
 
                 combined = (new_recs + baris_items) if dari_depan else (baris_items + new_recs)
                 rak_by_kol[kol] = lain_items + update_bayangan_baris(combined, kol, bar)
-                audit_trail.append((tx_id, jenis, lok, f"OK (+{m_pal}P {m_pec} pec)"))
+                audit_trail.append((tx_id, jenis, lok, lot, f"✅ +{m_pal}P {m_pec} pec {m_ec} pcs"))
 
-            # B. TRANSAKSI KELUAR / TURUN STAGING / KOREKSI KELUAR
-            elif arus == "KELUAR" or "KELUAR (KOREKSI" in jenis:
-                # Parsing lokasi jika berbentuk "A-24" atau "A-24 -> S-1"
+            # ==========================================================
+            # B. TRANSAKSI KELUAR / EC / KOREKSI KELUAR / TURUN STAGING
+            # ==========================================================
+            elif (
+                arus == "KELUAR"
+                or "ERROR CORRECTION (EC)" in jenis
+                or "KELUAR (KOREKSI" in jenis
+            ):
                 m_lok = re.match(r"^([A-GS])-(\d+)", lok)
                 if m_lok:
                     kol, bar = m_lok.group(1), int(m_lok.group(2))
 
                 if kol not in rak_by_kol or bar <= 0:
-                    audit_trail.append((tx_id, jenis, lok, "SKIP (lokasi tidak valid)"))
+                    mismatch_count += 1
+                    audit_trail.append((tx_id, jenis, lok, lot, "❌ Lokasi tidak valid"))
                     continue
 
                 baris_items = [d for d in rak_by_kol[kol] if is_same_baris(d, bar)]
                 lain_items = [d for d in rak_by_kol[kol] if not is_same_baris(d, bar)]
 
-                # Cari slot milik (pn, lot) pada baris tersebut
                 matching = [
                     d for d in baris_items
                     if clean_str(d.get("Part Number")).upper() == pn and clean_str(d.get("Lot Number")) == lot
                 ]
                 matching.sort(key=lambda x: pd.to_numeric(x.get("Pallet Ke", 0)), reverse=True)
 
-                # Hitung stok awal & target sisa dari detail_sistem ("Awal: XP Ydus -> Sisa: ZP Wdus")
-                m_sisa = re.search(r"Sisa:\s*(\d+)P\s*(\d+)", det)
-                m_akhir = re.search(r"Akhir:\s*(\d+)P\s*(\d+)", det)
+                # Hitung stok awal di simulasi saat ini
+                cur_u = sum(
+                    1 for d in matching
+                    if "Pecahan" not in clean_str(d.get("Keterangan")) and "Eceran" not in clean_str(d.get("Keterangan"))
+                )
+                cur_d = sum(parse_keterangan(d.get("Keterangan"))[0] for d in matching)
+                cur_e = sum(parse_keterangan(d.get("Keterangan"))[1] for d in matching)
 
-                if m_sisa:
-                    sisa_u, sisa_d, sisa_e = int(m_sisa.group(1)), int(m_sisa.group(2)), 0
-                elif m_akhir:
-                    sisa_u, sisa_d, sisa_e = int(m_akhir.group(1)), int(m_akhir.group(2)), 0
-                else:
-                    # Fallback hitung manual dari jumlah slot matching
-                    cur_u = sum(1 for d in matching if "Pecahan" not in clean_str(d.get("Keterangan")) and "Eceran" not in clean_str(d.get("Keterangan")))
-                    cur_d = sum(parse_keterangan(d.get("Keterangan"))[0] for d in matching)
-                    cur_e = sum(parse_keterangan(d.get("Keterangan"))[1] for d in matching)
-                    tot_awal_pcs = (cur_u * isi_p) + (cur_d * pcs_s) + cur_e if isi_p > 0 else cur_e
+                # Ekstrak target sisa dari teks detail_sistem (Sisa: / Sisa Rak: / Akhir:)
+                m_sisa_txt = re.search(r"(?:Sisa Rak|Sisa|Akhir):\s*(\d+)P\s*(\d+)", det)
+                txt_u = int(m_sisa_txt.group(1)) if m_sisa_txt else None
+                txt_d = int(m_sisa_txt.group(2)) if m_sisa_txt else None
+
+                # Hitung secara matematis berbasis total pcs (presisi seperti hitung_konversi_mutasi_pcs)
+                if isi_p > 0 and pcs_s > 0:
+                    tot_awal_pcs = (cur_u * isi_p) + (cur_d * pcs_s) + cur_e
                     tot_sisa_pcs = max(0, tot_awal_pcs - tot_pcs)
-                    if isi_p > 0 and pcs_s > 0:
-                        sisa_u = tot_sisa_pcs // isi_p
-                        rem = tot_sisa_pcs % isi_p
-                        sisa_d = rem // pcs_s
-                        sisa_e = rem % pcs_s
+                    math_u = tot_sisa_pcs // isi_p
+                    rem = tot_sisa_pcs % isi_p
+                    math_d = rem // pcs_s
+                    math_e = rem % pcs_s
+                else:
+                    math_u = max(0, cur_u - m_pal)
+                    math_d = max(0, cur_d - m_pec)
+                    math_e = max(0, cur_e - m_ec)
+
+                if txt_u is not None and txt_d is not None:
+                    if (math_u, math_d) == (txt_u, txt_d):
+                        sisa_u, sisa_d, sisa_e = math_u, math_d, math_e
+                        status_note = f"✅ Cocok ({sisa_u}P {sisa_d} pec)"
                     else:
-                        sisa_u = max(0, cur_u - m_pal)
-                        sisa_d = max(0, cur_d - m_pec)
-                        sisa_e = max(0, cur_e - m_ec)
+                        # Gunakan angka eksplisit dari log sistem jika ada perbedaan selisih master
+                        sisa_u, sisa_d, sisa_e = txt_u, txt_d, 0
+                        mismatch_count += 1
+                        status_note = f"⚠️ Pakai log ({txt_u}P {txt_d} pec vs hitung {math_u}P {math_d} pec)"
+                else:
+                    sisa_u, sisa_d, sisa_e = math_u, math_d, math_e
+                    status_note = f"✅ Hitung ({sisa_u}P {sisa_d} pec)"
 
                 slot_pec_butuh = 1 if (sisa_d > 0 or sisa_e > 0) else 0
                 total_slot_sisa = sisa_u + slot_pec_butuh
@@ -173,21 +198,26 @@ if st.button("1️⃣ Simulasikan Replay 107 Transaksi", type="primary"):
                         if max_sisa_p is not None and p_val == max_sisa_p:
                             d["Keterangan"] = format_keterangan(sisa_d, sisa_e)
                         else:
-                            d["Keterangan"] = ""
+                            ket_l = clean_str(d.get("Keterangan"))
+                            if "Pecahan" in ket_l or "Eceran" in ket_l:
+                                d["Keterangan"] = ""
                     updated_baris.append(d)
 
                 rak_by_kol[kol] = lain_items + update_bayangan_baris(updated_baris, kol, bar)
 
-                # Jika jenis transaksi TURUN KE STAGING (S-1), masukkan ke Kolom S Baris 1
-                if "STAGING" in jenis or "S-1" in jenis or "S-1" in det.upper():
+                # Khusus TURUN KE STAGING (S-1): tambahkan slot ke Kolom S Baris 1
+                if "STAGING" in jenis or "S-1" in jenis:
                     s_items = [d for d in rak_by_kol["S"] if is_same_baris(d, 1)]
                     s_lain = [d for d in rak_by_kol["S"] if not is_same_baris(d, 1)]
+                    m_cat_stg = re.search(r"Catatan:\s*(.+)$", det)
+                    cat_stg_extra = clean_str(m_cat_stg.group(1)) if m_cat_stg else ""
+                    cat_stg_full = f"[Asal: {kol}-{bar}] {cat_stg_extra}".strip()
+
                     moved_to_s = [
                         {
                             "Kolom": "S", "Baris": 1.0, "Pallet Ke": 0.0,
                             "Part Number": pn, "Lot Number": lot, "Nama Produk": nama,
-                            "Status": "Terisi", "Keterangan": "",
-                            "Catatan": f"[Asal: {kol}-{bar}]",
+                            "Status": "Terisi", "Keterangan": "", "Catatan": cat_stg_full,
                             "Approval QC": "", "Jadwal Kirim": "", "Target Penerima": "",
                         }
                         for _ in range(m_pal)
@@ -197,26 +227,34 @@ if st.button("1️⃣ Simulasikan Replay 107 Transaksi", type="primary"):
                             "Kolom": "S", "Baris": 1.0, "Pallet Ke": 0.0,
                             "Part Number": pn, "Lot Number": lot, "Nama Produk": nama,
                             "Status": "Terisi", "Keterangan": format_keterangan(m_pec, m_ec),
-                            "Catatan": f"[Asal: {kol}-{bar}]",
-                            "Approval QC": "", "Jadwal Kirim": "", "Target Penerima": "",
+                            "Catatan": cat_stg_full, "Approval QC": "", "Jadwal Kirim": "", "Target Penerima": "",
                         })
                     rak_by_kol["S"] = s_lain + update_bayangan_baris(s_items + moved_to_s, "S", 1)
+                    status_note += " + Masuk S-1"
 
-                audit_trail.append((tx_id, jenis, lok, f"OK (Sisa {sisa_u}P {sisa_d} pec)"))
+                audit_trail.append((tx_id, jenis, lok, lot, status_note))
 
-            # C. ERROR CORRECTION EDIT ATRIBUT
             else:
-                audit_trail.append((tx_id, jenis, lok, f"INFO ({det})"))
+                mismatch_count += 1
+                audit_trail.append((tx_id, jenis, lok, lot, f"⚠️ Tidak diproses: {det}"))
 
         st.session_state["simulated_rak"] = rak_by_kol
         st.session_state["audit_trail"] = audit_trail
+        st.session_state["mismatch_count"] = mismatch_count
 
 if "simulated_rak" in st.session_state:
-    df_audit = pd.DataFrame(st.session_state["audit_trail"], columns=["ID", "Jenis", "Lokasi", "Hasil Replay"])
-    st.dataframe(df_audit, use_container_width=True, height=350)
+    df_audit = pd.DataFrame(
+        st.session_state["audit_trail"],
+        columns=["ID", "Jenis Transaksi", "Lokasi", "Lot", "Status Validasi"]
+    )
+    st.dataframe(df_audit, use_container_width=True, height=380)
 
     total_slot_akhir = sum(len(v) for v in st.session_state["simulated_rak"].values())
-    st.info(f"Total slot terisi setelah replay: **{total_slot_akhir} slot palet**.")
+    mm = st.session_state.get("mismatch_count", 0)
+    if mm == 0:
+        st.success(f"🎯 **100% Presisi!** Seluruh 107 transaksi cocok secara matematis & teks log. Total akhir: **{total_slot_akhir} slot palet**.")
+    else:
+        st.warning(f"⚠️ Terdapat **{mm}** baris dengan catatan peringatan di atas (silakan periksa pada tabel sebelum menyimpan). Total akhir: **{total_slot_akhir} slot palet**.")
 
     if st.button("2️⃣ Simpan Hasil Pemulihan ke `uji_coba_rak` Sekarang", type="primary"):
         with st.spinner("Menyimpan seluruh kolom rak (A–G dan S) ke Supabase..."):
