@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import math
 import re
+import json
 import requests
 import hmac
 import copy
@@ -18,6 +19,9 @@ DB_UNDO_STATE = 'wms_undo_state'
 DB_DRAFT_INBOUND = 'wms_inbound_drafts'
 DB_DRAFT_OUTBOUND = 'wms_outbound_drafts'
 DB_QC_APPROVAL = 'wms_qc_approval'
+
+# Zona waktu baku WIB (UTC+7)
+WIB_TZ = timezone(timedelta(hours=7))
 
 # Batas maksimal palet di sisi ujung pintu masuk untuk lorong >= 3 item (mencegah delay bongkar outbound)
 MAX_TAIL_PALLETS_MULTI_ITEM = 10
@@ -114,7 +118,29 @@ db = _DummySupabaseShim()
 
 
 def get_waktu_jkt():
-    return datetime.now(timezone.utc) + timedelta(hours=7)
+    """Mengembalikan waktu saat ini dalam zona WIB (timezone-aware UTC+7)."""
+    return datetime.now(WIB_TZ)
+
+
+def _parse_dt_wib(dt_val):
+    """Mengubah string/datetime apa pun menjadi timezone-aware WIB secara aman."""
+    if not dt_val:
+        return None
+    if isinstance(dt_val, datetime):
+        return dt_val.astimezone(WIB_TZ) if dt_val.tzinfo else dt_val.replace(tzinfo=WIB_TZ)
+    s = str(dt_val).strip()
+    if not s:
+        return None
+    try:
+        dt_parsed = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt_parsed.astimezone(WIB_TZ) if dt_parsed.tzinfo else dt_parsed.replace(tzinfo=WIB_TZ)
+    except Exception:
+        pass
+    try:
+        dt_naive = datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
+        return dt_naive.replace(tzinfo=WIB_TZ)
+    except Exception:
+        return None
 
 
 def clean_str(val):
@@ -130,11 +156,13 @@ def clean_str(val):
 # 1B. ADAPTER HELPER SUPABASE (ROW <-> DICT KOMPATIBEL)
 # ==========================================================
 def _row_db_to_slot_dict(r: dict) -> dict:
+    bar_num = pd.to_numeric(r.get('baris', 0), errors='coerce')
+    plt_num = pd.to_numeric(r.get('pallet_ke', 0), errors='coerce')
     return {
         'id': r.get('id'),
         'Kolom': clean_str(r.get('kolom')).upper(),
-        'Baris': float(int(pd.to_numeric(r.get('baris', 0), errors='coerce') or 0)),
-        'Pallet Ke': float(int(pd.to_numeric(r.get('pallet_ke', 0), errors='coerce') or 0)),
+        'Baris': float(0 if pd.isna(bar_num) else int(bar_num)),
+        'Pallet Ke': float(0 if pd.isna(plt_num) else int(plt_num)),
         'Part Number': clean_str(r.get('part_number')).upper(),
         'Nama Produk': clean_str(r.get('nama_produk')),
         'Lot Number': clean_str(r.get('lot_number')),
@@ -206,7 +234,6 @@ def _sync_kolom_to_supabase(kolom_id: str, slot_dicts: list):
                 on_conflict="kolom,baris,pallet_ke"
             ).execute()
 
-    # Hapus baris sisa pada kolom tersebut yang tidak ada di payload terbaru
     existing_ids = []
     step = 1000
     start = 0
@@ -370,19 +397,43 @@ def render_progress_bar(current_slide, mode_transaksi):
 # ==========================================================
 def kirim_notif_telegram(pesan_html):
     try:
-        token = st.secrets["telegram"]["bot_token"]
-        raw_chat_ids = str(st.secrets["telegram"]["chat_id"])
-        daftar_id = [cid.strip() for cid in raw_chat_ids.split(",") if cid.strip()]
+        tele_cfg = st.secrets.get("telegram")
+        if not tele_cfg:
+            st.toast("⚠️ Secrets [telegram] belum dikonfigurasi pada aplikasi ini.", icon="⚠️")
+            return False
+
+        token = str(tele_cfg.get("bot_token", "")).strip()
+        raw_chat_ids = tele_cfg.get("chat_id", "")
+        if isinstance(raw_chat_ids, (list, tuple)):
+            daftar_id = [str(cid).strip() for cid in raw_chat_ids if str(cid).strip()]
+        else:
+            daftar_id = [cid.strip() for cid in str(raw_chat_ids).split(",") if cid.strip()]
+
+        if not token or not daftar_id:
+            st.toast("⚠️ bot_token / chat_id Telegram kosong di Secrets.", icon="⚠️")
+            return False
+
         url = f"https://api.telegram.org/bot{token}/sendMessage"
+        sukses_semua = True
         for cid in daftar_id:
             payload = {"chat_id": cid, "text": pesan_html, "parse_mode": "HTML"}
-            requests.post(url, json=payload, timeout=2)
-    except Exception:
-        pass
+            resp = requests.post(url, json=payload, timeout=8)
+            if not resp.ok:
+                sukses_semua = False
+                st.toast(f"⚠️ Telegram gagal ({resp.status_code}): {resp.text[:80]}", icon="⚠️")
+        return sukses_semua
+    except Exception as e:
+        st.toast(f"⚠️ Gagal kirim Telegram: {e}", icon="⚠️")
+        return False
 
 
 def escape_html(text):
-    return str(text).replace("&", "&").replace("<", "<").replace(">", ">")
+    return (
+        str(text)
+        .replace("&", "&")
+        .replace("<", "<")
+        .replace(">", ">")
+    )
 
 
 def parse_keterangan(ket_str):
@@ -1042,8 +1093,6 @@ def scan_plotting_untuk_outbound(semua_data, jadwal_kirim, target_penerima, qc_m
     """
     Memindai seluruh slot rak (A-G) yang telah di-plot PPIC untuk (jadwal_kirim, target_penerima).
     Memisahkan daftar yang SUDAH APPROVED QC (siap diturunkan forklift) dan yang BELUM APPROVED (Pending/Hold).
-    Sekaligus mengevaluasi akses pintu dinamis (penghalang yang sama-sama ter-plot untuk customer ini tidak dihitung blok).
-    Mengembalikan tuple: (df_ready_approved, df_blocked_qc)
     """
     if not semua_data:
         return pd.DataFrame(), pd.DataFrame()
@@ -1163,14 +1212,22 @@ def scan_plotting_untuk_outbound(semua_data, jadwal_kirim, target_penerima, qc_m
 # ==========================================================
 # 5. AUDIT LOG, PERSISTENT UNDO & AUTO-SAVE DRAFT (SKEMA doc_id & data)
 # ==========================================================
+def _safe_int_val(val, default=0):
+    if val is None or isinstance(val, bool):
+        return int(default)
+    num = pd.to_numeric(val, errors='coerce')
+    return int(default) if pd.isna(num) else int(round(float(num)))
+
+
 def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh, pecahan, eceran, keterangan=""):
     kol_str = clean_str(kolom)
-    try:
-        bar_int = int(float(baris))
-        lok_str = f"{kol_str}-{bar_int}" if bar_int > 0 else kol_str
-    except Exception:
-        bar_int = 0
-        lok_str = f"{kol_str}-{baris}" if str(baris).strip() else kol_str
+    bar_int = _safe_int_val(baris, 0)
+    if bar_int > 0:
+        lok_str = f"{kol_str}-{bar_int}"
+    elif clean_str(baris) and clean_str(baris).upper() not in ["ALL", "NONE", "PLOT"]:
+        lok_str = clean_str(baris)
+    else:
+        lok_str = kol_str
 
     j_up = str(jenis).upper()
     arus = "KELUAR" if any(x in j_up for x in ["KELUAR", "OUTBOUND", "WIP", "STAGING"]) else "MASUK"
@@ -1178,6 +1235,7 @@ def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh,
         arus = "KOREKSI"
 
     op_name = clean_str(st.session_state.get("operator")) or "Operator Lapangan"
+    ec_int = _safe_int_val(eceran, 0)
     row_log = {
         "waktu_transaksi": datetime.now(timezone.utc).isoformat(),
         "arus": arus,
@@ -1188,10 +1246,10 @@ def catat_log_mutasi(jenis, kolom, baris, produk, part_num, no_lot, pallet_utuh,
         "part_number": clean_str(part_num),
         "nama_produk": clean_str(produk),
         "lot_number": str(no_lot).strip() or "-",
-        "mutasi_pallet": int(float(pallet_utuh or 0)),
-        "mutasi_pecahan": int(float(pecahan or 0)),
-        "mutasi_eceran": int(float(eceran or 0)),
-        "total_pcs": int(float(eceran or 0)),
+        "mutasi_pallet": _safe_int_val(pallet_utuh, 0),
+        "mutasi_pecahan": _safe_int_val(pecahan, 0),
+        "mutasi_eceran": ec_int,
+        "total_pcs": ec_int,
         "tujuan_kategori": str(jenis),
         "detail_sistem": str(keterangan),
         "operator": op_name,
@@ -1242,17 +1300,11 @@ def muat_draft_inbound(prefix_app, operator_name):
         for rec in (res.data or []):
             data = rec.get("data")
             if isinstance(data, str):
-                import json
                 data = json.loads(data)
             if isinstance(data, dict) and data.get("item"):
-                saved_at = clean_str(data.get("saved_at"))
-                if saved_at:
-                    try:
-                        saved_dt = datetime.strptime(saved_at[:19], "%Y-%m-%d %H:%M:%S")
-                        if (get_waktu_jkt() - saved_dt) > timedelta(hours=12):
-                            continue
-                    except Exception:
-                        pass
+                saved_dt = _parse_dt_wib(data.get("saved_at"))
+                if saved_dt is not None and (get_waktu_jkt() - saved_dt) > timedelta(hours=12):
+                    continue
                 st.session_state.inbound_draft = data
                 return data
     except Exception as e:
@@ -1304,11 +1356,12 @@ def muat_draft_outbound(prefix_app, operator_name):
         )
         if res.data:
             rec = res.data[0]
-            data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
-            saved_at = data.get("saved_at")
-            if saved_at:
-                saved_dt = datetime.strptime(saved_at, "%Y-%m-%d %H:%M:%S")
-                if (get_waktu_jkt() - saved_dt) <= timedelta(hours=12):
+            data = rec.get("data")
+            if isinstance(data, str):
+                data = json.loads(data)
+            if isinstance(data, dict):
+                saved_dt = _parse_dt_wib(data.get("saved_at"))
+                if saved_dt is None or (get_waktu_jkt() - saved_dt) <= timedelta(hours=12):
                     st.session_state.outbound_draft = data
                     return
     except Exception:
@@ -1357,10 +1410,14 @@ def muat_undo_firestore(prefix_app, operator_name):
         )
         if res.data:
             rec = res.data[0]
-            data = rec.get("data") if isinstance(rec.get("data"), dict) else rec
+            data = rec.get("data")
+            if isinstance(data, str):
+                data = json.loads(data)
+            if not isinstance(data, dict):
+                data = rec
             if data.get("status") == "DONE" and data.get("created_at"):
-                created_dt = datetime.strptime(data["created_at"], "%Y-%m-%d %H:%M:%S")
-                if (get_waktu_jkt() - created_dt) <= timedelta(minutes=30):
+                created_dt = _parse_dt_wib(data["created_at"])
+                if created_dt is not None and (get_waktu_jkt() - created_dt) <= timedelta(minutes=30):
                     st.session_state.undo_record = data
                     return
     except Exception:
@@ -1391,7 +1448,7 @@ def render_header_dan_undo(app_title, accent_color, prefix_app, mode_badge="", r
                     🧭 {app_title}
                 </div>
                 <div style="font-size: 12px; opacity: 0.85; margin-top: 2px;">
-                    👤 <strong>{st.session_state.operator}</strong>  |  📡 {NAMA_DATABASE}{mode_badge}
+                    👤 <strong>{st.session_state.operator}</strong>  |  📡 {NAMA_DATABASE}{mode_badge}
                 </div>
             </div>
         """, unsafe_allow_html=True)
@@ -1423,17 +1480,19 @@ def render_header_dan_undo(app_title, accent_color, prefix_app, mode_badge="", r
     undo_rec = st.session_state.get("undo_record")
     if undo_rec and undo_rec.get("status") == "DONE":
         masih_berlaku = True
-        if undo_rec.get("created_at"):
-            created_dt = datetime.strptime(undo_rec["created_at"], "%Y-%m-%d %H:%M:%S")
+        created_dt = _parse_dt_wib(undo_rec.get("created_at"))
+        if created_dt is not None:
             if (get_waktu_jkt() - created_dt) > timedelta(minutes=30):
                 masih_berlaku = False
                 st.session_state.undo_record = None
 
         if masih_berlaku:
             mode_undo = undo_rec.get("mode", "TRANSAKSI")
+            created_txt = str(undo_rec.get("created_at", ""))
+            jam_txt = created_txt[-8:] if len(created_txt) >= 8 else created_txt
             with st.container(border=True):
                 st.success(f"✅ **BERHASIL ({mode_undo}):** {undo_rec.get('action_msg', '')}")
-                st.caption(f"⏱️ Opsi Undo tersedia selama 30 menit (Input pukul {undo_rec.get('created_at', '')[-8:]} WIB)")
+                st.caption(f"⏱️ Opsi Undo tersedia selama 30 menit (Input pukul {jam_txt} WIB)")
                 c_u1, c_u2 = st.columns(2)
                 with c_u1:
                     st.markdown('<div class="btn-undo">', unsafe_allow_html=True)
@@ -2135,8 +2194,8 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
         with st.container(border=True):
             st.markdown(f"📦 {format_nama_warna_bold(st.session_state.item)}")
             st.markdown(
-                f"<div style='font-size:13px; opacity:0.9;'>Lot: <strong>{lot_aktif}</strong>  |  "
-                f"Total: <strong>{qty_p_in} Pallet{teks_pec_hdr}</strong>  |  "
+                f"<div style='font-size:13px; opacity:0.9;'>Lot: <strong>{lot_aktif}</strong>  |  "
+                f"Total: <strong>{qty_p_in} Pallet{teks_pec_hdr}</strong>  |  "
                 f"Masuk: <span style='color:{sisi_color}; font-weight:bold;'>{sisi_label.upper()}</span></div>",
                 unsafe_allow_html=True
             )
@@ -2290,7 +2349,7 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
             with st.container(border=True):
                 c_hdr1, c_hdr2 = st.columns([3.5, 1.2])
                 with c_hdr1:
-                    st.markdown(f"📍 **Rak {al['Kolom']}-{b_int}**  |  <span style='font-size:12px;'>{al['Status']}</span>", unsafe_allow_html=True)
+                    st.markdown(f"📍 **Rak {al['Kolom']}-{b_int}**  |  <span style='font-size:12px;'>{al['Status']}</span>", unsafe_allow_html=True)
                 with c_hdr2:
                     if len(alokasi) > 1:
                         st.markdown('<div class="btn-compact">', unsafe_allow_html=True)
@@ -2321,7 +2380,6 @@ def render_alur_inbound_terpadu(prefix_app, judul_inbound, default_sisi_masuk="B
 
         st.session_state.alokasi_terpilih = alokasi_aktual
 
-        # Sinkronkan perubahan aktual Slide 7 ke draft Supabase agar tetap aman jika layar mati
         draft_sig_s7 = f"S7|{st.session_state.item}|{lot_aktif}|{target_p_awal}|{target_c_awal}|{sisi_masuk}|" + ",".join(
             f"{x['Kolom']}-{x['Baris']}:{x['qty_p']}:{x['qty_c']}" for x in alokasi_aktual
         )
